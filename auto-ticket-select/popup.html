@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>Auto Ticket Select</h1>
+    <div id="host" class="muted"></div>
+  </header>
+
+  <section>
+    <div class="row">
+      <h2>Steps</h2>
+      <button id="pick" class="secondary">+ Pick from page</button>
+    </div>
+    <p class="muted small">Click "Pick from page", then click the date / class / seat / button on the website. Repeat for each step, in order.</p>
+    <ol id="steps"></ol>
+    <button id="addManual" class="link">+ add step manually</button>
+  </section>
+
+  <section class="grid">
+    <label>Wait per step (sec)
+      <input id="waitSec" type="number" min="1" max="120">
+    </label>
+    <label>Auto-refresh if not found (sec, 0 = off)
+      <input id="refreshSec" type="number" min="0" max="600">
+    </label>
+  </section>
+
+  <section class="row">
+    <button id="start">▶ Start</button>
+    <button id="stop" class="danger">■ Stop</button>
+  </section>
+  <div id="state" class="muted small"></div>
+
+  <template id="stepTpl">
+    <li class="step">
+      <div class="row">
+        <select class="type">
+          <option value="text">Text</option>
+          <option value="selector">CSS selector</option>
+        </select>
+        <select class="match">
+          <option value="exact">exact</option>
+          <option value="contains">contains</option>
+        </select>
+        <label class="count">×<input class="countIn" type="number" min="1" max="10" title="How many matching items to click (e.g. 2 seats)"></label>
+        <button class="up icon" title="Move up">↑</button>
+        <button class="del icon" title="Delete">✕</button>
+      </div>
+      <input class="value" type="text" placeholder="e.g. S_CHAIR or A1">
+    </li>
+  </template>
+
+  <script src="popup.js"></script>
+</body>
+</html>
