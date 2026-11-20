@@ -26,6 +26,36 @@ export interface TradeRow {
   note: string | null;
 }
 
+// One buy -> withdraw -> sell cycle. Persisted so a restart resumes it where it stopped.
+export type TransferStatus = 'buying' | 'withdrawing' | 'selling' | 'done' | 'failed' | 'stuck';
+export interface TransferRow {
+  id?: number;
+  ts: number;
+  updated: number;
+  base: string;
+  symbol: string;
+  address: string;
+  decimals: number;
+  net_work: string;
+  qty_step: number;
+  price_decimals: number;
+  status: TransferStatus;
+  buy_qty: number;
+  cost_usd: number;
+  buy_order_id: string | null;
+  withdraw_amount: string | null;
+  withdraw_id: string | null;
+  wallet_before: string | null; // token balance (base units) before the withdrawal
+  received: string | null; // base units that arrived
+  usdc_out: number | null;
+  gas_usd: number;
+  expected_net: number;
+  pnl: number | null;
+  sell_attempts: number;
+  alerted_timeout: number;
+  note: string | null;
+}
+
 export class Db {
   private db: Database.Database;
 
@@ -44,6 +74,16 @@ export class Db {
       );
       CREATE INDEX IF NOT EXISTS trades_day ON trades(day, mode);
       CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS transfers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL, updated INTEGER NOT NULL,
+        base TEXT NOT NULL, symbol TEXT NOT NULL, address TEXT NOT NULL, decimals INTEGER NOT NULL,
+        net_work TEXT NOT NULL, qty_step REAL NOT NULL, price_decimals INTEGER NOT NULL,
+        status TEXT NOT NULL, buy_qty REAL, cost_usd REAL, buy_order_id TEXT,
+        withdraw_amount TEXT, withdraw_id TEXT, wallet_before TEXT, received TEXT,
+        usdc_out REAL, gas_usd REAL NOT NULL DEFAULT 0, expected_net REAL, pnl REAL,
+        sell_attempts INTEGER NOT NULL DEFAULT 0, alerted_timeout INTEGER NOT NULL DEFAULT 0, note TEXT
+      );
     `);
   }
 
@@ -91,6 +131,24 @@ export class Db {
       )
       .all(...args) as { symbol: string; trades: number; pnl: number; gas: number; failed: number }[];
     return { total, bySymbol };
+  }
+
+  insertTransfer(t: TransferRow): number {
+    const cols = Object.keys(t).filter((k) => k !== 'id');
+    const r = this.db
+      .prepare(`INSERT INTO transfers (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`)
+      .run(t);
+    return Number(r.lastInsertRowid);
+  }
+
+  updateTransfer(id: number, fields: Partial<TransferRow>): void {
+    const f = { ...fields, updated: Date.now() };
+    const cols = Object.keys(f).filter((k) => k !== 'id');
+    this.db.prepare(`UPDATE transfers SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...f, id });
+  }
+
+  openTransfers(): TransferRow[] {
+    return this.db.prepare(`SELECT * FROM transfers WHERE status IN ('buying','withdrawing','selling','stuck') ORDER BY id`).all() as TransferRow[];
   }
 
   getState(key: string): string | undefined {

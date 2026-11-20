@@ -132,9 +132,9 @@ function setup(opts: {
         orders.set(id, { orderId: id, status: filled === Number(q) ? 'FILLED' : 'PARTIALLY_FILLED', executedQty: String(filled), cummulativeQuoteQty: '0', origQty: q, price: p, side });
         return { orderId: id };
       },
-      marketOrder: async (_s, side, q) => {
-        calls.push(`market ${side} ${q}`);
-        fill(side, Number(q), side === 'BUY' ? bid + 0.01 : bid);
+      marketSell: async (_s, q) => {
+        calls.push(`market SELL ${q}`);
+        fill('SELL', Number(q), bid);
         return { orderId: 'm' };
       },
       getOrder: async (_s, id) => orders.get(id)!,
@@ -176,7 +176,7 @@ test('no trade when the gap is below max($15, 0.5%)', async () => {
 test('DEX leg fails after MEXC sold: buys back at market, alerts one-sided', async () => {
   const { engine, db, alerts, calls, bal } = setup({ dexOk: false });
   await engine.tick();
-  assert.ok(calls.includes('market BUY 20.00'));
+  assert.ok(calls.includes('limit BUY 20.00 @ 11.435')); // close: aggressive limit 2% over ask 11.21
   const row = trades(db);
   assert.equal(row.total.failed, 1);
   assert.ok(alerts.some((a) => a.startsWith('⚠️ ONE-SIDED FILL LINK')));

@@ -184,3 +184,38 @@ export function unwindPlan(
   if (!dexOk) return mk('SELL', cexFilled * (1 - takerFee), 'DEX leg failed: sell what was bought on MEXC');
   return mk('BUY', cexQty - cexFilled, 'MEXC buy only partly filled: buy the rest at market');
 }
+
+/**
+ * TRANSFER: buy on MEXC -> withdraw to wallet -> sell on DEX. Not atomic: the price can move
+ * while the withdrawal is on its way, so `driftBps` of the sale value is reserved as extra risk cost.
+ */
+export function evaluateTransfer(p: {
+  plan: NonNullable<ReturnType<typeof planCexBuy>>;
+  withdrawFeeTokens: number; // MEXC withdraw fee, paid in the token
+  usdcOut: number; // DEX quote for selling the tokens that arrive
+  usdcMin: number;
+  gasUsd: number; // approval + swap
+  driftBps: number;
+  costs: CostParams;
+}) {
+  const { plan } = p;
+  const arriving = plan.tokensToSell - p.withdrawFeeTokens;
+  const buyPrice = plan.costUsd / plan.qty;
+  const cexFeeUsd = plan.qty * p.costs.takerFee * buyPrice;
+  const withdrawFeeUsd = p.withdrawFeeTokens * buyPrice;
+  const slippageUsd = (plan.costUsd * p.costs.cexSlippageBps) / 10_000 + Math.max(0, p.usdcOut - p.usdcMin);
+  const driftUsd = (p.usdcOut * p.driftBps) / 10_000;
+  const net = p.usdcOut - plan.costUsd - p.gasUsd - slippageUsd - driftUsd - p.costs.safetyMarginUsd;
+  return {
+    arriving,
+    buyPrice,
+    sellPrice: arriving > 0 ? p.usdcOut / arriving : 0,
+    cexFeeUsd,
+    withdrawFeeUsd,
+    slippageUsd,
+    driftUsd,
+    gasUsd: p.gasUsd,
+    costUsd: plan.costUsd,
+    net,
+  };
+}

@@ -27,7 +27,7 @@ const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
 // Narrow interfaces so tests can plug in fakes.
 export interface CexApi {
   limitOrder(symbol: string, side: Side, quantity: string, price: string): Promise<{ orderId: string }>;
-  marketOrder(symbol: string, side: Side, quantity: string): Promise<{ orderId: string }>;
+  marketSell(symbol: string, quantity: string): Promise<{ orderId: string }>;
   getOrder(symbol: string, orderId: string): Promise<Order>;
   cancelOrder(symbol: string, orderId: string): Promise<Order>;
 }
@@ -323,8 +323,8 @@ export class Engine {
       status = 'one_sided';
       const qty = unwind.qty.toFixed(decimalsOfStep(t.qtyStep));
       try {
-        const r = await this.d.mexc.marketOrder(t.symbol, unwind.side, qty);
-        notes.push(`unwind ${unwind.side} ${qty} @market (${r.orderId})`);
+        const r = await this.closeAtMarket(t, unwind.side, qty);
+        notes.push(`unwind ${unwind.side} ${qty} @market (${r.orderId}, filled ${r.filled})`);
         await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base} ${opp.direction}\n${unwind.reason}\nClosed: MEXC MARKET ${unwind.side} ${qty} ${t.base}`);
       } catch (e) {
         this.d.risk.pause(`unwind failed for ${t.base}`);
@@ -361,6 +361,29 @@ export class Engine {
         .join('\n'),
     );
     await this.handleRisk(this.d.risk.afterTrade(status));
+  }
+
+  /**
+   * Close a position on MEXC now. SELL uses a MARKET order. BUY uses a LIMIT 2% above the best ask
+   * (MEXC documents MARKET buys by quote amount only, and we need an exact token quantity).
+   */
+  async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number }> {
+    if (side === 'SELL') {
+      const { orderId } = await this.d.mexc.marketSell(t.symbol, qty);
+      return { orderId, filled: Number(qty) };
+    }
+    const b = await this.d.book(t.symbol);
+    const f = 10 ** t.priceDecimals;
+    const px = (Math.ceil(b.asks[0][0] * 1.02 * f) / f).toFixed(t.priceDecimals);
+    const { orderId } = await this.d.mexc.limitOrder(t.symbol, 'BUY', qty, px);
+    await this.sleep(1500);
+    let o = await this.d.mexc.getOrder(t.symbol, orderId);
+    if (o.status !== 'FILLED') {
+      await this.d.mexc.cancelOrder(t.symbol, orderId).catch(() => {});
+      o = await this.d.mexc.getOrder(t.symbol, orderId);
+      if (Number(o.executedQty) < Number(qty) * 0.999) throw new Error(`close BUY only filled ${o.executedQty}/${qty}`);
+    }
+    return { orderId, filled: Number(o.executedQty) };
   }
 
   /** MEXC marketable limit order; cancels any unfilled rest. Returns filled quantity. */

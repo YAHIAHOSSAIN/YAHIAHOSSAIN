@@ -23,8 +23,14 @@ export function loadConfig() {
   const aggregator = str('DEX_AGGREGATOR', '0x') as AggregatorName;
   if (aggregator !== '0x' && aggregator !== '1inch') throw new Error('DEX_AGGREGATOR must be 0x or 1inch');
 
+  const strategy = str('STRATEGY', 'transfer').toLowerCase();
+  if (strategy !== 'transfer' && strategy !== 'inventory') throw new Error('STRATEGY must be transfer or inventory');
+
   return {
     mode,
+    // transfer  = scan all MEXC ERC20 tokens, buy on MEXC, withdraw to wallet, sell on DEX
+    // inventory = hold tokens on both sides and trade both legs at the same moment
+    strategy: strategy as 'transfer' | 'inventory',
     // --- Ethereum ---
     rpcUrl: str('RPC_URL'),
     // Private RPC for sending: never the public mempool.
@@ -66,6 +72,13 @@ export function loadConfig() {
     maxConsecutiveFails: num('MAX_CONSECUTIVE_FAILS', 3),
     minEthForGas: num('MIN_ETH_FOR_GAS', 0.01),
     txTimeoutSec: num('TX_TIMEOUT_SEC', 60),
+    // --- Transfer strategy (scanner) ---
+    scanIntervalSec: num('SCAN_INTERVAL_SEC', 20),
+    scanMinGapPct: num('SCAN_MIN_GAP_PCT', 3), // cheap pre-filter before exact quotes
+    scanExactQuotes: num('SCAN_EXACT_QUOTES', 5), // max exact DEX quotes per scan
+    transferDriftBps: num('TRANSFER_DRIFT_BPS', 150), // price-move reserve while withdrawing
+    transferTimeoutMin: num('TRANSFER_TIMEOUT_MIN', 90),
+    maxOpenTransfers: num('MAX_OPEN_TRANSFERS', 1),
     // --- Misc ---
     dbPath: str('DB_PATH', 'data/bot.sqlite'),
     envPath: str('ENV_PATH', '.env'),

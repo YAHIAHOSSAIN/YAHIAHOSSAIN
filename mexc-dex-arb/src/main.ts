@@ -12,6 +12,7 @@ import { OneInch, ZeroEx, type Aggregator } from './dex/aggregator.js';
 import { buildWatchlist, refreshStatus } from './watchlist.js';
 import { paperBalances, snapshot } from './inventory.js';
 import { Engine } from './engine.js';
+import { TransferEngine } from './transfer.js';
 import { formatReport } from './summary.js';
 import { dhakaDay, dhakaHourMinute, usd } from './util.js';
 
@@ -45,6 +46,8 @@ async function main() {
     if (!acc.canTrade) throw new Error('MEXC API key cannot trade');
     log.info(`wallet ${chain.address}`);
   }
+
+  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg);
 
   const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
     only: cfg.watchlist,
@@ -148,6 +151,103 @@ async function main() {
 
   await tg.send(
     `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} via ${agg.name}\nTokens: ${tokens.map((t) => t.base).join(', ')}\n` +
+      (risk.paused ? `⏸ Still paused: ${risk.pauseReason} (send /start)` : '▶️ Trading enabled'),
+  );
+}
+
+/** TRANSFER strategy: scan every MEXC ERC20 token, buy on MEXC, withdraw, sell on DEX. */
+async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator) {
+  const engine = new TransferEngine({ cfg, mexc, chain, agg, db, risk, tg });
+  await engine.refreshUniverse(true);
+  if (engine.universe.length === 0) throw new Error('No MEXC ERC20 token passed the filters');
+
+  void tg.startPolling({
+    '/stop': () => {
+      risk.pause('Telegram /stop');
+      return '🛑 New trades STOPPED. An open transfer still finishes (selling the tokens already bought is the safe exit). /start to resume.';
+    },
+    '/start': () => {
+      risk.resume();
+      const block = risk.blockReason();
+      return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
+    },
+    '/status': async () => {
+      const t = risk.today();
+      const open = db.openTransfers();
+      const lines = [
+        `MODE=${cfg.mode} STRATEGY=transfer | ${risk.paused ? `⏸ PAUSED (${risk.pauseReason})` : '▶️ running'}`,
+        `Scanning ${engine.universe.length} MEXC ERC20 tokens every ${cfg.scanIntervalSec}s`,
+        `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
+        `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, gas ${engine.lastGasGwei.toFixed(1)}/${cfg.maxGasGwei} gwei`,
+        `Top gaps: ${engine.lastTopGaps.map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ') || 'none'}`,
+        open.length ? `Open: ${open.map((o) => `#${o.id} ${o.base} ${o.status}`).join(', ')}` : 'Open transfers: none',
+      ];
+      if (cfg.mode === 'live') {
+        try {
+          const b = await mexc.balances();
+          const eth = await chain.ethBalance();
+          const usdc = await chain.tokenBalance(cfg.usdc);
+          lines.push(`MEXC ${usd(b.USDT ?? 0)} USDT | wallet ${(Number(eth) / 1e18).toFixed(4)} ETH, ${usd(Number(usdc) / 1e6)} USDC`);
+        } catch (e) {
+          lines.push(`Balance error: ${errMsg(e)}`);
+        }
+      }
+      return lines.join('\n');
+    },
+  });
+
+  let busy = false;
+  let errors = 0;
+  let lastLow = 0;
+  const loop = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      await engine.tick();
+      errors = 0;
+      // MEXC USDT is spent by buys and comes back only when you move USDC from the wallet to MEXC.
+      if (cfg.mode === 'live' && Date.now() - lastLow > 6 * 3600_000) {
+        const usdt = (await mexc.balances()).USDT ?? 0;
+        const eth = Number(await chain.ethBalance()) / 1e18;
+        if (usdt < cfg.minTradeUsd || eth < cfg.minEthForGas) {
+          lastLow = Date.now();
+          await tg.send(`📦 Rebalance needed: MEXC USDT ${usd(usdt)}, wallet ETH ${eth.toFixed(4)}. Move USDC profits from the wallet back to MEXC.`);
+        }
+      }
+    } catch (e) {
+      errors++;
+      log.error(`scan: ${errMsg(e)}`);
+      if (errors === 5) await tg.send(`❗ Bot errors (5 in a row): ${errMsg(e)}`);
+    } finally {
+      busy = false;
+    }
+  };
+  setInterval(loop, cfg.scanIntervalSec * 1000);
+  void loop();
+
+  setInterval(async () => {
+    const today = dhakaDay();
+    if (dhakaHourMinute().hour === 23 && db.getState('last_summary_day') !== today) {
+      db.setState('last_summary_day', today);
+      await tg.send(formatReport(db, cfg.mode, 24, `📊 Daily summary ${today}`));
+    }
+  }, 30_000);
+
+  const shutdown = async (why: string, code: number) => {
+    await tg.send(`🔌 Bot stopped: ${why}`);
+    tg.stop();
+    process.exit(code);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT', 0));
+  process.on('SIGTERM', () => void shutdown('SIGTERM', 0));
+  process.on('unhandledRejection', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
+  process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
+
+  const open = db.openTransfers();
+  await tg.send(
+    `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} STRATEGY=transfer via ${agg.name}\n` +
+      `Scanning ${engine.universe.length} MEXC ERC20 tokens (buy MEXC -> withdraw -> sell DEX)\n` +
+      (open.length ? `Resuming ${open.length} open transfer(s)\n` : '') +
       (risk.paused ? `⏸ Still paused: ${risk.pauseReason} (send /start)` : '▶️ Trading enabled'),
   );
 }

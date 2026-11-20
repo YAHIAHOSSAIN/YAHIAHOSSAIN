@@ -27,6 +27,9 @@ export interface CoinNetwork {
   contract?: string;
   depositEnable: boolean;
   withdrawEnable: boolean;
+  withdrawFee?: string; // in the coin itself
+  withdrawMin?: string;
+  withdrawMax?: string;
 }
 export interface CoinConfig {
   coin: string;
@@ -117,12 +120,35 @@ export class MexcRest {
     return Object.fromEntries(a.balances.map((b) => [b.asset, Number(b.free)]));
   }
 
+  /** Best bid/ask for every symbol in one call. */
+  async bookTickers(): Promise<Map<string, { bid: number; ask: number }>> {
+    const r = await this.request<{ symbol: string; bidPrice: string; askPrice: string }[]>('GET', '/api/v3/ticker/bookTicker');
+    return new Map(r.map((t) => [t.symbol, { bid: Number(t.bidPrice), ask: Number(t.askPrice) }]));
+  }
+
+  /** Withdraw (new endpoint). Requires an API key with withdraw permission. Returns the withdraw id. */
+  async withdraw(p: { coin: string; netWork: string; address: string; amount: string; contractAddress?: string; withdrawOrderId?: string }): Promise<string> {
+    const params: Record<string, string> = { coin: p.coin, netWork: p.netWork, address: p.address, amount: p.amount };
+    if (p.contractAddress) params.contractAddress = p.contractAddress;
+    if (p.withdrawOrderId) params.withdrawOrderId = p.withdrawOrderId;
+    const r = await this.request<{ id: string }>('POST', '/api/v3/capital/withdraw', params, true);
+    return r.id;
+  }
+
+  /** Status: 1 APPLY .. 6 WAIT_CONFIRM, 7 SUCCESS, 8 FAILED, 9 CANCEL, 10 MANUAL. */
+  async withdrawStatus(coin: string, id: string): Promise<{ status: number; txId?: string } | null> {
+    const r = await this.request<{ id: string; status: number | string; txId?: string }[]>('GET', '/api/v3/capital/withdraw/history', { coin, limit: 50 }, true);
+    const w = r.find((x) => x.id === id);
+    return w ? { status: Number(w.status), txId: w.txId } : null;
+  }
+
   limitOrder(symbol: string, side: Side, quantity: string, price: string): Promise<{ orderId: string }> {
     return this.request('POST', '/api/v3/order', { symbol, side, type: 'LIMIT', quantity, price }, true);
   }
 
-  marketOrder(symbol: string, side: Side, quantity: string): Promise<{ orderId: string }> {
-    return this.request('POST', '/api/v3/order', { symbol, side, type: 'MARKET', quantity }, true);
+  /** MARKET SELL by base quantity (documented). For buys use an aggressive LIMIT instead. */
+  marketSell(symbol: string, quantity: string): Promise<{ orderId: string }> {
+    return this.request('POST', '/api/v3/order', { symbol, side: 'SELL', type: 'MARKET', quantity }, true);
   }
 
   getOrder(symbol: string, orderId: string): Promise<Order> {

@@ -5,7 +5,43 @@
 
 Stack: Node 20+, TypeScript, ethers v6, MEXC Spot API v3 (REST + protobuf WebSocket), SQLite, Telegram, pm2।
 
-## কীভাবে কাজ করে
+বটে দুইটা strategy আছে (`STRATEGY`):
+
+| | `transfer` (ডিফল্ট) | `inventory` |
+|---|---|---|
+| কী করে | MEXC-এর **সব** ERC20 token সারাক্ষণ scan করে। যে token MEXC-তে সস্তা, সেটা MEXC-তে কেনে, wallet-এ withdraw করে, তারপর DEX-এ বেচে | দুই জায়গায় আগে থেকে token রাখে, দুই দিকে একসাথে trade করে |
+| গতি | ধীর: withdraw-এর জন্য মিনিট থেকে ঘণ্টা লাগে | তাৎক্ষণিক |
+| দাম সরে যাওয়ার ঝুঁকি | আছে (অপেক্ষার সময়ে), `TRANSFER_DRIFT_BPS` দিয়ে ধরা হয় | খুব কম |
+| MEXC API key | Trade **আর** Withdraw permission লাগে | শুধু Trade |
+| কী রাখতে হবে | MEXC-তে USDT, wallet-এ gas-এর ETH | দুই জায়গাতেই token আর stablecoin |
+
+## Transfer strategy (`STRATEGY=transfer`)
+
+1. **Scan (প্রতি `SCAN_INTERVAL_SEC` সেকেন্ডে):** MEXC-এর সব USDT pair থেকে বাছাই করে সেই token-গুলো যেগুলো Ethereum (ERC20)
+   token, যেগুলোর deposit আর withdraw দুইটাই খোলা, আর যেগুলোর volume যথেষ্ট। Contract address আসে MEXC-এর নিজের তথ্য থেকে।
+   সব token-এর MEXC দাম আসে **একটা call-এ**, আর DEX দাম আসে DexScreener থেকে, একবারে ৩০টা token।
+2. যেগুলোর gap `SCAN_MIN_GAP_PCT`-এর বেশি (আর ৫০%-এর কম, কারণ এর বেশি হলে সাধারণত ভুল token বা মরা pool),
+   শুধু সেগুলোর জন্য **ঠিক trade size অনুযায়ী** 0x বা 1inch quote নেয়।
+3. **Net লাভ** = DEX-এ বিক্রির মূল্য − MEXC-তে কেনার খরচ − MEXC fee − **withdraw fee** − gas (approval + swap) − slippage
+   − **দাম সরে যাওয়ার reserve** − safety margin। এটা `max($15, 0.5%)`-এর বেশি হলে তবেই trade করে।
+4. **MEXC-তে কেনে** (limit order), তারপর **শুধু বটের নিজের wallet address-এ withdraw করে**। অন্য কোনো address-এ কখনো না।
+5. **Token আসার অপেক্ষা:** wallet-এর ব্যালান্স দেখে বোঝে token এসেছে কিনা (withdraw fee কত কাটা হলো তা আন্দাজ করে না)।
+   `TRANSFER_TIMEOUT_MIN`-এর বেশি সময় লাগলে alert দেয়। এর মধ্যে নতুন কোনো trade খোলে না।
+6. **DEX-এ বেচে:** exact approval দেয়, firm quote নেয়, simulate করে, private RPC দিয়ে পাঠায়। আসল USDC কত এলো সেটা মেপে PnL বের করে।
+7. **কিছু ভুল হলে:**
+   - withdraw প্রত্যাখ্যাত হলে বা MEXC-এর দিক থেকে fail করলে, token আবার MEXC-তেই market-এ বেচে দেয়।
+   - DEX-এ ৩ বার বেচতে না পারলে 🚨 alert দেয়, তারপরও প্রতিবার scan-এর সময় আবার চেষ্টা করে।
+8. প্রতিটা ধাপ SQLite-এ লেখা থাকে, তাই **restart হলেও** মাঝপথের transfer যেখানে থেমেছিল সেখান থেকে চলবে।
+9. লাভ জমা হয় wallet-এ USDC হিসেবে, আর MEXC-এর USDT কমতে থাকে। কমে গেলে বট "rebalance" alert দেবে।
+   তখন wallet থেকে USDC নিজে MEXC-তে পাঠাতে হবে। বট নিজে কখনো MEXC-তে টাকা পাঠায় না।
+
+### Transfer strategy-র নিরাপত্তা (অবশ্যই করবেন)
+- MEXC API key: **Spot Trade + Withdraw** permission, **IP whitelist করা থাকবে শুধু VPS-এর IP**।
+- MEXC settings-এ **Withdrawal Address Whitelist চালু করুন**, আর সেখানে **শুধু বটের hot wallet address** রাখুন।
+  তাহলে কেউ key চুরি করলেও টাকা অন্য কোথাও পাঠাতে পারবে না।
+- MEXC account-এ শুধু ততটুকু USDT রাখুন যতটুকু বটের জন্য দরকার।
+
+## Inventory strategy (`STRATEGY=inventory`): কীভাবে কাজ করে
 
 1. **Watchlist:** MEXC-তে USDT pair আছে এমন token, যার MEXC-তে 24h volume $500k-এর বেশি আর Ethereum DEX-এ pool TVL
    $200k-এর বেশি (DexScreener দেখে)। Contract address নেওয়া হয় **MEXC-এর নিজের deposit network info থেকে**,
@@ -57,7 +93,8 @@ npm ci && npm run build && npm test
 
 ### 2. নতুন hot wallet
 - **একদম নতুন** একটা wallet বানান, শুধু এই বটের জন্য। Private key `.env`-এ যাবে।
-- Wallet-এ রাখুন: gas-এর জন্য **0.03–0.05 ETH**, **USDC** (যেমন $300–500), আর প্রতিটা token কিছু পরিমাণে (যেমন $200–300)।
+- `transfer`: wallet-এ শুধু gas-এর জন্য **0.03–0.05 ETH**, আর MEXC-তে **USDT**।
+- `inventory`: wallet-এ ETH, **USDC** আর প্রতিটা token কিছু পরিমাণে রাখতে হবে।
 - বট নিজে কোনো টাকা transfer বা withdraw করে না।
 
 ### 3. MEXC
@@ -88,6 +125,11 @@ npm run report -- 24 live
 এটা দেখায় কয়টা trade হয়েছে, মোট net PnL, gas খরচ, কয়টা fail করেছে, আর কোন token-এ লাভ বা ক্ষতি হয়েছে। Telegram-এর দৈনিক summary-তেও একই তথ্য আসে।
 
 ## জরুরি কথা
+
+- **আসল scan-এ দেখা গেছে** (LINK, PEPE, UNI, SHIB, ENA, LDO): MEXC আর DEX-এর gap বেশিরভাগ সময় **০–১%**।
+  আর withdraw fee, ~$৪–১০ gas আর ১.৫% drift reserve বাদ দিলে, **লাভ হতে সাধারণত ৫–১০%+ gap লাগে**।
+  এত বড় gap সাধারণত ছোট বা নতুন token-এ দেখা যায়, অথবা যখন deposit বা withdraw বন্ধ থাকে। বট ঠিক সেগুলোই বাদ দেয়, কারণ সেগুলো ফাঁদ।
+  তাই trade খুব কম হবে। এটা স্বাভাবিক।
 
 - **$200 trade-এ $15 ন্যূনতম লাভ মানে অন্তত ~৭.৫% দামের পার্থক্য লাগবে**, তাও gas আর fee বাদ দেওয়ার পর। LINK বা PEPE-র মতো liquid
   token-এ এত বড় পার্থক্য প্রায় কখনোই থাকে না। এত বড় পার্থক্য দেখা গেলে সাধারণত কিছু একটা গোলমাল থাকে: deposit বন্ধ,
