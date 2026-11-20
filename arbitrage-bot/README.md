@@ -25,6 +25,7 @@
 | `contracts/FlashArbitrage.sol` | On-chain flash-swap arbitrage contract |
 | `src/math.js` | Uniswap V2 সূত্র + সর্বোত্তম পরিমাণ খোঁজা (contract-এর সাথে হুবহু মেলে) |
 | `src/bot.js` | Block দেখা, সুযোগ খোঁজা, simulate করা, পাঠানো |
+| `src/mexc.js`, `src/cexdexMath.js`, `src/cexdex.js` | MEXC ↔ Uniswap CEX-DEX arbitrage |
 | `test/` | Math unit test + mock pool দিয়ে contract test |
 
 ## চালানোর ধাপ
@@ -38,6 +39,31 @@ npm start                # DRY_RUN=true থাকলে শুধু সুয�
 ```
 
 আগে testnet-এ, অথবা Hardhat mainnet fork-এ চালিয়ে দেখো। সব ঠিক থাকলে তবেই `DRY_RUN=false` দাও।
+
+## MEXC ↔ DEX (Ethereum) bot — `src/cexdex.js`
+
+MEXC-তে ETH-এর দাম আর Uniswap V2-তে ETH-এর দামের পার্থক্য থেকে লাভ তোলে।
+
+| দিক | Uniswap (wallet) | MEXC |
+|---|---|---|
+| `DEX_BUY` (MEXC-তে দাম বেশি) | USDC দিয়ে WETH কেনো | ETH বেচো |
+| `CEX_BUY` (MEXC-তে দাম কম) | WETH বেচে USDC নাও | USDT দিয়ে ETH কেনো |
+
+- এটা flash swap-এর মতো **atomic না**, তাই দুই জায়গাতেই টাকা রাখতে হয়:
+  wallet-এ USDC + WETH (আর gas-এর ETH), MEXC-তে USDT + ETH।
+- প্রতি block-এ MEXC order book আর Uniswap reserves পড়ে, MEXC fee (0.05%), price impact আর gas বাদ দিয়ে
+  net লাভ হিসাব করে, আর ব্যালান্স অনুযায়ী trade-এর পরিমাণ ঠিক করে।
+- **আগে DEX leg** যায় (Flashbots RPC দিয়ে, slippage সীমা সহ)। সেটা সফল হলে তবেই MEXC-তে
+  limit order দেয়, তাই DEX fail করলে আপনি এক দিকে আটকে থাকেন না।
+- সময়ের সাথে inventory এক দিকে জমে যাবে (যেমন সব ETH wallet-এ চলে আসবে)। তখন নিজে deposit/withdraw করে ব্যালান্স ঠিক করতে হবে।
+
+```bash
+npm run start:cexdex     # RPC_URL দিলেই DRY_RUN মোডে লাইভ দাম দেখায়
+```
+
+ঝুঁকি: DEX tx confirm হতে ~১২ সেকেন্ড লাগে, এর মধ্যে MEXC-এর দাম সরে যেতে পারে। USDC আর USDT-কে 1:1 ধরা হয়।
+MEXC API key-তে **withdraw permission কখনো দেবেন না**, আর key-টা নিজের সার্ভারের IP-তে সীমাবদ্ধ রাখুন।
+Uniswap V2-তে এখন liquidity কম। বেশিরভাগ liquidity Uniswap V3-তে, তাই পরের ধাপ হিসেবে V3 যোগ করা উচিত।
 
 ## বাস্তবতা (অবশ্যই পড়ো)
 

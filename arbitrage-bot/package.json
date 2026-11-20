@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "start": "node src/bot.js",
-    "test": "node --test test/math.test.js && hardhat test test/FlashArbitrage.test.cjs",
+    "test": "node --test test/math.test.js test/cexdex.test.js && hardhat test test/FlashArbitrage.test.cjs",
     "compile": "hardhat compile",
-    "deploy": "hardhat run scripts/deploy.cjs --network mainnet"
+    "deploy": "hardhat run scripts/deploy.cjs --network mainnet",
+    "start:cexdex": "node src/cexdex.js"
   },
   "dependencies": {
     "dotenv": "^16.6.1",
