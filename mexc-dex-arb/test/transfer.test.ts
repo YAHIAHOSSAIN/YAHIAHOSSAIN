@@ -41,6 +41,7 @@ function setup(
   process.env.ALLOW_WITHDRAWALS = 'yes';
   process.env.RPC_URL = 'http://localhost';
   process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
+  process.env.MIN_PROFIT_USD = '15';
   process.env.PRIVATE_KEY = '0x' + '22'.repeat(32);
   process.env.MEXC_API_KEY = 'k'.repeat(10);
   process.env.MEXC_API_SECRET = 's'.repeat(10);
@@ -132,7 +133,11 @@ function setup(
     sleep: async () => {},
     now: o.now,
   });
-  const arrive = (tokens: number) => (state.wallet[XYZ] += BigInt(Math.round(tokens * 1e6)) * 10n ** 12n);
+  // The withdrawal lands: MEXC reports SUCCESS (7) and the wallet balance grows.
+  const arrive = (tokens: number) => {
+    state.withdrawStatus = 7;
+    state.wallet[XYZ] += BigInt(Math.round(tokens * 1e6)) * 10n ** 12n;
+  };
   return { engine, db, risk, alerts, calls, state, arrive, cfg };
 }
 
@@ -202,6 +207,7 @@ test('restart while withdrawing: a new engine resumes the same transfer', async 
   const second = setup({ db: first.db });
   Object.assign(second.state, first.state);
   second.state.wallet[XYZ] = BigInt(198.9e6) * 10n ** 12n;
+  second.state.withdrawStatus = 7; // MEXC reports SUCCESS
   await second.engine.tick();
   assert.ok(!first.db.openTransfers().some((t) => t.id === 1));
   assert.equal(first.db.statsSince(0, 'live').total.trades, 1);
@@ -270,7 +276,7 @@ test('swap outcome unknown: stuck + paused, never retried automatically', async 
   assert.equal(calls.filter((c) => c === 'send').length, 1);
 });
 
-test('withdrawal never arrives: after 2x timeout it stops blocking new trades but is still watched', async () => {
+test('withdrawal never arrives: after 2x timeout it stops blocking, but never a 2nd transfer of the same token', async () => {
   let t = Date.UTC(2026, 10, 20, 6);
   const { engine, db, calls, alerts, cfg } = setup({ now: () => t });
   await engine.tick();
@@ -283,7 +289,10 @@ test('withdrawal never arrives: after 2x timeout it stops blocking new trades bu
   assert.equal(db.getTransfer(1)!.alerted_timeout, 2);
   assert.equal(db.getTransfer(1)!.status, 'withdrawing'); // still watched
   await engine.tick();
-  assert.equal(calls.filter((c) => c.startsWith('limit BUY')).length, 2); // new trade allowed
+  // It no longer blocks by COUNT, but a second transfer of the SAME token must never start while
+  // the first is still out (they would share one wallet balance).
+  assert.equal(calls.filter((c) => c.startsWith('limit BUY')).length, 1);
+  assert.equal(db.blockingTransfers().length, 0);
 });
 
 test('withdraw rejected: sells the tokens back on MEXC and records a failure', async () => {
@@ -334,4 +343,16 @@ test('loadUniverse respects WATCHLIST', async () => {
   };
   const u = await loadUniverse(fake as never, { minVolumeUsd: 1, only: ['ABC'] });
   assert.deepEqual(u.map((t) => t.base), ['ABC']);
+});
+
+test('a dust deposit during the withdrawal is NOT taken as arrival', async () => {
+  const { engine, db, alerts, state } = setup();
+  await engine.tick();
+  state.wallet[XYZ] += 10n ** 15n; // 0.001 XYZ airdrop, MEXC still PROCESSING
+  await engine.tick();
+  assert.equal(db.getTransfer(1)!.status, 'withdrawing');
+  state.withdrawStatus = 7; // MEXC says SUCCESS but only dust arrived
+  await engine.tick();
+  assert.equal(db.getTransfer(1)!.status, 'withdrawing');
+  assert.ok(alerts.some((a) => a.includes('only grew by')));
 });

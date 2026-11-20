@@ -257,3 +257,50 @@ test('RPC URLs (they contain provider keys) are redacted', () => {
   registerSecrets(secretsOf(c));
   assert.equal(redact('rpc https://eth-mainnet.g.alchemy.com/v2/SECRETKEY123 failed'), 'rpc *** failed');
 });
+
+test('default economics: profit floor is small vs trade size; $15 on $50 is rejected', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MIN_PROFIT_USD', 'MAX_TRADE_USD', 'MODE', 'STRATEGY']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    const d = validateConfig(loadConfig());
+    assert.ok(d.minProfitUsd <= d.maxTradeUsd * 0.1, `${d.minProfitUsd} vs ${d.maxTradeUsd}`);
+    assert.throws(() => validateConfig({ ...d, minProfitUsd: 15, maxTradeUsd: 50 }), /only fake gaps/);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Telegram: a command sent before this start (replayed after restart) is ignored', async () => {
+  const tg = new Telegram('123456:TOKENTOKEN', '777', (async () => new Response(JSON.stringify({ ok: true, result: {} }))) as unknown as typeof fetch, '42');
+  let n = 0;
+  const handlers = { '/start': () => (n++, 'ok') };
+  const old = Math.floor(Date.now() / 1000) - 3600;
+  await tg.handle({ message: { chat: { id: 777, type: 'private' }, from: { id: 42 }, text: '/start confirm', date: old } }, handlers);
+  assert.equal(n, 0);
+  await tg.handle({ message: { chat: { id: 777, type: 'private' }, from: { id: 42 }, text: '/start confirm', date: Math.floor(Date.now() / 1000) + 1 } }, handlers);
+  assert.equal(n, 1);
+});
+
+test('aggressive close offset stays inside a tight PERCENT_PRICE_BY_SIDE band', async () => {
+  const { aggressiveOffset, rulesFrom } = await import('../src/mexc/rules.js');
+  const base = { symbol: 'X', baseAsset: 'X', quoteAsset: 'USDT', status: '1', isSpotTradingAllowed: true, baseSizePrecision: '0', quotePrecision: 4, orderTypes: ['LIMIT'] };
+  assert.equal(aggressiveOffset(rulesFrom({ ...base, filters: [{ filterType: 'PERCENT_PRICE_BY_SIDE', bidMultiplierUp: '0.2', askMultiplierDown: '0.2' }] })), 0.02);
+  assert.equal(aggressiveOffset(rulesFrom({ ...base, filters: [{ filterType: 'PERCENT_PRICE_BY_SIDE', bidMultiplierUp: '0.02', askMultiplierDown: '0.02' }] })), 0.01);
+});
+
+test('MARKET orders use the market notional limits', async () => {
+  const { orderProblem } = await import('../src/mexc/rules.js');
+  const r = { qtyStep: 0.01, priceDecimals: 2, minQty: 0, minNotional: 1, maxNotional: 1e6, orderTypes: ['LIMIT', 'MARKET'], tradeSideType: 1, minNotionalMarket: 5 };
+  assert.equal(orderProblem(r, 'SELL', 1, 2, 'LIMIT'), null);
+  assert.match(orderProblem(r, 'SELL', 1, 2, 'MARKET')!, /minimum 5/);
+});
+
+test('cancelAndConfirm: never reports a still-open order as closed', async () => {
+  const { cancelAndConfirm, OrderStillOpenError } = await import('../src/engine.js');
+  const open = { getOrder: async () => ({ orderId: '1', status: 'NEW', executedQty: '0' }) as never, cancelOrder: async () => { throw new Error('timeout'); } };
+  await assert.rejects(cancelAndConfirm(open, 'X', '1', async () => {}), (e: unknown) => e instanceof OrderStillOpenError);
+  let st = 'NEW';
+  const ok = { getOrder: async () => ({ orderId: '1', status: st, executedQty: '0' }) as never, cancelOrder: async () => ((st = 'CANCELED'), {} as never) };
+  assert.equal((await cancelAndConfirm(ok, 'X', '1', async () => {})).status, 'CANCELED');
+});

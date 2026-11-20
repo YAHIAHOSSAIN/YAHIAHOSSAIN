@@ -56,35 +56,41 @@ export async function buildWatchlist(
     .filter((s) => (volume.get(s.symbol) ?? 0) >= opts.minVolumeUsd)
     .sort((a, b) => (volume.get(b.symbol) ?? 0) - (volume.get(a.symbol) ?? 0));
 
+  // Check candidates 8 at a time (each DexScreener call can take seconds), stop once we have enough.
   const out: Token[] = [];
-  for (const s of candidates) {
-    if (out.length >= opts.max) break;
+  const check = async (s: (typeof candidates)[number]): Promise<Token | null> => {
     const coin = coinBy.get(s.baseAsset.toUpperCase());
     const net = coin && ethNetwork(coin);
-    if (!net?.contract || !/^0x[0-9a-fA-F]{40}$/.test(net.contract)) continue; // not an Ethereum token on MEXC
+    if (!net?.contract || !/^0x[0-9a-fA-F]{40}$/.test(net.contract)) return null; // not an Ethereum token on MEXC
     const address = net.contract.toLowerCase();
     try {
       const tvl = await dexTvl(address);
       if (tvl < opts.minTvlUsd) {
         log.info(`watchlist: skip ${s.baseAsset}, DEX TVL $${Math.round(tvl)}`);
-        continue;
+        return null;
       }
-      out.push({
+      const rules = rulesFrom(s);
+      return {
         base: s.baseAsset.toUpperCase(),
         symbol: s.symbol,
         address,
         decimals: await decimalsOf(address),
-        qtyStep: rulesFrom(s).qtyStep,
+        qtyStep: rules.qtyStep,
         priceDecimals: s.quotePrecision,
-        rules: rulesFrom(s),
+        rules,
         dexTvlUsd: tvl,
         mexcVolumeUsd: volume.get(s.symbol) ?? 0,
         depositOk: net.depositEnable,
         withdrawOk: net.withdrawEnable,
-      });
+      };
     } catch (e) {
       log.warn(`watchlist: ${s.baseAsset} check failed: ${errMsg(e)}`);
+      return null;
     }
+  };
+  for (let i = 0; i < candidates.length && out.length < opts.max; i += 8) {
+    const batch = await Promise.all(candidates.slice(i, i + 8).map(check));
+    for (const t of batch) if (t && out.length < opts.max) out.push(t);
   }
   return out;
 }

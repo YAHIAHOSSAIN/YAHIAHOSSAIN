@@ -73,17 +73,34 @@ function installProcessHandlers(tg: Telegram, cleanup: () => void) {
   process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
 }
 
-/** /start handler shared by both strategies: critical pauses need "/start confirm". */
-function startHandler(risk: Risk, statusText: () => Promise<string>, onConfirm: () => void) {
+/**
+ * /start handler shared by both strategies: critical pauses need "/start confirm", and even then
+ * the bot re-checks that nothing is still unresolved (pending DEX tx, executing trade) before resuming.
+ */
+function startHandler(risk: Risk, statusText: () => Promise<string>, stillUnresolved: () => Promise<string | null>) {
   return async (args: string[]) => {
     const confirm = args[0]?.toLowerCase() === 'confirm';
     if (risk.paused && risk.critical && !confirm) {
       return `⚠️ Critical pause: ${risk.pauseReason}\nCheck these positions and balances first:\n\n${await statusText()}\n\nThen send: /start confirm`;
     }
+    if (risk.paused && risk.critical) {
+      const open = await stillUnresolved();
+      if (open) return `⛔ Not resuming: ${open}\nResolve it first (check etherscan / MEXC), then /start confirm again.`;
+    }
     risk.resume(confirm);
-    if (confirm) onConfirm();
     const block = risk.blockReason();
     return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
+  };
+}
+
+/** What still blocks a critical resume, or null. */
+function makeUnresolvedCheck(db: Db, chain: Chain) {
+  return async (): Promise<string | null> => {
+    const u = await chain.checkUnresolved();
+    if (u.state === 'pending') return `DEX tx ${chain.unresolved?.hashes.join(' / ')} (nonce ${chain.unresolved?.nonce}) is still pending`;
+    const ex = db.executingTrades();
+    if (ex.length) return `${ex.length} trade(s) still marked executing (#${ex.map((t) => t.id).join(', #')})`;
+    return null;
   };
 }
 
@@ -99,10 +116,16 @@ async function main() {
 
   const db = new Db(cfg.dbPath);
   const risk = new Risk(db, cfg.mode, cfg);
-  const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId);
+  const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, {
+    get: () => db.getState('telegram_offset'),
+    set: (v) => db.setState('telegram_offset', v),
+  });
   if (!tg.enabled) log.warn('Telegram not configured: alerts only go to the log and there is no /stop');
   const mexc = new MexcRest(cfg.mexcApiKey, cfg.mexcApiSecret);
-  const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei);
+  const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei, {
+    get: () => db.getState('unresolved_tx') || undefined,
+    set: (v) => db.setState('unresolved_tx', v ?? ''),
+  });
   const agg: Aggregator = cfg.aggregator === '0x' ? new ZeroEx(cfg.zeroExApiKey) : new OneInch(cfg.oneInchApiKey);
 
   // --- Pre-flight checks: fail at startup, not in the middle of the first trade ---
@@ -140,7 +163,7 @@ async function main() {
     }
   }
 
-  if (cfg.mode === 'live') await recoverExecuting(db, risk, tg, mexc, (h) => chain.provider.getTransactionReceipt(h));
+  if (cfg.mode === 'live') await recoverExecuting(db, risk, tg, mexc, (h) => chain.provider.getTransactionReceipt(h), () => chain.checkUnresolved());
   // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
   setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
 
@@ -191,15 +214,18 @@ async function main() {
       risk.pause('Telegram /stop');
       return '🛑 Trading STOPPED. Send /start to resume.';
     },
-    '/start': startHandler(risk, statusText, () => (chain.unresolved = null)),
+    '/start': startHandler(risk, statusText, makeUnresolvedCheck(db, chain)),
     '/status': statusText,
   });
 
   // --- Main loop: one scan per block ---
   let busy = false;
   let errors = 0;
-  chain.provider.on('block', async () => {
+  let lastTick = Date.now();
+  let lastStallAlert = 0;
+  const runTick = async () => {
     if (busy || rateLimited() || lifecycle.stopping) return;
+    lastTick = Date.now();
     busy = lifecycle.busy = true;
     try {
       await engine.tick();
@@ -213,7 +239,17 @@ async function main() {
     } finally {
       busy = lifecycle.busy = false;
     }
-  });
+  };
+  chain.provider.on('block', runTick);
+  // Watchdog: if the RPC stops emitting blocks, still scan on a timer, and alert once per hour.
+  setInterval(() => {
+    const idle = Date.now() - lastTick;
+    if (idle > 30_000) void runTick();
+    if (idle > 3 * 60_000 && Date.now() - lastStallAlert > 3600_000) {
+      lastStallAlert = Date.now();
+      void tg.send(`⚠️ No new Ethereum block from RPC for ${Math.round(idle / 60_000)} min: scanning on a timer. Check RPC_URL.`);
+    }
+  }, 15_000);
 
   // MEXC deposit/withdraw status every 10 minutes.
   setInterval(async () => {
@@ -254,7 +290,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
       risk.pause('Telegram /stop');
       return '🛑 New trades STOPPED. An open transfer still finishes (selling the tokens already bought is the safe exit). /start to resume.';
     },
-    '/start': async (args: string[]) => startHandler(risk, transferStatus, () => (chain.unresolved = null))(args),
+    '/start': async (args: string[]) => startHandler(risk, transferStatus, makeUnresolvedCheck(db, chain))(args),
     '/status': async () => transferStatus(),
     '/sell': ([id]: string[]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
     '/clear': ([id]: string[]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),

@@ -59,6 +59,7 @@ export interface TransferRow {
   next_try: number; // ms timestamp: no sell attempt before this (backoff)
   force_sell: number; // 1 = /sell command: sell even below the loss floor
   hold_alerted: number;
+  sell_tx: string | null; // DEX sale tx hash, written before broadcast (crash safety)
 }
 
 const TRANSFER_MIGRATIONS = [
@@ -66,6 +67,7 @@ const TRANSFER_MIGRATIONS = [
   'ALTER TABLE transfers ADD COLUMN next_try INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE transfers ADD COLUMN force_sell INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE transfers ADD COLUMN hold_alerted INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE transfers ADD COLUMN sell_tx TEXT',
 ];
 
 export class Db {

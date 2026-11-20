@@ -43,10 +43,11 @@ export class Risk {
   /** Returns false (and stays paused) if a critical pause is not confirmed. */
   resume(confirm = false): boolean {
     if (this.paused && this.critical && !confirm) return false;
+    // After a critical incident the failure streak is NOT forgiven: the bot does not get a fresh budget.
+    if (!this.critical) this.db.setState('consecutive_fails', '0');
     this.db.setState('paused', '0');
     this.db.setState('pause_reason', '');
     this.db.setState('pause_critical', '0');
-    this.db.setState('consecutive_fails', '0');
     return true;
   }
 

@@ -152,6 +152,25 @@ npm run report -- 24 live
 - **Loss budget:** কোনো trade-এর worst case (size-এর ৫% আর gas) দিনের বাকি loss budget-এর চেয়ে বেশি হলে সেই trade বাদ দেয়।
   PnL-এ approval gas আর MEXC-এর locked balance-ও ধরা হয়।
 
+### Round 2 review-এর পর আরও যা যোগ হয়েছে
+- **লাভের threshold:** ডিফল্ট `MIN_PROFIT_USD=2`। আগের $15 মানে $50 trade-এ প্রায় ৩০% gap লাগত, যা শুধু ভুয়া gap-এ পাওয়া যায়।
+  এখন `MIN_PROFIT_USD` যদি `MAX_TRADE_USD`-এর ১০%-এর বেশি হয়, বট চালুই হবে না।
+- **Unresolved tx মনে রাখা:** ফল অজানা tx-এর তথ্য database-এ থাকে, তাই restart-এর পরও একই nonce আবার ব্যবহার হয় না।
+  RPC স্পষ্টভাবে tx প্রত্যাখ্যান করলে সেটা unresolved ধরা হয় না, nonce আবার ব্যবহার হয়।
+  ১০ মিনিট পরেও কোনো RPC tx-টা না চিনলে, সেটা drop হয়ে গেছে ধরা হয়। Cancel পাঠানোর আগে gas-এর দাম নতুন করে পড়া হয়।
+- **`/start confirm` আরও কড়া:** কোনো DEX tx pending থাকলে বা কোনো trade `executing` থাকলে resume করে না।
+  Critical pause থেকে resume করলেও পরপর fail-এর গণনা শূন্য হয় না।
+- **Restart recovery:** দুই দিকই সম্পূর্ণ হয়ে থাকলে trade `ok` হিসেবে চিহ্নিত হয়। Transfer-এর বিক্রির tx hash broadcast-এর আগেই লেখা হয়।
+- **Transfer arrival:** token এসেছে ধরা হয় শুধু তখন, যখন MEXC SUCCESS দেখায় **আর** wallet-এ প্রত্যাশিত পরিমাণ আসে।
+  আসল `transactionFee` দিয়ে হিসাব হয়। একই token-এর দুইটা transfer কখনো একসাথে চলে না।
+- **MEXC order cancel যাচাই:** cancel করার পর order আসলেই বন্ধ হলো কিনা দেখা হয়।
+  খোলা থেকে গেলে দ্বিতীয়বার close করে না, critical pause দেয়।
+- **দামের সীমা:** aggressive close-এর দাম symbol-এর `PERCENT_PRICE_BY_SIDE` সীমার ভেতরে রাখা হয়। কিছু symbol-এর সীমা মাত্র ২%।
+  MARKET order-এর আলাদা notional সীমা মানা হয়।
+- **Telegram:** update offset database-এ সংরক্ষিত থাকে। বট চালু হওয়ার আগে পাঠানো command উপেক্ষা করা হয়,
+  তাই restart-এর পর পুরনো `/start confirm` আবার চলে না। Error হলে backoff করে।
+- **Block watchdog:** RPC থেকে block আসা বন্ধ হলেও বট timer দিয়ে scan চালিয়ে যায়, আর alert দেয়।
+
 ## জরুরি কথা
 
 - **আসল scan-এ দেখা গেছে** (LINK, PEPE, UNI, SHIB, ENA, LDO): MEXC আর DEX-এর gap বেশিরভাগ সময় **০–১%**।

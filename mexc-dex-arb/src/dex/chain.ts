@@ -12,26 +12,8 @@ const ERC20_ABI = [
 ];
 const APPROVE_GAS = 60_000n;
 
-export interface GasInfo {
-  baseFee: bigint;
-  tip: bigint;
-  /** What we expect to actually pay per gas (baseFee + tip). */
-  effective: bigint;
-  /** maxFeePerGas to set on the tx (headroom for base fee rises). */
-  maxFee: bigint;
-}
-
-export interface TxResult {
-  ok: boolean;
-  hash?: string;
-  gasCostWei: bigint;
-  reason?: string;
-  /**
-   * true = we do NOT know whether the tx executed (not mined, cancel not confirmed either).
-   * Callers must not unwind or retry: pause and let a human check the wallet.
-   */
-  unknown?: boolean;
-}
+export type { GasInfo, TxResult } from './txsender.js';
+import { type GasInfo, type KeyValue, type TxResult, TxSender } from './txsender.js';
 
 export class Chain {
   readonly provider: ethers.JsonRpcProvider;
@@ -39,10 +21,52 @@ export class Chain {
   readonly wallet?: ethers.Wallet;
   private decimalsCache = new Map<string, number>();
 
-  constructor(rpcUrl: string, sendRpcUrl: string, privateKey: string, private priorityFeeGwei: number) {
+  readonly tx: TxSender;
+
+  /** `unresolvedStore` persists the unresolved-tx record (SQLite state) so a restart does not forget it. */
+  constructor(rpcUrl: string, sendRpcUrl: string, privateKey: string, private priorityFeeGwei: number, unresolvedStore?: KeyValue) {
     this.provider = new ethers.JsonRpcProvider(rpcUrl, 1, { staticNetwork: true });
     this.sendProvider = new ethers.JsonRpcProvider(sendRpcUrl, 1, { staticNetwork: true });
     if (privateKey) this.wallet = new ethers.Wallet(privateKey, this.provider);
+    const chain = this; // eslint-disable-line @typescript-eslint/no-this-alias
+    this.tx = new TxSender(
+      {
+        get address() {
+          return chain.address;
+        },
+        confirmedNonce: () => this.provider.getTransactionCount(this.address, 'latest'),
+        receipt: (h) => this.provider.getTransactionReceipt(h),
+        knowsTx: async (h) => Boolean((await this.provider.getTransaction(h).catch(() => null)) ?? (await this.sendProvider.getTransaction(h).catch(() => null))),
+        sign: async (t) => {
+          const raw = await this.wallet!.signTransaction({ chainId: 1n, type: 2, ...t });
+          return { raw, hash: ethers.keccak256(raw) };
+        },
+        broadcast: async (raw) => {
+          await this.sendProvider.send('eth_sendRawTransaction', [raw]);
+        },
+        gas: () => this.gas(),
+      },
+      unresolvedStore,
+    );
+  }
+
+  get unresolved() {
+    return this.tx.unresolved;
+  }
+  checkUnresolved() {
+    return this.tx.checkUnresolved();
+  }
+  receipt(hash: string) {
+    return this.provider.getTransactionReceipt(hash);
+  }
+  send(
+    tx: { to: string; data: string; value?: bigint },
+    gasLimit: bigint,
+    gas: GasInfo,
+    timeoutSec: number,
+    onSigned?: (hash: string, nonce: number) => void,
+  ): Promise<TxResult> {
+    return this.tx.send(tx, gasLimit, gas, timeoutSec, onSigned);
   }
 
   get address(): string {
@@ -116,117 +140,5 @@ export class Chain {
     const req = { from: this.address, to: tx.to, data: tx.data, value: tx.value };
     await this.provider.call(req);
     return this.provider.estimateGas(req);
-  }
-
-  // ---- Nonce manager ----
-  // Our txs go through a PRIVATE RPC, so the public RPC's 'pending' count does not see them.
-  // We track nonces locally, starting from the confirmed ('latest') count, and refuse to send
-  // while an earlier tx is unresolved (outcome unknown), so a nonce is never reused by accident.
-  private nextNonce: number | null = null;
-  /** A tx (and maybe its cancel) whose outcome we do not know yet. */
-  unresolved: { nonce: number; hashes: string[]; since: number } | null = null;
-
-  private async takeNonce(): Promise<number> {
-    const confirmed = await this.provider.getTransactionCount(this.address, 'latest');
-    if (this.nextNonce === null || this.nextNonce < confirmed) this.nextNonce = confirmed;
-    return this.nextNonce;
-  }
-
-  /**
-   * Re-check an unresolved tx. Returns 'clear' once its nonce is consumed on-chain (by the tx or its cancel),
-   * 'pending' while nothing is mined yet.
-   */
-  async checkUnresolved(): Promise<{ state: 'clear' | 'pending'; executedHash?: string; ok?: boolean }> {
-    const u = this.unresolved;
-    if (!u) return { state: 'clear' };
-    for (const h of u.hashes) {
-      const r = await this.provider.getTransactionReceipt(h).catch(() => null);
-      if (r) {
-        this.unresolved = null;
-        this.nextNonce = Math.max(this.nextNonce ?? 0, u.nonce + 1);
-        return { state: 'clear', executedHash: h, ok: r.status === 1 };
-      }
-    }
-    const confirmed = await this.provider.getTransactionCount(this.address, 'latest').catch(() => -1);
-    if (confirmed > u.nonce) {
-      // Nonce used by something we did not see a receipt for (RPC lag): treat as clear, keep counting up.
-      this.unresolved = null;
-      this.nextNonce = Math.max(this.nextNonce ?? 0, confirmed);
-      return { state: 'clear' };
-    }
-    return { state: 'pending' };
-  }
-
-  /**
-   * Sign and send through the private RPC, wait for inclusion.
-   * If it is not mined within timeoutSec, replace it with a 0-value self-transfer (cancel).
-   * Result states: ok (mined, success), ok:false (mined and reverted / cancelled), unknown (we cannot tell).
-   */
-  async send(
-    tx: { to: string; data: string; value?: bigint },
-    gasLimit: bigint,
-    gas: GasInfo,
-    timeoutSec: number,
-    onSigned?: (hash: string, nonce: number) => void,
-  ): Promise<TxResult> {
-    const wallet = this.wallet!;
-    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
-      return { ok: false, gasCostWei: 0n, reason: `refusing to send: earlier tx ${this.unresolved.hashes[0]} unresolved` };
-    }
-    const nonce = await this.takeNonce();
-    const base = { chainId: 1n, type: 2, nonce, maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.tip };
-    const signed = await wallet.signTransaction({ ...base, to: tx.to, data: tx.data, value: tx.value ?? 0n, gasLimit });
-    const hash = ethers.keccak256(signed);
-    this.nextNonce = nonce + 1;
-    onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
-    try {
-      await this.sendProvider.send('eth_sendRawTransaction', [signed]);
-    } catch (e) {
-      // The RPC may have accepted it before failing to answer: outcome unknown, nonce may be consumed.
-      this.unresolved = { nonce, hashes: [hash], since: Date.now() };
-      return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `send error, outcome unknown: ${errMsg(e)}` };
-    }
-    log.info(`tx sent ${hash} (nonce ${nonce})`);
-
-    let receipt = await this.waitReceipt(hash, timeoutSec);
-    if (!receipt) {
-      log.warn(`tx ${hash} not mined in ${timeoutSec}s, sending cancel`);
-      const bump = (x: bigint) => (x * 13n) / 10n; // +30% to replace
-      const cancel = await wallet.signTransaction({
-        ...base,
-        maxFeePerGas: bump(gas.maxFee),
-        maxPriorityFeePerGas: bump(gas.tip),
-        to: wallet.address,
-        value: 0n,
-        gasLimit: 21_000n,
-      });
-      const cancelHash = ethers.keccak256(cancel);
-      await this.sendProvider.send('eth_sendRawTransaction', [cancel]).catch((e) => log.warn(`cancel send failed: ${errMsg(e)}`));
-      const deadline = Date.now() + timeoutSec * 1000;
-      while (Date.now() < deadline && !receipt) {
-        receipt = await this.provider.getTransactionReceipt(hash).catch(() => null);
-        const cancelReceipt = await this.provider.getTransactionReceipt(cancelHash).catch(() => null);
-        if (cancelReceipt) {
-          return { ok: false, hash, gasCostWei: cancelReceipt.gasUsed * cancelReceipt.gasPrice, reason: 'not mined, cancelled' };
-        }
-        if (!receipt) await sleep(3000);
-      }
-      if (!receipt) {
-        this.unresolved = { nonce, hashes: [hash, cancelHash], since: Date.now() };
-        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancelHash} not confirmed: outcome UNKNOWN` };
-      }
-    }
-    const cost = receipt.gasUsed * receipt.gasPrice;
-    return receipt.status === 1 ? { ok: true, hash, gasCostWei: cost } : { ok: false, hash, gasCostWei: cost, reason: 'reverted' };
-  }
-
-  private async waitReceipt(hash: string, timeoutSec: number) {
-    const deadline = Date.now() + timeoutSec * 1000;
-    while (Date.now() < deadline) {
-      const r = await this.provider.getTransactionReceipt(hash).catch(() => null);
-      if (r) return r;
-      await sleep(2000);
-    }
-    return null;
   }
 }

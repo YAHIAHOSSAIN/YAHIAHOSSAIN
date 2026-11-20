@@ -21,6 +21,9 @@ export interface SymbolInfo {
   orderTypes: string[];
   quoteAmountPrecision?: string; // minimum order value (USDT)
   maxQuoteAmount?: string;
+  quoteAmountPrecisionMarket?: string;
+  maxQuoteAmountMarket?: string;
+  filters?: { filterType: string; bidMultiplierUp?: string; askMultiplierDown?: string }[];
   tradeSideType?: number; // 1 all, 2 buy only, 3 sell only, 4 close only
 }
 export interface CoinNetwork {
@@ -59,10 +62,19 @@ export class RateLimitError extends Error {}
  */
 export class AmbiguousRequestError extends Error {}
 
+/** MEXC answered with an error body; `code` is MEXC's error code when present (e.g. -2011 "Unknown order sent"). */
+export class MexcApiError extends Error {
+  constructor(msg: string, readonly status: number, readonly code?: number) {
+    super(msg);
+  }
+}
+
 export interface WithdrawRecord {
   id: string;
   status: number;
   amount: string;
+  /** Fee MEXC actually charged (withdraw history `transactionFee`). */
+  transactionFee?: string;
   txId?: string;
   withdrawOrderId?: string;
 }
@@ -117,7 +129,10 @@ export class MexcRest {
     const err = redact(`MEXC ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`);
     if (res.status === 429 || res.status === 418) throw new RateLimitError(err);
     if (res.status >= 500 && method !== 'GET') throw new AmbiguousRequestError(err);
-    if (!res.ok) throw new Error(err);
+    if (!res.ok) {
+      const code = body && typeof body === 'object' && 'code' in body ? Number((body as { code: unknown }).code) : undefined;
+      throw new MexcApiError(err, res.status, Number.isFinite(code) ? code : undefined);
+    }
     return body as T;
   }
 
@@ -182,13 +197,13 @@ export class MexcRest {
 
   /** Recent withdrawals of a coin (status: 1 APPLY .. 6 WAIT_CONFIRM, 7 SUCCESS, 8 FAILED, 9 CANCEL, 10 MANUAL). */
   async withdrawHistory(coin: string, sinceTs: number): Promise<WithdrawRecord[]> {
-    const r = await this.request<{ id: string; status: number | string; amount: string; txId?: string; withdrawOrderId?: string }[]>(
+    const r = await this.request<{ id: string; status: number | string; amount: string; transactionFee?: string; txId?: string; withdrawOrderId?: string }[]>(
       'GET',
       '/api/v3/capital/withdraw/history',
       { coin, startTime: Math.max(0, Math.floor(sinceTs)), limit: 1000 },
       true,
     );
-    return r.map((w) => ({ id: w.id, status: Number(w.status), amount: w.amount, txId: w.txId, withdrawOrderId: w.withdrawOrderId }));
+    return r.map((w) => ({ id: w.id, status: Number(w.status), amount: w.amount, transactionFee: w.transactionFee, txId: w.txId, withdrawOrderId: w.withdrawOrderId }));
   }
 
   /** Find a withdrawal by MEXC id or by our own withdrawOrderId. null = not in history. */
@@ -209,8 +224,10 @@ export class MexcRest {
     try {
       return await this.request<Order>('GET', '/api/v3/order', { symbol, origClientOrderId: clientOrderId }, true);
     } catch (e) {
-      // MEXC documents -2011 "Unknown order sent"; anything else is a real error (caller retries).
-      if (/-2011|unknown order|does not exist|not exist/i.test((e as Error).message)) return null;
+      // MEXC documents -2011 "Unknown order sent". Prefer the parsed code; the text match is a fallback
+      // because MEXC does not document its error body shape. Anything else is a real error (caller retries).
+      if (e instanceof MexcApiError && e.code === -2011) return null;
+      if (/-2011|unknown order/i.test((e as Error).message)) return null;
       throw e;
     }
   }

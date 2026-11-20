@@ -5,17 +5,24 @@ import { sleep } from './util.js';
 
 type Handler = (args: string[]) => Promise<string> | string;
 type FetchFn = typeof fetch;
-type Update = { message?: { chat?: { id: number | string; type?: string }; from?: { id: number | string }; text?: string } };
+type Update = {
+  message?: { chat?: { id: number | string; type?: string }; from?: { id: number | string }; text?: string; date?: number };
+};
 
 export class Telegram {
   private offset = 0;
   private running = false;
+
+  /** Commands sent before this moment are never executed (a restart must not replay an old /start confirm). */
+  private readonly startedAt = Math.floor(Date.now() / 1000);
 
   constructor(
     private token: string,
     private chatId: string,
     private fetchFn: FetchFn = fetch,
     private adminId = '',
+    /** Persists the update offset across restarts. */
+    private offsetStore?: { get(): string | undefined; set(v: string): void },
   ) {}
 
   get enabled(): boolean {
@@ -50,6 +57,10 @@ export class Telegram {
   async handle(update: Update, handlers: Record<string, Handler>) {
     const m = update.message;
     if (!m?.text || String(m.chat?.id) !== String(this.chatId)) return; // other chats
+    if (m.date !== undefined && m.date < this.startedAt) {
+      log.warn(`telegram: ignored command sent before this start (${m.text.split(/\s/)[0]})`);
+      return;
+    }
     // In a group anyone could type /start: require the admin user in a private chat.
     if (!this.adminId || String(m.from?.id) !== String(this.adminId) || m.chat?.type !== 'private') {
       log.warn(`telegram: ignored command from user ${m.from?.id} in ${m.chat?.type ?? '?'} chat`);
@@ -65,6 +76,8 @@ export class Telegram {
   async startPolling(handlers: Record<string, Handler>): Promise<void> {
     if (!this.enabled || this.running) return;
     this.running = true;
+    this.offset = Number(this.offsetStore?.get() ?? 0) || 0;
+    let backoff = 5000;
     while (this.running) {
       try {
         const updates = await this.api<({ update_id: number } & Update)[]>(
@@ -74,11 +87,14 @@ export class Telegram {
         );
         for (const u of updates) {
           this.offset = u.update_id + 1;
+          this.offsetStore?.set(String(this.offset)); // acknowledged before handling: never handled twice
           await this.handle(u, handlers).catch((e) => log.warn(`telegram handler: ${errMsg(e)}`));
         }
+        backoff = 5000;
       } catch (e) {
-        log.warn(`telegram poll: ${errMsg(e)}`);
-        await sleep(5000);
+        log.warn(`telegram poll: ${errMsg(e)} (retry in ${backoff / 1000}s)`);
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 5 * 60_000); // e.g. a bad token: do not hammer the API
       }
     }
   }

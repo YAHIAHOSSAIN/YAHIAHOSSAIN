@@ -19,7 +19,8 @@ import {
 } from './pricing.js';
 import { log, errMsg } from './log.js';
 import { AmbiguousRequestError } from './mexc/rest.js';
-import { orderProblem } from './mexc/rules.js';
+import { aggressiveOffset, orderProblem } from './mexc/rules.js';
+import crypto from 'node:crypto';
 
 /** A close/unwind that only partly filled: `remaining` is what is still open. */
 export class PartialCloseError extends Error {
@@ -29,7 +30,41 @@ export class PartialCloseError extends Error {
 }
 
 /** Unique id we give MEXC orders, so an order can be found even if the request timed out. */
-export const clientId = (tag: string) => `arb${tag}${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`.slice(0, 32);
+export const clientId = (tag: string) => `arb${tag}${crypto.randomUUID().replace(/-/g, '')}`.slice(0, 32);
+
+const FINAL_ORDER = new Set(['FILLED', 'CANCELED', 'PARTIALLY_CANCELED']);
+
+/** A cancel could not be confirmed: the order may still be live on MEXC. Never place a second close for it. */
+export class OrderStillOpenError extends Error {
+  constructor(readonly orderId: string, status: string) {
+    super(`MEXC order ${orderId} still ${status} after cancel attempts: it may still fill`);
+  }
+}
+
+/**
+ * Cancel an order and keep checking until MEXC reports a final status (FILLED / CANCELED / PARTIALLY_CANCELED).
+ * Throws OrderStillOpenError if that cannot be confirmed within ~10s.
+ */
+export async function cancelAndConfirm(
+  mexc: Pick<CexApi, 'getOrder' | 'cancelOrder'>,
+  symbol: string,
+  orderId: string,
+  sleep: (ms: number) => Promise<void>,
+): Promise<Order> {
+  let last = '?';
+  for (let i = 0; i < 6; i++) {
+    const o = await mexc.getOrder(symbol, orderId).catch(() => null);
+    if (o) {
+      if (FINAL_ORDER.has(o.status)) return o;
+      last = o.status;
+    }
+    await mexc.cancelOrder(symbol, orderId).catch((e) => log.warn(`cancel ${orderId}: ${errMsg(e)}`));
+    await sleep(500 * (i + 1));
+  }
+  const o = await mexc.getOrder(symbol, orderId).catch(() => null);
+  if (o && FINAL_ORDER.has(o.status)) return o;
+  throw new OrderStillOpenError(orderId, o?.status ?? last);
+}
 
 /**
  * Place an order; if the request is ambiguous (timeout / 5xx) look it up by client id
@@ -46,9 +81,10 @@ export async function placeSafely(
     return await place();
   } catch (e) {
     if (!(e instanceof AmbiguousRequestError)) throw e; // clearly rejected: nothing was placed
+    // MEXC may take a few seconds to index a just-placed order: look for ~20s with backoff.
     let notFound = 0;
-    for (let i = 0; i < 5; i++) {
-      await sleep(1000);
+    for (const wait of [1000, 2000, 3000, 4000, 5000, 5000]) {
+      await sleep(wait);
       let o: Order | null;
       try {
         o = await mexc.getOrderByClientId(symbol, cid);
@@ -56,7 +92,7 @@ export async function placeSafely(
         continue; // lookup itself failed: try again
       }
       if (o) return { orderId: o.orderId }; // it WAS placed
-      if (++notFound >= 3) throw e; // MEXC says three times that no such order exists
+      if (++notFound >= 4) throw e; // MEXC says four times (over ~10s+) that no such order exists
     }
     throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
   }
@@ -90,7 +126,7 @@ export interface ChainApi {
     onSigned?: (hash: string, nonce: number) => void,
   ): Promise<TxResult>;
   /** Unresolved earlier tx (outcome unknown): no new trades until it is 'clear'. */
-  checkUnresolved?(): Promise<{ state: 'clear' | 'pending' }>;
+  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean }>;
 }
 export interface Notifier {
   send(text: string): Promise<void>;
@@ -171,8 +207,13 @@ export class Engine {
     if (block) return this.note('block', `trading blocked: ${block}`);
     this.note('block', 'trading enabled');
 
-    if (this.d.chain.checkUnresolved && (await this.d.chain.checkUnresolved()).state === 'pending') {
-      return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or replaced');
+    if (this.d.chain.checkUnresolved) {
+      const u = await this.d.chain.checkUnresolved();
+      if (u.dropped) await this.d.tg.send('ℹ️ An unresolved DEX tx was dropped by every RPC (never mined); its nonce is free again.');
+      if (u.state === 'pending') {
+        await this.alertThrottled('unresolved', '⏳ An earlier DEX tx is still unresolved: no new trades until it is mined or dropped. /status for details.', 3600_000);
+        return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or dropped');
+      }
     }
     this.note('unresolved', 'no unresolved tx');
 
@@ -423,6 +464,7 @@ export class Engine {
         }
       } catch (e) {
         const remaining = e instanceof PartialCloseError ? e.remaining : Number(qty);
+        if (e instanceof OrderStillOpenError) notes.push(`close order ${e.orderId} may still be live on MEXC: cancel it by hand`);
         this.d.risk.pause(`unwind failed for ${t.base}`, true);
         notes.push(`UNWIND FAILED: ${errMsg(e)}`);
         await this.d.tg.send(
@@ -475,7 +517,8 @@ export class Engine {
   async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number; dust?: string }> {
     const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
     const f = 10 ** t.priceDecimals;
-    const pxNum = side === 'BUY' ? Math.ceil(b.asks[0][0] * 1.02 * f) / f : Math.floor(b.bids[0][0] * 0.98 * f) / f;
+    const off = aggressiveOffset(t.rules); // 2%, or less if the symbol's price band is tight
+    const pxNum = side === 'BUY' ? Math.ceil(b.asks[0][0] * (1 + off) * f) / f : Math.floor(b.bids[0][0] * (1 - off) * f) / f;
     const dust = orderProblem(t.rules, side, Number(qty), pxNum);
     if (dust) return { orderId: '', filled: 0, dust };
     const px = pxNum.toFixed(t.priceDecimals);
@@ -483,10 +526,7 @@ export class Engine {
     const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, side, qty, px, cid), this.sleep);
     await this.sleep(1500);
     let o = await this.d.mexc.getOrder(t.symbol, orderId);
-    if (o.status !== 'FILLED') {
-      await this.d.mexc.cancelOrder(t.symbol, orderId).catch(() => {});
-      o = await this.d.mexc.getOrder(t.symbol, orderId);
-    }
+    if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
     const filled = Number(o.executedQty);
     if (filled < Number(qty) * 0.999) {
       const remaining = Number((Number(qty) - filled).toFixed(decimalsOfStep(t.qtyStep)));
@@ -524,9 +564,13 @@ export class Engine {
     };
     let o = await read();
     if (o.status !== 'FILLED') {
-      await this.d.mexc.cancelOrder(t.symbol, orderId).catch((e) => log.warn(`cancel: ${errMsg(e)}`));
-      await this.sleep(500);
-      o = await read();
+      try {
+        o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
+      } catch (e) {
+        // The order may still fill later: its state is unknown, so no unwind may be based on it.
+        if (e instanceof OrderStillOpenError) throw new Error(`UNKNOWN_ORDER_STATE ${e.message}`);
+        throw e;
+      }
     }
     return { orderId, filled: Number(o.executedQty) };
   }

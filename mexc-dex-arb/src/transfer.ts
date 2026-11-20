@@ -20,7 +20,8 @@ import { AmbiguousRequestError } from './mexc/rest.js';
 import type { Db, TransferRow } from './db.js';
 import type { Risk } from './risk.js';
 import type { Notifier } from './engine.js';
-import { USDC_DECIMALS, clientId, placeSafely } from './engine.js';
+import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine.js';
+import { orderProblem } from './mexc/rules.js';
 import { type Gap, type ScanToken, dexPrices, findGaps, loadUniverse } from './scanner.js';
 import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
 import { log, errMsg } from './log.js';
@@ -54,7 +55,15 @@ export interface TransferChain {
   tokenBalance(token: string): Promise<bigint>;
   approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
   simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
-  send(tx: { to: string; data: string; value?: bigint }, gasLimit: bigint, gas: GasInfo, timeoutSec: number): Promise<TxResult>;
+  send(
+    tx: { to: string; data: string; value?: bigint },
+    gasLimit: bigint,
+    gas: GasInfo,
+    timeoutSec: number,
+    onSigned?: (hash: string, nonce: number) => void,
+  ): Promise<TxResult>;
+  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean }>;
+  receipt?(hash: string): Promise<{ status: number | null } | null>;
 }
 
 export interface TransferDeps {
@@ -139,7 +148,18 @@ export class TransferEngine {
     if (!eth) throw new Error('no ETHUSDT ticker');
     const ethUsd = (eth.bid + eth.ask) / 2;
 
+    // An earlier DEX tx with unknown outcome blocks every new send (same nonce rule as the inventory engine).
+    let txBlocked = false;
+    if (this.d.chain.checkUnresolved) {
+      const u = await this.d.chain.checkUnresolved();
+      if (u.dropped) await this.d.tg.send('ℹ️ An unresolved DEX tx was dropped by every RPC (never mined); its nonce is free again.');
+      txBlocked = u.state === 'pending';
+      if (txBlocked) await this.alertOnce('unresolved-tx', '⏳ An earlier DEX tx is still unresolved: no DEX sales or new trades until it is mined or dropped.');
+      else this.alerted.delete('unresolved-tx');
+    }
+
     for (const row of this.d.db.openTransfers()) {
+      if (txBlocked && row.status === 'selling') continue; // would only be refused
       try {
         await this.advance(row, gas, ethUsd);
       } catch (e) {
@@ -166,13 +186,17 @@ export class TransferEngine {
     const block = this.d.risk.blockReason();
     if (block) return this.note('block', `new trades blocked: ${block}`);
     this.note('block', 'new trades enabled');
+    if (txBlocked) return;
     if (this.d.db.blockingTransfers().length >= this.cfg.maxOpenTransfers) return this.note('open', 'waiting for open transfer to finish');
     this.note('open', 'no open transfer');
     if (this.lastGasGwei > this.cfg.maxGasGwei) return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > ${this.cfg.maxGasGwei}, no new trades`);
     this.note('gas', 'gas ok');
 
     // Skip tokens whose exact quote recently showed the gap was not real, so they cannot starve the rest.
-    const fresh = gaps.filter((g) => (this.cooldown.get(g.token.base) ?? 0) <= now);
+    // Never two transfers of the same token at once (they would share one wallet balance), even after
+    // an old one stopped blocking because of a long withdrawal.
+    const busyTokens = new Set([...this.d.db.openTransfers(), ...this.d.db.stuckTransfers()].map((t) => t.base));
+    const fresh = gaps.filter((g) => (this.cooldown.get(g.token.base) ?? 0) <= now && !busyTokens.has(g.token.base));
     if (!fresh.length) return;
 
     const usdt = this.live ? ((await this.d.mexc.balances()).USDT ?? 0) : 1e12;
@@ -257,7 +281,7 @@ export class TransferEngine {
       net_work: t.netWork, qty_step: t.qtyStep, price_decimals: t.priceDecimals, status: 'buying',
       buy_qty: c.plan.qty, cost_usd: c.ev.costUsd, buy_order_id: null, withdraw_amount: null, withdraw_id: null,
       wallet_before: null, received: null, usdc_out: null, gas_usd: 0, expected_net: c.ev.net, pnl: null,
-      sell_attempts: 0, alerted_timeout: 0, note: null, withdraw_fee: t.withdrawFee, next_try: 0, force_sell: 0, hold_alerted: 0,
+      sell_attempts: 0, alerted_timeout: 0, note: null, withdraw_fee: t.withdrawFee, next_try: 0, force_sell: 0, hold_alerted: 0, sell_tx: null,
     });
     log.info(`transfer #${id} ${t.base}: START gap ${c.gap.gapPct.toFixed(2)}% expected ${usd(c.ev.net)}`);
     const row = this.d.db.getTransfer(id)!;
@@ -313,10 +337,12 @@ export class TransferEngine {
   private async finishBuy(row: TransferRow) {
     let o = await this.d.mexc.getOrder(row.symbol, row.buy_order_id!);
     if (o.status !== 'FILLED') {
-      await this.d.mexc.cancelOrder(row.symbol, row.buy_order_id!).catch((e) => log.warn(`cancel: ${errMsg(e)}`));
-      await this.sleep(500);
-      o = await this.d.mexc.getOrder(row.symbol, row.buy_order_id!);
-      if (o.status === 'NEW' || o.status === 'PARTIALLY_FILLED') return; // cancel not done yet: check again next tick
+      try {
+        o = await cancelAndConfirm(this.d.mexc, row.symbol, row.buy_order_id!, this.sleep);
+      } catch (e) {
+        log.warn(`transfer #${row.id}: ${errMsg(e)}; checking again next scan`);
+        return; // still 'buying': the order is re-read next tick, never assumed
+      }
     }
     const filled = Number(o.executedQty);
     const cost = Number(o.cummulativeQuoteQty);
@@ -383,11 +409,23 @@ export class TransferEngine {
     const rec = await this.d.mexc.findWithdraw(row.base, since, { id: row.withdraw_id, withdrawOrderId: withdrawCid(row.id!) }).catch(() => undefined);
     const bal = await this.d.chain.tokenBalance(row.address);
     const diff = bal - BigInt(row.wallet_before ?? '0');
-    const expected = toUnits(Math.max(0, Number(row.withdraw_amount) - row.withdraw_fee), row.decimals);
+    // Fee actually charged by MEXC (history) beats the configured one.
+    const fee = rec?.transactionFee !== undefined && rec.transactionFee !== '' ? Number(rec.transactionFee) : row.withdraw_fee;
+    const expected = toUnits(Math.max(0, Number(row.withdraw_amount) - fee), row.decimals);
 
-    if (diff > 0n && (rec?.status === 7 || diff * 100n >= expected * 98n)) {
-      this.d.db.updateTransfer(row.id!, { status: 'selling', received: diff.toString() });
-      log.info(`transfer #${row.id} ${row.base}: ${toFloat(diff, row.decimals)} arrived in wallet`);
+    // Arrival needs BOTH: MEXC says SUCCESS and the wallet grew by (almost) the expected amount.
+    // A balance change alone could be an unrelated deposit / airdrop.
+    if (rec?.status === 7 && diff > 0n && diff * 100n < expected * 98n) {
+      await this.alertOnce(
+        `wshort-${row.id}`,
+        `⚠️ TRANSFER #${row.id} ${row.base}: MEXC says SUCCESS but the wallet only grew by ${toFloat(diff, row.decimals)} (expected ~${toFloat(expected, row.decimals)}). Waiting; check the wallet.`,
+      );
+    }
+    if (rec?.status === 7 && diff > 0n && diff * 100n >= expected * 98n) {
+      // Sell what was withdrawn, never more (extra balance may belong to something else).
+      const received = diff > (expected * 102n) / 100n ? expected : diff;
+      this.d.db.updateTransfer(row.id!, { status: 'selling', received: received.toString() });
+      log.info(`transfer #${row.id} ${row.base}: ${toFloat(received, row.decimals)} arrived in wallet`);
       return this.sellStep(this.reload(row), gas, ethUsd);
     }
     if (rec && WITHDRAW_FAILED.has(rec.status) && diff <= 0n) {
@@ -397,7 +435,9 @@ export class TransferEngine {
         return this.alertOnce(`wfail-${row.id}`, `⚠️ TRANSFER #${row.id} ${row.base}: MEXC withdrawal ${rec.status === 8 ? 'FAILED' : 'CANCELLED'}; waiting for the tokens to return to MEXC`);
       }
       await this.d.tg.send(`⚠️ TRANSFER #${row.id} ${row.base}: withdrawal ${rec.status === 8 ? 'FAILED' : 'CANCELLED'}, selling back on MEXC`);
-      const proceeds = await this.sellOnMexc(row, row.withdraw_amount!);
+      // Sell what is actually free on MEXC, never more than was withdrawn.
+      const qty = floorToStep(Math.min(free, Number(row.withdraw_amount)), row.qty_step).toFixed(decimalsOfStep(row.qty_step));
+      const proceeds = await this.sellOnMexc(row, qty);
       return this.fail(row, `withdraw status ${rec.status}`, proceeds - row.cost_usd);
     }
     if (rec?.status === WITHDRAW_MANUAL) {
@@ -426,7 +466,27 @@ export class TransferEngine {
   private async sellStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
     if (row.next_try > this.now()) return;
     if (Number(gas.effective) / 1e9 > this.cfg.maxGasGwei) return this.note(`sell-${row.id}`, `transfer #${row.id}: gas too high, sale waits`);
-    const amount = BigInt(row.received!);
+
+    // Crash safety: a sale tx was signed before (hash persisted). Did it already execute?
+    if (row.sell_tx && this.d.chain.receipt) {
+      const rc = await this.d.chain.receipt(row.sell_tx).catch(() => null);
+      if (rc?.status === 1) {
+        this.d.db.updateTransfer(row.id!, { status: 'done', note: 'sale completed before a restart; PnL not measured' });
+        this.recordTrade(row, 'ok', 0, row.gas_usd, row.sell_tx, 'sale completed before a restart; PnL not measured');
+        await this.d.tg.send(`✅ TRANSFER #${row.id} ${row.base}: the DEX sale ${row.sell_tx} had already executed before the restart. Marked done (PnL not measured).`);
+        return;
+      }
+    }
+    // Never sell more than is really in the wallet now.
+    const balance = await this.d.chain.tokenBalance(row.address);
+    const amount = balance < BigInt(row.received!) ? balance : BigInt(row.received!);
+    if (amount * 100n < BigInt(row.received!)) {
+      this.d.db.updateTransfer(row.id!, { status: 'stuck', note: 'tokens no longer in the wallet' });
+      await this.d.tg.send(
+        `🚨 TRANSFER #${row.id} ${row.base}: the tokens are no longer in the wallet (sold before a restart, or moved). Check etherscan, then /clear ${row.id}.`,
+      );
+      return;
+    }
     const qty = toFloat(amount, row.decimals);
     const req = { sellToken: row.address, buyToken: this.cfg.usdc, sellAmount: amount, taker: this.d.chain.address, slippageBps: this.cfg.dexSlippageBps };
     let gasWei = 0n;
@@ -437,6 +497,7 @@ export class TransferEngine {
       // Loss floor: price may have fallen while the withdrawal travelled. Hold instead of locking in a big loss.
       const worstOut = toFloat(first.minBuyAmount, USDC_DECIMALS);
       const floor = row.cost_usd * (1 - this.cfg.transferMaxLossPct / 100);
+      if (worstOut >= floor && row.hold_alerted) this.d.db.updateTransfer(row.id!, { hold_alerted: 0 }); // recovered: alert again if it falls
       if (worstOut < floor && !row.force_sell) {
         this.d.db.updateTransfer(row.id!, { next_try: this.now() + 5 * 60_000 });
         if (!row.hold_alerted) {
@@ -458,7 +519,10 @@ export class TransferEngine {
       if (!firm.tx) throw new Error('quote without transaction');
       const est = await this.d.chain.simulate(firm.tx);
       const usdcBefore = await this.d.chain.tokenBalance(this.cfg.usdc);
-      const r = await this.d.chain.send(firm.tx, (est * 13n) / 10n, gas, this.cfg.txTimeoutSec);
+      const r = await this.d.chain.send(firm.tx, (est * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash) =>
+        this.d.db.updateTransfer(row.id!, { sell_tx: hash }),
+      );
+      if (r.refused) return; // an earlier tx is unresolved: not an attempt, try again later
       gasWei += r.gasCostWei;
       txHash = r.hash;
       if (r.unknown) return this.unknownOutcome(row, `swap ${r.hash}`, gasWei, ethUsd);
@@ -528,6 +592,14 @@ export class TransferEngine {
    * real USDT balance change instead of assuming.
    */
   private async sellOnMexc(row: TransferRow, qty: string): Promise<number> {
+    const rules = this.universe.find((t) => t.base === row.base)?.rules;
+    const px = row.cost_usd / (row.buy_qty || 1);
+    const problem = rules && orderProblem(rules, 'SELL', Number(qty), px, 'MARKET');
+    if (problem) {
+      this.d.risk.pause(`cannot sell ${row.base} on MEXC: ${problem}`, true);
+      await this.d.tg.send(`🚨 ${row.base}: cannot market-sell ${qty} on MEXC (${problem}). Trading PAUSED: sell it by hand, then /start confirm.`);
+      return 0;
+    }
     try {
       const usdtBefore = (await this.d.mexc.balances()).USDT ?? 0;
       const cid = clientId(`${row.id}s`);

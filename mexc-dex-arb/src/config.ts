@@ -63,7 +63,8 @@ export function loadConfig() {
     minDexTvlUsd: num('MIN_DEX_TVL_USD', 200_000),
     minMexcVolumeUsd: num('MIN_MEXC_VOLUME_USD', 500_000),
     // --- Costs & thresholds ---
-    minProfitUsd: num('MIN_PROFIT_USD', 15),
+    // Must be small relative to MAX_TRADE_USD: $15 on a $50 trade would need a ~30% gap = only fake gaps pass.
+    minProfitUsd: num('MIN_PROFIT_USD', 2),
     minProfitPct: num('MIN_PROFIT_PCT', 0.5), // percent of trade size
     dexSlippageBps: num('DEX_SLIPPAGE_BPS', 30),
     cexSlippageBps: num('CEX_SLIPPAGE_BPS', 20),
@@ -105,6 +106,10 @@ export function validateConfig(c: Config): Config {
     if (!(v >= min && v <= max)) errs.push(`${name}=${v} must be between ${min} and ${max}`);
   };
   range('MIN_PROFIT_USD', c.minProfitUsd, 0, 1e6);
+  // A floor above 10% of the trade size means only absurd (fake / dead-pool) gaps could ever pass.
+  if (c.minProfitUsd > c.maxTradeUsd * 0.1) {
+    errs.push(`MIN_PROFIT_USD=${c.minProfitUsd} is more than 10% of MAX_TRADE_USD=${c.maxTradeUsd}: only fake gaps could pass`);
+  }
   range('MIN_PROFIT_PCT', c.minProfitPct, 0, 100);
   range('DEX_SLIPPAGE_BPS', c.dexSlippageBps, 1, 500);
   range('CEX_SLIPPAGE_BPS', c.cexSlippageBps, 0, 500);

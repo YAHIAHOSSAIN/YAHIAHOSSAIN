@@ -123,6 +123,7 @@ export class OneInch implements Aggregator {
     if (!this.spender) {
       const a = (await getJson<{ address: string }>(this.fetchFn, `${this.base}/approve/spender`, this.headers)).address;
       this.spender = requireAddress('1inch spender', a, ONEINCH_ROUTER_V6);
+      setTimeout(() => (this.spender = undefined), 24 * 3600_000).unref?.(); // re-check daily
     }
     return this.spender;
   }

@@ -36,6 +36,7 @@ function setup(opts: {
   process.env.MODE = opts.mode ?? 'live';
   process.env.RPC_URL = 'http://localhost';
   process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
+  process.env.MIN_PROFIT_USD = '15';
   process.env.PRIVATE_KEY = '0x' + '11'.repeat(32);
   process.env.MEXC_API_KEY = 'k'.repeat(10);
   process.env.MEXC_API_SECRET = 's'.repeat(10);
@@ -326,4 +327,35 @@ test('restart with an executing row: looked up, reported, paused until /start co
   assert.equal(risk.resume(), false);
   assert.equal(db.executingTrades().length, 0);
   assert.ok(alerts[0].includes('MEXC order 9: FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
+});
+
+test('recovery: both legs done -> trade marked ok, no critical pause', async () => {
+  const { db, risk } = setup({});
+  const { recoverExecuting } = await import('../src/recovery.js');
+  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xdone', cex_order_id: 'cidY', note: 'client order id cidY; nonce 8' });
+  const alerts: string[] = [];
+  await recoverExecuting(
+    db, risk, { send: async (t) => void alerts.push(t) },
+    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
+    async () => ({ status: 1 }),
+    async () => ({ state: 'clear' }),
+  );
+  assert.equal(risk.paused, false);
+  assert.equal(db.statsSince(0, 'live').total.failed, 0);
+  assert.ok(alerts[0].includes('All legs completed'));
+});
+
+test('recovery: a pending DEX tx from before the restart keeps the bot critically paused', async () => {
+  const { db, risk } = setup({});
+  const { recoverExecuting } = await import('../src/recovery.js');
+  await recoverExecuting(db, risk, { send: async () => {} }, { getOrderByClientId: async () => null }, async () => null, async () => ({ state: 'pending' }));
+  assert.equal(risk.critical, true);
+});
+
+test('critical resume does not reset the failure streak', () => {
+  const { risk, db } = setup({});
+  db.setState('consecutive_fails', '2');
+  risk.pause('DEX tx unknown', true);
+  risk.resume(true);
+  assert.equal(risk.consecutiveFails, 2);
 });
