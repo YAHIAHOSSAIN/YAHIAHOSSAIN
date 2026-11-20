@@ -75,18 +75,19 @@ export function evaluateDexBuy(p: {
   gasUsd: number;
   costs: CostParams;
 }): Opportunity | null {
-  const qty = floorToStep(p.tokensOut, p.qtyStep);
+  // Sell on MEXC only what the DEX GUARANTEES (minBuyAmount), so we never sell tokens we may not get.
+  const qty = floorToStep(p.tokensMin, p.qtyStep);
   if (qty <= 0) return null;
   const fill = fillBase(p.bids, qty);
   if (!fill) return null;
   const sellPrice = fill.quote / qty;
   const cexFeeUsd = fill.quote * p.costs.takerFee;
   const cexSlip = (fill.quote * p.costs.cexSlippageBps) / 10_000;
-  const dexSlip = Math.max(0, p.tokensOut - p.tokensMin) * sellPrice;
-  const slippageUsd = cexSlip + dexSlip;
-  // Leftover dust (tokensOut - qty) stays in inventory; it is not counted as profit.
-  const dustUsd = (p.tokensOut - qty) * sellPrice;
-  const net = fill.quote - cexFeeUsd - (p.sizeUsd - dustUsd) - p.gasUsd - slippageUsd - p.costs.safetyMarginUsd;
+  // DEX slippage is covered by sizing from tokensMin; reported for information only.
+  const slippageUsd = cexSlip + Math.max(0, p.tokensOut - p.tokensMin) * sellPrice;
+  // Worst case we receive exactly tokensMin; the part below the MEXC step stays as inventory.
+  const dustUsd = (p.tokensMin - qty) * sellPrice;
+  const net = fill.quote - cexFeeUsd - (p.sizeUsd - dustUsd) - p.gasUsd - cexSlip - p.costs.safetyMarginUsd;
   return {
     direction: 'DEX_BUY',
     sizeUsd: p.sizeUsd,

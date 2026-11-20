@@ -1,6 +1,6 @@
 // DEX quotes from 0x (Swap API v2, AllowanceHolder) or 1inch (Swap API v6).
 // Both route across Uniswap v2/v3 and other Ethereum DEXs; DEX fees are already in buyAmount.
-import { redact } from '../log.js';
+import { log, redact } from '../log.js';
 
 export interface QuoteRequest {
   sellToken: string;
@@ -49,7 +49,9 @@ interface ZeroExResponse {
   buyAmount: string;
   minBuyAmount: string;
   gas?: string | null;
-  issues?: { allowance?: { spender: string } | null; balance?: unknown };
+  allowanceTarget?: string | null;
+  fees?: { zeroExFee?: { amount: string; token: string } | null } | null;
+  issues?: { allowance?: { spender: string } | null; balance?: unknown; simulationIncomplete?: boolean };
   transaction?: { to: string; data: string; gas: string; value: string };
 }
 
@@ -66,7 +68,7 @@ export class ZeroEx implements Aggregator {
       buyToken: r.buyToken,
       sellAmount: r.sellAmount.toString(),
       taker: r.taker,
-      slippageBps: String(r.slippageBps),
+      slippagePpm: String(r.slippageBps * 100), // slippageBps is deprecated in v2
     });
     return `https://api.0x.org/swap/allowance-holder/${kind}?${q}`;
   }
@@ -74,9 +76,20 @@ export class ZeroEx implements Aggregator {
   private async call(kind: 'price' | 'quote', r: QuoteRequest): Promise<Quote> {
     const d = await getJson<ZeroExResponse>(this.fetchFn, this.url(kind, r), { '0x-api-key': this.apiKey, '0x-version': 'v2' });
     if (!d.liquidityAvailable) throw new Error('0x: no liquidity');
+    if (kind === 'quote') {
+      // A firm quote we would actually send: refuse if 0x itself could not validate it.
+      if (d.issues?.balance) throw new Error('0x: taker balance too low for this quote');
+      if (d.issues?.simulationIncomplete) throw new Error('0x: simulation incomplete');
+      if (d.fees?.zeroExFee) log.info(`0x fee: ${d.fees.zeroExFee.amount} of ${d.fees.zeroExFee.token}`);
+    }
     const gas = BigInt(d.transaction?.gas ?? d.gas ?? '300000');
     // With the AllowanceHolder flow, both the spender and tx.to are the AllowanceHolder contract.
-    const spender = requireAddress('0x spender', d.issues?.allowance?.spender ?? ZEROX_ALLOWANCE_HOLDER, ZEROX_ALLOWANCE_HOLDER);
+    // Never transaction.to for allowances (0x docs): issues.allowance.spender or allowanceTarget, pinned.
+    const spender = requireAddress(
+      '0x spender',
+      d.issues?.allowance?.spender ?? d.allowanceTarget ?? ZEROX_ALLOWANCE_HOLDER,
+      ZEROX_ALLOWANCE_HOLDER,
+    );
     if (d.transaction) requireAddress('0x tx.to', d.transaction.to, ZEROX_ALLOWANCE_HOLDER);
     return {
       buyAmount: BigInt(d.buyAmount),

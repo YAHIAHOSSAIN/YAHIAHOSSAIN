@@ -18,13 +18,17 @@ function num(name: string, def: number): number {
 }
 
 export function loadConfig() {
-  const mode = str('MODE', 'live').toLowerCase() as Mode;
+  const mode = str('MODE', 'paper').toLowerCase() as Mode;
   if (mode !== 'live' && mode !== 'paper') throw new Error('MODE must be live or paper');
   const aggregator = str('DEX_AGGREGATOR', '0x') as AggregatorName;
   if (aggregator !== '0x' && aggregator !== '1inch') throw new Error('DEX_AGGREGATOR must be 0x or 1inch');
 
-  const strategy = str('STRATEGY', 'transfer').toLowerCase();
+  const strategy = str('STRATEGY', 'inventory').toLowerCase();
   if (strategy !== 'transfer' && strategy !== 'inventory') throw new Error('STRATEGY must be transfer or inventory');
+  // Transfer mode needs a MEXC key that can WITHDRAW. That is off unless explicitly allowed.
+  if (strategy === 'transfer' && str('ALLOW_WITHDRAWALS', 'no').toLowerCase() !== 'yes') {
+    throw new Error('STRATEGY=transfer needs MEXC withdrawals; set ALLOW_WITHDRAWALS=yes only if you accept that risk');
+  }
 
   return {
     mode,
@@ -48,6 +52,8 @@ export function loadConfig() {
     // --- Telegram ---
     telegramToken: str('TELEGRAM_BOT_TOKEN', ''),
     telegramChatId: str('TELEGRAM_CHAT_ID', ''),
+    // Only this Telegram user may send commands (in a private chat with the bot).
+    telegramAdminId: str('TELEGRAM_ADMIN_ID', ''),
     // --- Watchlist ---
     watchlist: str('WATCHLIST', '')
       .split(',')
@@ -64,10 +70,12 @@ export function loadConfig() {
     safetyMarginUsd: num('SAFETY_MARGIN_USD', 2),
     priorityFeeGwei: num('PRIORITY_FEE_GWEI', 1),
     // --- Risk limits ---
-    maxTradeUsd: num('MAX_TRADE_USD', 200),
+    maxTradeUsd: num('MAX_TRADE_USD', 50),
     minTradeUsd: num('MIN_TRADE_USD', 25),
     maxTradesPerDay: num('MAX_TRADES_PER_DAY', 20),
     dailyLossLimitUsd: num('DAILY_LOSS_LIMIT_USD', 30),
+    // Skip a trade if losing this % of its size (+ gas) would break the remaining daily loss budget.
+    worstCaseLossPct: num('WORST_CASE_LOSS_PCT', 5),
     maxGasGwei: num('MAX_GAS_GWEI', 40),
     maxConsecutiveFails: num('MAX_CONSECUTIVE_FAILS', 3),
     minEthForGas: num('MIN_ETH_FOR_GAS', 0.01),
@@ -106,6 +114,7 @@ export function validateConfig(c: Config): Config {
   range('MIN_TRADE_USD', c.minTradeUsd, 1, c.maxTradeUsd);
   range('MAX_TRADES_PER_DAY', c.maxTradesPerDay, 1, 10_000);
   range('DAILY_LOSS_LIMIT_USD', c.dailyLossLimitUsd, 0.01, 1e7);
+  range('WORST_CASE_LOSS_PCT', c.worstCaseLossPct, 0, 100);
   range('MAX_GAS_GWEI', c.maxGasGwei, 0.01, 1000);
   range('MAX_CONSECUTIVE_FAILS', c.maxConsecutiveFails, 1, 100);
   range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 600);
@@ -122,7 +131,8 @@ export function validateConfig(c: Config): Config {
 
 /** Every secret value, so the logger can scrub them from any output. */
 export function secretsOf(cfg: Config): string[] {
-  return [cfg.privateKey, cfg.mexcApiKey, cfg.mexcApiSecret, cfg.zeroExApiKey, cfg.oneInchApiKey, cfg.telegramToken]
+  // RPC URLs usually embed a provider API key (Alchemy/Infura), so they are secrets too.
+  return [cfg.privateKey, cfg.mexcApiKey, cfg.mexcApiSecret, cfg.zeroExApiKey, cfg.oneInchApiKey, cfg.telegramToken, cfg.rpcUrl, cfg.sendRpcUrl]
     .filter((s) => s && s.length >= 8)
     .flatMap((s) => [s, s.replace(/^0x/, '')]);
 }

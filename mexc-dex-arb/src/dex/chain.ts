@@ -118,23 +118,75 @@ export class Chain {
     return this.provider.estimateGas(req);
   }
 
+  // ---- Nonce manager ----
+  // Our txs go through a PRIVATE RPC, so the public RPC's 'pending' count does not see them.
+  // We track nonces locally, starting from the confirmed ('latest') count, and refuse to send
+  // while an earlier tx is unresolved (outcome unknown), so a nonce is never reused by accident.
+  private nextNonce: number | null = null;
+  /** A tx (and maybe its cancel) whose outcome we do not know yet. */
+  unresolved: { nonce: number; hashes: string[]; since: number } | null = null;
+
+  private async takeNonce(): Promise<number> {
+    const confirmed = await this.provider.getTransactionCount(this.address, 'latest');
+    if (this.nextNonce === null || this.nextNonce < confirmed) this.nextNonce = confirmed;
+    return this.nextNonce;
+  }
+
+  /**
+   * Re-check an unresolved tx. Returns 'clear' once its nonce is consumed on-chain (by the tx or its cancel),
+   * 'pending' while nothing is mined yet.
+   */
+  async checkUnresolved(): Promise<{ state: 'clear' | 'pending'; executedHash?: string; ok?: boolean }> {
+    const u = this.unresolved;
+    if (!u) return { state: 'clear' };
+    for (const h of u.hashes) {
+      const r = await this.provider.getTransactionReceipt(h).catch(() => null);
+      if (r) {
+        this.unresolved = null;
+        this.nextNonce = Math.max(this.nextNonce ?? 0, u.nonce + 1);
+        return { state: 'clear', executedHash: h, ok: r.status === 1 };
+      }
+    }
+    const confirmed = await this.provider.getTransactionCount(this.address, 'latest').catch(() => -1);
+    if (confirmed > u.nonce) {
+      // Nonce used by something we did not see a receipt for (RPC lag): treat as clear, keep counting up.
+      this.unresolved = null;
+      this.nextNonce = Math.max(this.nextNonce ?? 0, confirmed);
+      return { state: 'clear' };
+    }
+    return { state: 'pending' };
+  }
+
   /**
    * Sign and send through the private RPC, wait for inclusion.
    * If it is not mined within timeoutSec, replace it with a 0-value self-transfer (cancel).
+   * Result states: ok (mined, success), ok:false (mined and reverted / cancelled), unknown (we cannot tell).
    */
   async send(
     tx: { to: string; data: string; value?: bigint },
     gasLimit: bigint,
     gas: GasInfo,
     timeoutSec: number,
+    onSigned?: (hash: string, nonce: number) => void,
   ): Promise<TxResult> {
     const wallet = this.wallet!;
-    const nonce = await this.provider.getTransactionCount(wallet.address, 'pending');
+    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
+      return { ok: false, gasCostWei: 0n, reason: `refusing to send: earlier tx ${this.unresolved.hashes[0]} unresolved` };
+    }
+    const nonce = await this.takeNonce();
     const base = { chainId: 1n, type: 2, nonce, maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.tip };
     const signed = await wallet.signTransaction({ ...base, to: tx.to, data: tx.data, value: tx.value ?? 0n, gasLimit });
     const hash = ethers.keccak256(signed);
-    await this.sendProvider.send('eth_sendRawTransaction', [signed]);
-    log.info(`tx sent ${hash}`);
+    this.nextNonce = nonce + 1;
+    onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
+    try {
+      await this.sendProvider.send('eth_sendRawTransaction', [signed]);
+    } catch (e) {
+      // The RPC may have accepted it before failing to answer: outcome unknown, nonce may be consumed.
+      this.unresolved = { nonce, hashes: [hash], since: Date.now() };
+      return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `send error, outcome unknown: ${errMsg(e)}` };
+    }
+    log.info(`tx sent ${hash} (nonce ${nonce})`);
 
     let receipt = await this.waitReceipt(hash, timeoutSec);
     if (!receipt) {
@@ -152,15 +204,16 @@ export class Chain {
       await this.sendProvider.send('eth_sendRawTransaction', [cancel]).catch((e) => log.warn(`cancel send failed: ${errMsg(e)}`));
       const deadline = Date.now() + timeoutSec * 1000;
       while (Date.now() < deadline && !receipt) {
-        receipt = await this.provider.getTransactionReceipt(hash);
-        const cancelReceipt = await this.provider.getTransactionReceipt(cancelHash);
+        receipt = await this.provider.getTransactionReceipt(hash).catch(() => null);
+        const cancelReceipt = await this.provider.getTransactionReceipt(cancelHash).catch(() => null);
         if (cancelReceipt) {
           return { ok: false, hash, gasCostWei: cancelReceipt.gasUsed * cancelReceipt.gasPrice, reason: 'not mined, cancelled' };
         }
         if (!receipt) await sleep(3000);
       }
       if (!receipt) {
-        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancelHash} not confirmed: outcome UNKNOWN, check wallet` };
+        this.unresolved = { nonce, hashes: [hash, cancelHash], since: Date.now() };
+        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancelHash} not confirmed: outcome UNKNOWN` };
       }
     }
     const cost = receipt.gasUsed * receipt.gasPrice;

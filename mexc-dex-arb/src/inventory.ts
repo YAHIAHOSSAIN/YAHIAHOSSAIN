@@ -11,11 +11,11 @@ export interface Balances {
   mexc: Record<string, number>; // free balance by asset
 }
 
-export async function snapshot(chain: Chain, mexc: MexcRest, usdc: string, tokens: Token[]): Promise<Balances> {
+export async function snapshot(chain: Chain, mexc: MexcRest, usdc: string, tokens: Token[], total = false): Promise<Balances> {
   const [eth, usdcBal, mexcBal, ...toks] = await Promise.all([
     chain.ethBalance(),
     chain.tokenBalance(usdc),
-    mexc.balances(),
+    mexc.balances(total),
     ...tokens.map((t) => chain.tokenBalance(t.address)),
   ]);
   return {

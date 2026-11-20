@@ -31,13 +31,12 @@ test('threshold = max($15, 0.5% of size)', () => {
   assert.equal(threshold(10_000, 15, 0.5), 50);
 });
 
-test('evaluateDexBuy: every cost is subtracted', () => {
-  // Bought 20 tokens for $200 on DEX (min 19.9); MEXC bid 11 -> sell 20 for $220.
+test('evaluateDexBuy: sells only what the DEX guarantees, every cost subtracted', () => {
+  // $200 on DEX buys 20 tokens expected, 19.9 guaranteed; MEXC bid 11 -> sell 19.9 for $218.90.
   const o = evaluateDexBuy({ sizeUsd: 200, tokensOut: 20, tokensMin: 19.9, bids: [[11, 100]], qtyStep: 0.01, gasUsd: 3, costs })!;
-  const fee = 220 * 0.0005;
-  const slip = 220 * 0.002 + 0.1 * 11;
-  close(o.net, 220 - fee - 200 - 3 - slip - 2);
-  assert.equal(o.cexQty, 20);
+  const proceeds = 19.9 * 11;
+  close(o.net, proceeds - proceeds * 0.0005 - 200 - 3 - proceeds * 0.002 - 2);
+  assert.equal(o.cexQty, 19.9);
   close(o.cexLimitPrice, 11 * 0.998);
   close(o.buyPrice, 10);
   close(o.sellPrice, 11);
@@ -85,6 +84,8 @@ test('util conversions', () => {
   assert.equal(floorToStep(1.23456, 0.01), 1.23);
   assert.equal(floorToStep(0.3, 0.1), 0.3);
   assert.equal(toUnits(123.456789, 6), 123456789n);
+  assert.equal(toUnits(1.5e-7, 18), 150000000000n);
+  assert.equal(toUnits(0.1, 18), 100000000000000000n); // exactly, not 100000000000000005
   assert.equal(toUnits(1, 18), 10n ** 18n);
   assert.equal(toFloat(1_500_000n, 6), 1.5);
   assert.equal(toFloat(5n, 18), 5e-18);

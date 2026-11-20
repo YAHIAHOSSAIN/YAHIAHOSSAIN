@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 // 'approval' = gas spent on an approval for a trade that was then skipped (a real cost, not a trade).
-export type TradeStatus = 'ok' | 'one_sided' | 'dex_failed' | 'cex_failed' | 'paper' | 'approval';
+// 'executing' = written BEFORE the legs fire; if the bot dies mid-trade, startup finds it and stays paused.
+export type TradeStatus = 'ok' | 'one_sided' | 'dex_failed' | 'cex_failed' | 'paper' | 'approval' | 'executing';
 
 export interface TradeRow {
   ts: number;
@@ -103,15 +104,26 @@ export class Db {
     }
   }
 
-  insertTrade(t: TradeRow): void {
-    this.db
+  insertTrade(t: TradeRow): number {
+    return Number(this.db
       .prepare(
         `INSERT INTO trades (ts, day, mode, symbol, direction, size_usd, qty, buy_price, sell_price, expected_net,
           cex_fee_usd, gas_usd, pnl_usd, status, dex_tx, cex_order_id, note)
          VALUES (@ts, @day, @mode, @symbol, @direction, @size_usd, @qty, @buy_price, @sell_price, @expected_net,
           @cex_fee_usd, @gas_usd, @pnl_usd, @status, @dex_tx, @cex_order_id, @note)`,
       )
-      .run(t);
+      .run(t).lastInsertRowid);
+  }
+
+  updateTrade(id: number, fields: Partial<TradeRow>): void {
+    const cols = Object.keys(fields);
+    if (!cols.length) return;
+    this.db.prepare(`UPDATE trades SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...fields, id });
+  }
+
+  /** Trades that were in flight when the bot stopped. */
+  executingTrades(): (TradeRow & { id: number })[] {
+    return this.db.prepare(`SELECT * FROM trades WHERE status = 'executing' ORDER BY id`).all() as (TradeRow & { id: number })[];
   }
 
   dayStats(day: string, mode: string): { trades: number; pnl: number; gas: number; failed: number } {

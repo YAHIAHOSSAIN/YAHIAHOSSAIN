@@ -2,14 +2,19 @@
 // (taken from MEXC's own deposit network info), enough DEX TVL and MEXC volume.
 import type { CoinConfig, MexcRest } from './mexc/rest.js';
 import { log, errMsg } from './log.js';
+import { type SymbolRules, rulesFrom } from './mexc/rules.js';
+
+/** exchangeInfo status: live API returns "1"; the docs example shows "ENABLED". Accept both. */
+export const isOnline = (status: unknown) => String(status) === '1' || String(status).toUpperCase() === 'ENABLED';
 
 export interface Token {
   base: string; // e.g. LINK
   symbol: string; // MEXC symbol, e.g. LINKUSDT
   address: string; // Ethereum contract (lowercase)
   decimals: number;
-  qtyStep: number; // MEXC quantity step
+  qtyStep: number; // MEXC quantity step (from baseAssetPrecision)
   priceDecimals: number; // MEXC price precision
+  rules: SymbolRules;
   dexTvlUsd: number;
   mexcVolumeUsd: number;
   depositOk: boolean;
@@ -45,7 +50,7 @@ export async function buildWatchlist(
   const coinBy = new Map(coins.map((c) => [c.coin.toUpperCase(), c]));
 
   const candidates = symbols
-    .filter((s) => s.quoteAsset === 'USDT' && s.isSpotTradingAllowed && String(s.status) === '1')
+    .filter((s) => s.quoteAsset === 'USDT' && s.isSpotTradingAllowed && isOnline(s.status))
     .filter((s) => !SKIP.has(s.baseAsset.toUpperCase()))
     .filter((s) => opts.only.length === 0 || opts.only.includes(s.baseAsset.toUpperCase()))
     .filter((s) => (volume.get(s.symbol) ?? 0) >= opts.minVolumeUsd)
@@ -69,8 +74,9 @@ export async function buildWatchlist(
         symbol: s.symbol,
         address,
         decimals: await decimalsOf(address),
-        qtyStep: Number(s.baseSizePrecision) || 10 ** -(s.baseAssetPrecision ?? 2),
+        qtyStep: rulesFrom(s).qtyStep,
         priceDecimals: s.quotePrecision,
+        rules: rulesFrom(s),
         dexTvlUsd: tvl,
         mexcVolumeUsd: volume.get(s.symbol) ?? 0,
         depositOk: net.depositEnable,

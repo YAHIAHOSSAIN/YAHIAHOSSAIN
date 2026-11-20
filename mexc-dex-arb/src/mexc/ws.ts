@@ -36,9 +36,17 @@ export class MexcBookStream {
     const ws = new WebSocket(URL);
     this.sockets.push(ws);
     let ping: NodeJS.Timeout | undefined;
+    let lastData = Date.now();
+    // MEXC drops idle subscriptions; if no data arrives for 60s, reconnect.
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastData > 60_000) {
+        log.warn(`MEXC WS: no data for 60s on ${symbols.length} symbols, reconnecting`);
+        ws.terminate();
+      }
+    }, 15_000);
 
     ws.on('open', () => {
-      attempt = 0;
+      lastData = Date.now();
       const params = symbols.map((s) => `spot@public.limit.depth.v3.api.pb@${s}@20`);
       ws.send(JSON.stringify({ method: 'SUBSCRIPTION', params }));
       ping = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ method: 'PING' })), 20_000);
@@ -51,6 +59,8 @@ export class MexcBookStream {
         if (msg.includes('Blocked') || msg.includes('Not Subscribed')) log.warn(`MEXC WS: ${msg}`);
         return;
       }
+      lastData = Date.now();
+      attempt = 0; // reset backoff only once data really flows (a bad subscription closes right after open)
       try {
         const push = decodeDepthPush(data);
         // Sanity check: ignore empty or crossed books instead of trading on them.
@@ -64,6 +74,7 @@ export class MexcBookStream {
 
     const reconnect = () => {
       if (ping) clearInterval(ping);
+      clearInterval(watchdog);
       this.sockets = this.sockets.filter((s) => s !== ws);
       if (this.stopped) return;
       const delay = Math.min(30_000, 1000 * 2 ** attempt);

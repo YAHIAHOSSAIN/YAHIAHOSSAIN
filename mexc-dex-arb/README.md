@@ -5,15 +5,19 @@
 
 Stack: Node 20+, TypeScript, ethers v6, MEXC Spot API v3 (REST + protobuf WebSocket), SQLite, Telegram, pm2।
 
+> **ডিফল্ট: `MODE=paper`, `STRATEGY=inventory`, `MAX_TRADE_USD=50`।** অন্তত ৭ দিন paper-এ চালান, তারপর live।
+> MEXC API key-তে **শুধু Trade permission** দিন, **Withdraw দেবেন না**, আর key IP-whitelist করুন।
+
 বটে দুইটা strategy আছে (`STRATEGY`):
 
-| | `transfer` (ডিফল্ট) | `inventory` |
+| | `inventory` (ডিফল্ট, প্রস্তাবিত) | `transfer` (ঝুঁকিপূর্ণ, ডিফল্টে বন্ধ) |
 |---|---|---|
-| কী করে | MEXC-এর **সব** ERC20 token সারাক্ষণ scan করে। যে token MEXC-তে সস্তা, সেটা MEXC-তে কেনে, wallet-এ withdraw করে, তারপর DEX-এ বেচে | দুই জায়গায় আগে থেকে token রাখে, দুই দিকে একসাথে trade করে |
-| গতি | ধীর: withdraw-এর জন্য মিনিট থেকে ঘণ্টা লাগে | তাৎক্ষণিক |
-| দাম সরে যাওয়ার ঝুঁকি | আছে (অপেক্ষার সময়ে), `TRANSFER_DRIFT_BPS` দিয়ে ধরা হয় | খুব কম |
-| MEXC API key | Trade **আর** Withdraw permission লাগে | শুধু Trade |
-| কী রাখতে হবে | MEXC-তে USDT, wallet-এ gas-এর ETH | দুই জায়গাতেই token আর stablecoin |
+| কী করে | দুই জায়গায় আগে থেকে token রাখে, দুই দিকে একসাথে trade করে | MEXC-এর **সব** ERC20 token scan করে, MEXC-তে কেনে, wallet-এ **withdraw** করে, তারপর DEX-এ বেচে |
+| গতি | তাৎক্ষণিক | ধীর: withdraw-এর জন্য ৫ থেকে ৬০ মিনিটের বেশি লাগে |
+| দাম সরে যাওয়ার ঝুঁকি | খুব কম | আছে: এই পুরো সময় hedge ছাড়া position খোলা থাকে |
+| MEXC API key | শুধু Trade | Trade **আর Withdraw**: key ফাঁস হলে account খালি হতে পারে |
+| চালু করতে | `STRATEGY=inventory` | `STRATEGY=transfer` **আর** `ALLOW_WITHDRAWALS=yes` (না দিলে চালুই হবে না) |
+| কী রাখতে হবে | দুই জায়গাতেই token আর stablecoin | MEXC-তে USDT, wallet-এ gas-এর ETH |
 
 ## Transfer strategy (`STRATEGY=transfer`)
 
@@ -40,7 +44,7 @@ Stack: Node 20+, TypeScript, ethers v6, MEXC Spot API v3 (REST + protobuf WebSoc
 9. লাভ জমা হয় wallet-এ USDC হিসেবে, আর MEXC-এর USDT কমতে থাকে। কমে গেলে বট "rebalance" alert দেবে।
    তখন wallet থেকে USDC নিজে MEXC-তে পাঠাতে হবে। বট নিজে কখনো MEXC-তে টাকা পাঠায় না।
 
-### Transfer strategy-র নিরাপত্তা (অবশ্যই করবেন)
+### Transfer strategy-র নিরাপত্তা (চালাতে চাইলে অবশ্যই করবেন; প্রস্তাবিত নয়)
 - MEXC API key: **Spot Trade + Withdraw** permission, **IP whitelist করা থাকবে শুধু VPS-এর IP**।
 - MEXC settings-এ **Withdrawal Address Whitelist চালু করুন**, আর সেখানে **শুধু বটের hot wallet address** রাখুন।
   তাহলে কেউ key চুরি করলেও টাকা অন্য কোথাও পাঠাতে পারবে না।
@@ -80,7 +84,10 @@ Stack: Node 20+, TypeScript, ethers v6, MEXC Spot API v3 (REST + protobuf WebSoc
 
 সব state (pause, fail streak, দিনের PnL) SQLite-এ থাকে, তাই pm2 restart করলেও limit reset হয় না।
 
-**Telegram commands:** `/stop` দিলে সাথে সাথে নতুন trade বন্ধ হয়, `/start` দিলে আবার চালু হয়, `/status` দেখায় PnL, inventory, limit আর আটকে থাকা transfer।
+**Telegram commands** (শুধু `TELEGRAM_ADMIN_ID`-এর user থেকে, আর বটের সাথে **private chat**-এ। group-এ অন্য কেউ দিলে উপেক্ষা করবে):
+`/stop` দিলে সাথে সাথে নতুন trade বন্ধ হয়, `/status` দেখায় PnL, inventory, limit আর আটকে থাকা transfer।
+`/start` শুধু সাধারণ pause খোলে, যেমন `/stop` বা পরপর fail-এর pause। **Critical pause**-এর ক্ষেত্রে বট আগে খোলা position আর balance দেখায়,
+তারপর **`/start confirm`** চায়। Critical pause হয় MEXC order বা DEX tx-এর ফল অজানা থাকলে, unwind fail করলে, বা trade চলার মাঝখানে restart হলে।
 Transfer strategy-তে আরও দুইটা command আছে: `/sell <id>` আটকে থাকা বা hold করা token এখনই বেচার চেষ্টা করে (loss floor উপেক্ষা করে), আর
 `/clear <id>` হাতে সমাধান করা transfer বন্ধ করে।
 বট শুধু `TELEGRAM_CHAT_ID`-এর মেসেজ মানে।
@@ -120,7 +127,7 @@ chmod 600 .env      # না দিলে live মোড চালু হবে 
 
 ### 5. চালানো
 ```bash
-MODE=paper npm start                   # (পরামর্শ) আগে paper মোডে এক দিন দেখুন
+npm start                              # ডিফল্ট MODE=paper: কমপক্ষে ৭ দিন দেখুন
 pm2 start ecosystem.config.cjs && pm2 save && pm2 startup
 pm2 logs mexc-dex-arb
 ```
@@ -130,6 +137,20 @@ pm2 logs mexc-dex-arb
 npm run report -- 24 live
 ```
 এটা দেখায় কয়টা trade হয়েছে, মোট net PnL, gas খরচ, কয়টা fail করেছে, আর কোন token-এ লাভ বা ক্ষতি হয়েছে। Telegram-এর দৈনিক summary-তেও একই তথ্য আসে।
+
+## নিরাপত্তা ব্যবস্থা (Muse আর Grok-এর review-এর পর)
+
+- **MEXC order idempotent:** প্রতিটা order-এ নিজের দেওয়া `newClientOrderId` থাকে। timeout বা 5xx হলে আবার পাঠায় না, আগে `origClientOrderId` দিয়ে খুঁজে দেখে।
+- **MEXC rule যাচাই হয় DEX tx পাঠানোর আগেই:** পরিমাণের step (`baseAssetPrecision`), ন্যূনতম পরিমাণ (`baseSizePrecision`),
+  ন্যূনতম আর সর্বোচ্চ notional, order type, আর `tradeSideType`।
+- **DEX tx-এর ফল অজানা হলে:** unwind করে না, critical pause দেয়। নিজস্ব nonce manager-এর কারণে আগের tx-এর মীমাংসা না হওয়া পর্যন্ত নতুন tx পাঠায় না।
+- **Crash safety:** legs পাঠানোর আগেই trade `executing` হিসেবে database-এ লেখা হয়, tx-এর hash-ও broadcast-এর আগে লেখা হয়।
+  Restart হলে বট সেটা খুঁজে বের করে, MEXC order আর tx receipt দেখে, তারপর `/start confirm` না পাওয়া পর্যন্ত paused থাকে।
+  বন্ধ করার সংকেত পেলে চলমান trade শেষ হওয়া পর্যন্ত অপেক্ষা করে।
+- **0x:** approve কোন address-এ যাবে সেটা নেওয়া হয় `issues.allowance.spender` বা `allowanceTarget` থেকে, আর সেটা AllowanceHolder address-এর সাথে মিলতে হবে।
+  `slippagePpm` ব্যবহার হয়। firm quote-এ `issues.balance` বা `simulationIncomplete` থাকলে trade বাতিল হয়।
+- **Loss budget:** কোনো trade-এর worst case (size-এর ৫% আর gas) দিনের বাকি loss budget-এর চেয়ে বেশি হলে সেই trade বাদ দেয়।
+  PnL-এ approval gas আর MEXC-এর locked balance-ও ধরা হয়।
 
 ## জরুরি কথা
 

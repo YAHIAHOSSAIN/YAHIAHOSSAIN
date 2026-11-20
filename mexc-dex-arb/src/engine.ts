@@ -19,6 +19,14 @@ import {
 } from './pricing.js';
 import { log, errMsg } from './log.js';
 import { AmbiguousRequestError } from './mexc/rest.js';
+import { orderProblem } from './mexc/rules.js';
+
+/** A close/unwind that only partly filled: `remaining` is what is still open. */
+export class PartialCloseError extends Error {
+  constructor(msg: string, readonly remaining: number) {
+    super(msg);
+  }
+}
 
 /** Unique id we give MEXC orders, so an order can be found even if the request timed out. */
 export const clientId = (tag: string) => `arb${tag}${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`.slice(0, 32);
@@ -74,7 +82,15 @@ export interface ChainApi {
   approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint>;
   approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
   simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
-  send(tx: { to: string; data: string; value?: bigint }, gasLimit: bigint, gas: GasInfo, timeoutSec: number): Promise<TxResult>;
+  send(
+    tx: { to: string; data: string; value?: bigint },
+    gasLimit: bigint,
+    gas: GasInfo,
+    timeoutSec: number,
+    onSigned?: (hash: string, nonce: number) => void,
+  ): Promise<TxResult>;
+  /** Unresolved earlier tx (outcome unknown): no new trades until it is 'clear'. */
+  checkUnresolved?(): Promise<{ state: 'clear' | 'pending' }>;
 }
 export interface Notifier {
   send(text: string): Promise<void>;
@@ -91,7 +107,8 @@ export interface EngineDeps {
   book: (symbol: string) => Promise<Book>;
   /** Authoritative book (REST) used for the final check right before trading; defaults to `book`. */
   freshBook?: (symbol: string) => Promise<Book>;
-  balances: () => Promise<Balances>;
+  /** total=true: free + locked MEXC balances (for exact PnL); default free (for sizing). */
+  balances: (total?: boolean) => Promise<Balances>;
   tokens: Token[];
   sleep?: (ms: number) => Promise<void>;
 }
@@ -153,6 +170,11 @@ export class Engine {
     const block = this.d.risk.blockReason();
     if (block) return this.note('block', `trading blocked: ${block}`);
     this.note('block', 'trading enabled');
+
+    if (this.d.chain.checkUnresolved && (await this.d.chain.checkUnresolved()).state === 'pending') {
+      return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or replaced');
+    }
+    this.note('unresolved', 'no unresolved tx');
 
     const gas = await this.d.chain.gas();
     this.lastGasGwei = Number(gas.effective) / 1e9;
@@ -229,7 +251,9 @@ export class Engine {
         gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
         costs: this.costs(),
       });
-      if (opp && opp.cexQty <= cexTok) out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
+      const problem = opp && orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
+      if (problem) this.note(`rule-${t.base}-A`, `${t.base} DEX_BUY skipped: MEXC would reject the sell (${problem})`);
+      else if (opp && opp.cexQty <= cexTok) out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
     }
 
     // CEX_BUY: USDT -> token on MEXC, token -> USDC on DEX.
@@ -248,7 +272,9 @@ export class Engine {
           gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
           costs: this.costs(),
         });
-        out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
+        const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
+        if (problem) this.note(`rule-${t.base}-B`, `${t.base} CEX_BUY skipped: MEXC would reject the buy (${problem})`);
+        else out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
       }
     }
     return out;
@@ -274,6 +300,14 @@ export class Engine {
         this.record(c, 'approval', { pnl: -g, gas: g, note: `approval, then skipped: ${why}` });
       }
     };
+
+    // 0) Worst case must fit in what is left of today's loss budget.
+    const worst = (c.opp.sizeUsd * this.cfg.worstCaseLossPct) / 100 + c.opp.gasUsd;
+    const budget = this.d.risk.remainingLossBudget();
+    if (worst > budget) return skip(`worst case ${usd(worst)} > remaining daily loss budget ${usd(budget)}`);
+
+    // Snapshot BEFORE the approval, so approval gas is part of the measured PnL.
+    const before = await this.d.balances(true);
 
     // 1) Exact approval (never unlimited).
     if (c.approvalGas > 0n) {
@@ -327,14 +361,22 @@ export class Engine {
     }
     const need = this.need(c.opp.sizeUsd);
     if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
+    // MEXC symbol rules on the FINAL numbers, before anything is sent: a rejected MEXC leg after a sent DEX tx = one-sided.
+    const problem = orderProblem(t.rules, opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY', opp.cexQty, opp.cexLimitPrice);
+    if (problem) return skip(`MEXC would reject the order: ${problem}`);
 
-    // 4) Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
-    //    the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
-    const before = await this.d.balances();
+    // 4) Persist the trade as 'executing' BEFORE anything is sent: if the bot dies now, startup sees it.
+    const cid = clientId('t');
+    const tradeId = this.record({ ...c, opp }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
+
+    // Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
+    // the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
     log.info(`${t.base} EXECUTE ${opp.direction} size ${usd(opp.sizeUsd)} expected ${usd(opp.net)}`);
     const [cexR, dexR] = await Promise.allSettled([
-      this.cexLeg(t, opp),
-      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec),
+      this.cexLeg(t, opp, cid),
+      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash, nonce) =>
+        this.d.db.updateTrade(tradeId, { dex_tx: hash, note: `client order id ${cid}; nonce ${nonce}` }),
+      ),
     ]);
 
     const dex: TxResult = dexR.status === 'fulfilled' ? dexR.value : { ok: false, gasCostWei: 0n, reason: errMsg(dexR.reason) };
@@ -346,7 +388,7 @@ export class Engine {
       orderId = cexR.value.orderId;
     } else if (String((cexR.reason as Error)?.message ?? '').startsWith('UNKNOWN_ORDER_STATE')) {
       cexUnknown = true;
-      this.d.risk.pause('MEXC order state unknown');
+      this.d.risk.pause('MEXC order state unknown', true);
       await this.d.tg.send(`🚨 ${t.base}: MEXC order state unknown after placing. Trading PAUSED. Check MEXC manually.\n${errMsg(cexR.reason)}`);
     } else {
       log.warn(`${t.base} MEXC leg failed: ${errMsg(cexR.reason)}`);
@@ -358,10 +400,10 @@ export class Engine {
     if (!dex.ok) notes.push(`DEX: ${dex.reason}`);
     if (dex.unknown) {
       // We cannot tell if the swap executed. Unwinding could DOUBLE the position. Stop and ask a human.
-      this.d.risk.pause(`DEX tx outcome unknown (${dex.hash})`);
+      this.d.risk.pause(`DEX tx unknown ${dex.hash}`, true);
       await this.d.tg.send(
         `🚨 ${t.base}: DEX tx ${dex.hash} outcome UNKNOWN (not mined, cancel not confirmed). MEXC filled ${cexFilled}/${opp.cexQty}.\n` +
-          `NOT unwinding automatically. Trading PAUSED. Check the wallet on etherscan, fix by hand, then /start.`,
+          `NOT unwinding automatically. Trading PAUSED. Check the wallet on etherscan, fix by hand, then /start confirm.`,
       );
     }
     const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.cfg.mexcTakerFee, t.qtyStep);
@@ -372,14 +414,20 @@ export class Engine {
       const qty = unwind.qty.toFixed(decimalsOfStep(t.qtyStep));
       try {
         const r = await this.closeAtMarket(t, unwind.side, qty);
-        notes.push(`unwind ${unwind.side} ${qty} @market (${r.orderId}, filled ${r.filled})`);
-        await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base} ${opp.direction}\n${unwind.reason}\nClosed: MEXC MARKET ${unwind.side} ${qty} ${t.base}`);
+        if (r.dust) {
+          notes.push(`unwind ${unwind.side} ${qty} not sent: ${r.dust}`);
+          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base}: leftover ${unwind.side} ${qty} is below MEXC minimums (${r.dust}). Left as dust; fix inventory by hand.`);
+        } else {
+          notes.push(`unwind ${unwind.side} ${qty} (${r.orderId}, filled ${r.filled})`);
+          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base} ${opp.direction}\n${unwind.reason}\nClosed: MEXC ${unwind.side} ${r.filled} ${t.base}`);
+        }
       } catch (e) {
-        this.d.risk.pause(`unwind failed for ${t.base}`);
+        const remaining = e instanceof PartialCloseError ? e.remaining : Number(qty);
+        this.d.risk.pause(`unwind failed for ${t.base}`, true);
         notes.push(`UNWIND FAILED: ${errMsg(e)}`);
         await this.d.tg.send(
           `🚨 ONE-SIDED FILL ${t.base} and the market close FAILED: ${errMsg(e)}\n` +
-            `Open position: MEXC ${unwind.side} ${qty} ${t.base} still needed.\nTrading PAUSED. Close it manually, then /start.`,
+            `Still open: MEXC ${unwind.side} ${remaining} ${t.base} needed.\nTrading PAUSED. Close it manually, then /start confirm.`,
         );
       }
     } else if (!dex.ok) {
@@ -387,11 +435,19 @@ export class Engine {
     }
 
     // 6) Exact PnL = change in total value of everything the trade touched, at pre-trade prices.
-    await this.sleep(2500); // let MEXC balances settle
-    const after = await this.d.balances();
+    //    Orders are closed (filled/cancelled) by now; free + locked balances avoid counting held funds as lost.
+    await this.sleep(2500);
+    const after = await this.d.balances(true);
     const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd) - portfolioUsd(before, t, c.tokenUsd, ethUsd);
     const gasPaid = (Number(dex.gasCostWei + approvalCostWei) / 1e18) * ethUsd;
-    this.record({ ...c, opp }, status, { pnl, gas: gasPaid, dexTx: dex.hash, orderId, note: notes.join('; ') || null });
+    this.d.db.updateTrade(tradeId, {
+      status,
+      pnl_usd: pnl,
+      gas_usd: gasPaid,
+      dex_tx: dex.hash ?? null,
+      cex_order_id: orderId ?? cid,
+      note: [`client order id ${cid}`, ...notes].join('; '),
+    });
 
     const dexIsBuy = opp.direction === 'DEX_BUY';
     await this.d.tg.send(
@@ -412,40 +468,39 @@ export class Engine {
   }
 
   /**
-   * Close a position on MEXC now. SELL uses a MARKET order. BUY uses a LIMIT 2% above the best ask
-   * (MEXC documents MARKET buys by quote amount only, and we need an exact token quantity).
+   * Close a position on MEXC now with an aggressive LIMIT 2% through the book, for BOTH sides.
+   * (No MEXC spot symbol offers IMMEDIATE_OR_CANCEL, and some have no MARKET; LIMIT works everywhere.)
+   * Reads the order back and never assumes it filled. Below MEXC minimums -> returns `dust`, sends nothing.
    */
-  async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number }> {
-    if (side === 'SELL') {
-      const cid = clientId('c');
-      const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.marketSell(t.symbol, qty, cid), this.sleep);
-      await this.sleep(1000);
-      const o = await this.d.mexc.getOrder(t.symbol, orderId);
-      if (Number(o.executedQty) < Number(qty) * 0.999) throw new Error(`close SELL only filled ${o.executedQty}/${qty}`);
-      return { orderId, filled: Number(o.executedQty) };
-    }
+  async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number; dust?: string }> {
     const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
     const f = 10 ** t.priceDecimals;
-    const px = (Math.ceil(b.asks[0][0] * 1.02 * f) / f).toFixed(t.priceDecimals);
+    const pxNum = side === 'BUY' ? Math.ceil(b.asks[0][0] * 1.02 * f) / f : Math.floor(b.bids[0][0] * 0.98 * f) / f;
+    const dust = orderProblem(t.rules, side, Number(qty), pxNum);
+    if (dust) return { orderId: '', filled: 0, dust };
+    const px = pxNum.toFixed(t.priceDecimals);
     const cid = clientId('c');
-    const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, 'BUY', qty, px, cid), this.sleep);
+    const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, side, qty, px, cid), this.sleep);
     await this.sleep(1500);
     let o = await this.d.mexc.getOrder(t.symbol, orderId);
     if (o.status !== 'FILLED') {
       await this.d.mexc.cancelOrder(t.symbol, orderId).catch(() => {});
       o = await this.d.mexc.getOrder(t.symbol, orderId);
-      if (Number(o.executedQty) < Number(qty) * 0.999) throw new Error(`close BUY only filled ${o.executedQty}/${qty}`);
     }
-    return { orderId, filled: Number(o.executedQty) };
+    const filled = Number(o.executedQty);
+    if (filled < Number(qty) * 0.999) {
+      const remaining = Number((Number(qty) - filled).toFixed(decimalsOfStep(t.qtyStep)));
+      throw new PartialCloseError(`close ${side} only filled ${filled}/${qty}, ${remaining} remaining`, remaining);
+    }
+    return { orderId, filled };
   }
 
   /** MEXC marketable limit order; cancels any unfilled rest. Returns filled quantity. */
-  async cexLeg(t: Token, opp: Opportunity): Promise<{ orderId: string; filled: number }> {
+  async cexLeg(t: Token, opp: Opportunity, cid = clientId('t')): Promise<{ orderId: string; filled: number }> {
     const side: Side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
     const qty = opp.cexQty.toFixed(decimalsOfStep(t.qtyStep));
     const f = 10 ** t.priceDecimals;
     const px = side === 'SELL' ? Math.floor(opp.cexLimitPrice * f) / f : Math.ceil(opp.cexLimitPrice * f) / f;
-    const cid = clientId('t');
     const { orderId } = await placeSafely(
       this.d.mexc,
       t.symbol,
@@ -490,9 +545,9 @@ export class Engine {
     c: Candidate,
     status: TradeStatus,
     r: { pnl: number; gas: number; dexTx?: string; orderId?: string | null; note?: string | null },
-  ) {
+  ): number {
     const now = Date.now();
-    this.d.db.insertTrade({
+    return this.d.db.insertTrade({
       ts: now,
       day: dhakaDay(now),
       mode: this.cfg.mode,

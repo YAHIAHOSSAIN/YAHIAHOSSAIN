@@ -5,7 +5,8 @@
 //   MEXC bookTicker (all symbols, one call)  vs  DexScreener price (30 tokens per call)
 // Only the biggest gaps then get an exact, size-specific aggregator quote (see transfer.ts).
 import type { MexcRest } from './mexc/rest.js';
-import { ethNetwork } from './watchlist.js';
+import { ethNetwork, isOnline } from './watchlist.js';
+import { type SymbolRules, rulesFrom } from './mexc/rules.js';
 
 export interface ScanToken {
   base: string;
@@ -16,6 +17,7 @@ export interface ScanToken {
   withdrawMin: number;
   qtyStep: number;
   priceDecimals: number;
+  rules: SymbolRules;
   volumeUsd: number;
 }
 
@@ -40,7 +42,8 @@ export async function loadUniverse(
   const out: ScanToken[] = [];
   for (const s of symbols) {
     const base = s.baseAsset.toUpperCase();
-    if (s.quoteAsset !== 'USDT' || !s.isSpotTradingAllowed || String(s.status) !== '1' || SKIP.has(base)) continue;
+    if (s.quoteAsset !== 'USDT' || !s.isSpotTradingAllowed || !isOnline(s.status) || SKIP.has(base)) continue;
+    if ((s.tradeSideType ?? 1) !== 1) continue; // transfer needs to buy and (for exits) sell
     if (opts.only.length && !opts.only.includes(base)) continue;
     const vol = volume.get(s.symbol) ?? 0;
     if (vol < opts.minVolumeUsd) continue;
@@ -55,8 +58,9 @@ export async function loadUniverse(
       netWork: net.netWork ?? net.network,
       withdrawFee: Number(net.withdrawFee ?? 0),
       withdrawMin: Number(net.withdrawMin ?? 0),
-      qtyStep: Number(s.baseSizePrecision) || 10 ** -(s.baseAssetPrecision ?? 2),
+      qtyStep: rulesFrom(s).qtyStep,
       priceDecimals: s.quotePrecision,
+      rules: rulesFrom(s),
       volumeUsd: vol,
     });
   }

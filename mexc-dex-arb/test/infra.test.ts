@@ -6,7 +6,7 @@ import { MexcRest } from '../src/mexc/rest.js';
 import { ZeroEx, ZEROX_ALLOWANCE_HOLDER } from '../src/dex/aggregator.js';
 import { AmbiguousRequestError } from '../src/mexc/rest.js';
 import { placeSafely } from '../src/engine.js';
-import { loadConfig, validateConfig } from '../src/config.js';
+import { loadConfig, secretsOf, validateConfig } from '../src/config.js';
 import { Telegram } from '../src/telegram.js';
 import { redact, registerSecrets } from '../src/log.js';
 import { Db } from '../src/db.js';
@@ -135,20 +135,57 @@ test('config validation rejects dangerous values', () => {
   assert.throws(() => validateConfig({ ...ok, minTradeUsd: 500, maxTradeUsd: 200 }), /MIN_TRADE_USD/);
 });
 
-test('Telegram only obeys the configured chat', async () => {
+test('Telegram only obeys the admin user in a private chat', async () => {
   const sent: string[] = [];
   const fetchFn = (async (_u: string, o: { body: string }) => {
     sent.push(JSON.parse(o.body).text);
     return new Response(JSON.stringify({ ok: true, result: {} }));
   }) as unknown as typeof fetch;
-  const tg = new Telegram('123456:TOKENTOKEN', '777', fetchFn);
-  let stopped = false;
-  const handlers = { '/stop': () => ((stopped = true), 'stopped') };
-  await tg.handle({ message: { chat: { id: 999 }, text: '/stop' } }, handlers);
-  assert.equal(stopped, false);
-  await tg.handle({ message: { chat: { id: 777 }, text: '/stop@MyBot' } }, handlers);
-  assert.equal(stopped, true);
+  const tg = new Telegram('123456:TOKENTOKEN', '777', fetchFn, '42');
+  let stopped = 0;
+  const handlers = { '/stop': () => (stopped++, 'stopped') };
+  await tg.handle({ message: { chat: { id: 999, type: 'private' }, from: { id: 42 }, text: '/stop' } }, handlers); // other chat
+  await tg.handle({ message: { chat: { id: 777, type: 'private' }, from: { id: 13 }, text: '/stop' } }, handlers); // wrong user
+  await tg.handle({ message: { chat: { id: 777, type: 'group' }, from: { id: 42 }, text: '/stop' } }, handlers); // group
+  assert.equal(stopped, 0);
+  await tg.handle({ message: { chat: { id: 777, type: 'private' }, from: { id: 42 }, text: '/stop@MyBot' } }, handlers);
+  assert.equal(stopped, 1);
   assert.deepEqual(sent, ['stopped']);
+});
+
+test('MEXC rules: step from baseAssetPrecision, min qty from baseSizePrecision, notional and side checks', async () => {
+  const { rulesFrom, orderProblem } = await import('../src/mexc/rules.js');
+  // real ETHUSDT values from exchangeInfo
+  const r = rulesFrom({ symbol: 'ETHUSDT', baseAsset: 'ETH', quoteAsset: 'USDT', status: '1', isSpotTradingAllowed: true, baseSizePrecision: '0.0001', baseAssetPrecision: 5, quotePrecision: 2, orderTypes: ['LIMIT', 'MARKET', 'LIMIT_MAKER'], quoteAmountPrecision: '1', maxQuoteAmount: '4000000', tradeSideType: 1 });
+  assert.equal(r.qtyStep, 1e-5);
+  assert.equal(r.minQty, 0.0001);
+  assert.equal(orderProblem(r, 'BUY', 0.01, 1600), null);
+  assert.match(orderProblem(r, 'BUY', 0.00005, 1600)!, /minimum 0.0001/);
+  assert.match(orderProblem(r, 'BUY', 0.0005, 1600)!, /< minimum 1 USDT/);
+  assert.match(orderProblem(r, 'BUY', 0.01, 1600, 'IMMEDIATE_OR_CANCEL')!, /not allowed/);
+  assert.match(orderProblem({ ...r, tradeSideType: 3 }, 'BUY', 0.01, 1600)!, /sell-only/);
+  assert.match(orderProblem({ ...r, tradeSideType: 2 }, 'SELL', 0.01, 1600)!, /buy-only/);
+});
+
+test('toUnits truncates, never rounds up', async () => {
+  const { toUnits } = await import('../src/util.js');
+  assert.equal(toUnits(0.1239999999, 3), 123n);
+  assert.equal(toUnits(1.9999999, 6), 1999999n);
+  assert.equal(toUnits(0, 6), 0n);
+});
+
+test('0x requests use slippagePpm (slippageBps is deprecated) and refuse unsafe firm quotes', async () => {
+  let url = '';
+  const z = (body: object) =>
+    new ZeroEx('k', (async (u: string) => {
+      url = u;
+      return new Response(JSON.stringify({ liquidityAvailable: true, buyAmount: '1', minBuyAmount: '1', transaction: { to: AH, data: '0x', gas: '1', value: '0' }, ...body }));
+    }) as unknown as typeof fetch);
+  await z({}).quote(req);
+  assert.match(url, /slippagePpm=3000/);
+  assert.doesNotMatch(url, /slippageBps/);
+  await assert.rejects(z({ issues: { balance: { actual: '0' } } }).quote(req), /balance/);
+  await assert.rejects(z({ issues: { simulationIncomplete: true } }).quote(req), /simulation incomplete/);
 });
 
 test('Risk: loss limit, fail streak, trade limit, kill switch', () => {
@@ -192,4 +229,31 @@ test('ethNetwork finds the Ethereum entry in MEXC coin config', () => {
     ],
   });
   assert.equal(n?.contract, '0xeth');
+});
+
+test('transfer strategy refuses to start without ALLOW_WITHDRAWALS=yes; safe defaults', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MODE', 'STRATEGY', 'ALLOW_WITHDRAWALS', 'MAX_TRADE_USD']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    const d = loadConfig();
+    assert.equal(d.mode, 'paper');
+    assert.equal(d.strategy, 'inventory');
+    assert.equal(d.maxTradeUsd, 50);
+    process.env.STRATEGY = 'transfer';
+    assert.throws(() => loadConfig(), /ALLOW_WITHDRAWALS=yes/);
+    process.env.ALLOW_WITHDRAWALS = 'yes';
+    assert.equal(loadConfig().strategy, 'transfer');
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('RPC URLs (they contain provider keys) are redacted', () => {
+  process.env.RPC_URL = 'https://eth-mainnet.g.alchemy.com/v2/SECRETKEY123';
+  process.env.MODE = 'paper';
+  delete process.env.STRATEGY;
+  const c = loadConfig();
+  registerSecrets(secretsOf(c));
+  assert.equal(redact('rpc https://eth-mainnet.g.alchemy.com/v2/SECRETKEY123 failed'), 'rpc *** failed');
 });

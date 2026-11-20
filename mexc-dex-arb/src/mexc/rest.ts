@@ -19,6 +19,9 @@ export interface SymbolInfo {
   baseAssetPrecision?: number;
   quotePrecision: number;
   orderTypes: string[];
+  quoteAmountPrecision?: string; // minimum order value (USDT)
+  maxQuoteAmount?: string;
+  tradeSideType?: number; // 1 all, 2 buy only, 3 sell only, 4 close only
 }
 export interface CoinNetwork {
   coin: string;
@@ -156,9 +159,10 @@ export class MexcRest {
     return this.request('GET', '/api/v3/account', {}, true);
   }
 
-  async balances(): Promise<Record<string, number>> {
+  /** Free balances (what can be traded now); includeLocked adds funds held in open orders. */
+  async balances(includeLocked = false): Promise<Record<string, number>> {
     const a = await this.account();
-    return Object.fromEntries(a.balances.map((b) => [b.asset, Number(b.free)]));
+    return Object.fromEntries(a.balances.map((b) => [b.asset, Number(b.free) + (includeLocked ? Number(b.locked) : 0)]));
   }
 
   /** Best bid/ask for every symbol in one call. */

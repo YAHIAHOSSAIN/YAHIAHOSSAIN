@@ -14,6 +14,7 @@ import { paperBalances, snapshot } from './inventory.js';
 import { Engine } from './engine.js';
 import { TransferEngine } from './transfer.js';
 import { formatReport } from './summary.js';
+import { recoverExecuting } from './recovery.js';
 import { dhakaDay, dhakaHourMinute, usd } from './util.js';
 
 const cfg = validateConfig(loadConfig());
@@ -38,10 +39,23 @@ function rateLimitOk() {
   rateLimit.level = 0;
 }
 
-/** Crash handlers: exit (pm2 restarts) only on real crashes; a stray rejected promise is logged and alerted. */
+/** Set by shutdown: loops stop starting new ticks. */
+export const lifecycle = { stopping: false, busy: false };
+
+/**
+ * Crash handlers: exit (pm2 restarts) only on real crashes; a stray rejected promise is logged and alerted.
+ * On SIGINT/SIGTERM/crash: stop new ticks and wait for a running trade to finish (up to TX_TIMEOUT_SEC*2+30s).
+ */
 function installProcessHandlers(tg: Telegram, cleanup: () => void) {
+  let shuttingDown = false;
   const shutdown = async (why: string, code: number) => {
-    await tg.send(`🔌 Bot stopped: ${why}`);
+    if (shuttingDown) return;
+    shuttingDown = true;
+    lifecycle.stopping = true;
+    const deadline = Date.now() + (cfg.txTimeoutSec * 2 + 30) * 1000;
+    if (lifecycle.busy) log.info('shutdown: waiting for the running trade to finish');
+    while (lifecycle.busy && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
+    await tg.send(`🔌 Bot stopped: ${why}${lifecycle.busy ? ' (a trade was still running: check /status after restart)' : ''}`);
     cleanup();
     tg.stop();
     process.exit(code);
@@ -59,6 +73,20 @@ function installProcessHandlers(tg: Telegram, cleanup: () => void) {
   process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
 }
 
+/** /start handler shared by both strategies: critical pauses need "/start confirm". */
+function startHandler(risk: Risk, statusText: () => Promise<string>, onConfirm: () => void) {
+  return async (args: string[]) => {
+    const confirm = args[0]?.toLowerCase() === 'confirm';
+    if (risk.paused && risk.critical && !confirm) {
+      return `⚠️ Critical pause: ${risk.pauseReason}\nCheck these positions and balances first:\n\n${await statusText()}\n\nThen send: /start confirm`;
+    }
+    risk.resume(confirm);
+    if (confirm) onConfirm();
+    const block = risk.blockReason();
+    return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
+  };
+}
+
 /** Refuse to trade live if .env is readable by other users. */
 function checkEnvPermissions(path: string) {
   if (!fs.existsSync(path)) return log.warn(`${path} not found; make sure secrets come from a protected place`);
@@ -71,7 +99,7 @@ async function main() {
 
   const db = new Db(cfg.dbPath);
   const risk = new Risk(db, cfg.mode, cfg);
-  const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId);
+  const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId);
   if (!tg.enabled) log.warn('Telegram not configured: alerts only go to the log and there is no /stop');
   const mexc = new MexcRest(cfg.mexcApiKey, cfg.mexcApiSecret);
   const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei);
@@ -96,6 +124,7 @@ async function main() {
   });
   if (cfg.mode === 'live') {
     if (!tg.enabled) throw new Error('Live mode needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (kill switch)');
+    if (!cfg.telegramAdminId) throw new Error('Live mode needs TELEGRAM_ADMIN_ID (only this user may send /stop /start)');
     const acc = await mexc.account();
     if (!acc.canTrade) throw new Error('MEXC API key cannot trade');
     const eth = Number(await chain.ethBalance()) / 1e18;
@@ -111,6 +140,10 @@ async function main() {
     }
   }
 
+  if (cfg.mode === 'live') await recoverExecuting(db, risk, tg, mexc, (h) => chain.provider.getTransactionReceipt(h));
+  // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
+  setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
+
   if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg);
 
   const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
@@ -125,7 +158,8 @@ async function main() {
   const stream = new MexcBookStream(['ETHUSDT', ...tokens.map((t) => t.symbol)]);
   stream.start();
   const book = async (symbol: string) => stream.get(symbol) ?? mexc.depth(symbol, 20);
-  const balances = cfg.mode === 'live' ? () => snapshot(chain, mexc, cfg.usdc, tokens) : async () => paperBalances(tokens);
+  const balances =
+    cfg.mode === 'live' ? (total?: boolean) => snapshot(chain, mexc, cfg.usdc, tokens, total) : async () => paperBalances(tokens);
 
   const freshBook = (symbol: string) => mexc.depth(symbol, 20);
   const engine = new Engine({ cfg, mexc, chain, agg, db, risk, tg, book, freshBook, balances, tokens });
@@ -157,11 +191,7 @@ async function main() {
       risk.pause('Telegram /stop');
       return '🛑 Trading STOPPED. Send /start to resume.';
     },
-    '/start': () => {
-      risk.resume();
-      const block = risk.blockReason();
-      return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
-    },
+    '/start': startHandler(risk, statusText, () => (chain.unresolved = null)),
     '/status': statusText,
   });
 
@@ -169,8 +199,8 @@ async function main() {
   let busy = false;
   let errors = 0;
   chain.provider.on('block', async () => {
-    if (busy || rateLimited()) return;
-    busy = true;
+    if (busy || rateLimited() || lifecycle.stopping) return;
+    busy = lifecycle.busy = true;
     try {
       await engine.tick();
       errors = 0;
@@ -181,7 +211,7 @@ async function main() {
       log.error(`tick: ${errMsg(e)}`);
       if (errors >= 5) await engine.alertThrottled('tick-errors', `❗ Bot errors (${errors} in a row): ${errMsg(e)}`, 3600_000);
     } finally {
-      busy = false;
+      busy = lifecycle.busy = false;
     }
   });
 
@@ -224,46 +254,44 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
       risk.pause('Telegram /stop');
       return '🛑 New trades STOPPED. An open transfer still finishes (selling the tokens already bought is the safe exit). /start to resume.';
     },
-    '/start': () => {
-      risk.resume();
-      const block = risk.blockReason();
-      return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
-    },
-    '/status': async () => {
-      const t = risk.today();
-      const open = db.openTransfers();
-      const lines = [
-        `MODE=${cfg.mode} STRATEGY=transfer | ${risk.paused ? `⏸ PAUSED (${risk.pauseReason})` : '▶️ running'}`,
-        `Scanning ${engine.universe.length} MEXC ERC20 tokens every ${cfg.scanIntervalSec}s`,
-        `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
-        `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, gas ${engine.lastGasGwei.toFixed(1)}/${cfg.maxGasGwei} gwei`,
-        `Top gaps: ${engine.lastTopGaps.map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ') || 'none'}`,
-        open.length ? `Open: ${open.map((o) => `#${o.id} ${o.base} ${o.status}`).join(', ')}` : 'Open transfers: none',
-      ];
-      const stuck = db.stuckTransfers();
-      if (stuck.length) lines.push(`🚨 Needs you: ${stuck.map((o) => `#${o.id} ${o.base} (${o.note ?? 'stuck'})`).join('; ')} -> /sell <id> or /clear <id>`);
-      if (cfg.mode === 'live') {
-        try {
-          const b = await mexc.balances();
-          const eth = await chain.ethBalance();
-          const usdc = await chain.tokenBalance(cfg.usdc);
-          lines.push(`MEXC ${usd(b.USDT ?? 0)} USDT | wallet ${(Number(eth) / 1e18).toFixed(4)} ETH, ${usd(Number(usdc) / 1e6)} USDC`);
-        } catch (e) {
-          lines.push(`Balance error: ${errMsg(e)}`);
-        }
-      }
-      return lines.join('\n');
-    },
-    '/sell': ([id]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
-    '/clear': ([id]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
+    '/start': async (args: string[]) => startHandler(risk, transferStatus, () => (chain.unresolved = null))(args),
+    '/status': async () => transferStatus(),
+    '/sell': ([id]: string[]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
+    '/clear': ([id]: string[]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
   });
+
+  async function transferStatus() {
+    const t = risk.today();
+    const open = db.openTransfers();
+    const lines = [
+      `MODE=${cfg.mode} STRATEGY=transfer | ${risk.paused ? `⏸ PAUSED (${risk.pauseReason})` : '▶️ running'}`,
+      `Scanning ${engine.universe.length} MEXC ERC20 tokens every ${cfg.scanIntervalSec}s`,
+      `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
+      `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, gas ${engine.lastGasGwei.toFixed(1)}/${cfg.maxGasGwei} gwei`,
+      `Top gaps: ${engine.lastTopGaps.map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ') || 'none'}`,
+      open.length ? `Open: ${open.map((o) => `#${o.id} ${o.base} ${o.status}`).join(', ')}` : 'Open transfers: none',
+    ];
+    const stuck = db.stuckTransfers();
+    if (stuck.length) lines.push(`🚨 Needs you: ${stuck.map((o) => `#${o.id} ${o.base} (${o.note ?? 'stuck'})`).join('; ')} -> /sell <id> or /clear <id>`);
+    if (cfg.mode === 'live') {
+      try {
+        const b = await mexc.balances();
+        const eth = await chain.ethBalance();
+        const usdc = await chain.tokenBalance(cfg.usdc);
+        lines.push(`MEXC ${usd(b.USDT ?? 0)} USDT | wallet ${(Number(eth) / 1e18).toFixed(4)} ETH, ${usd(Number(usdc) / 1e6)} USDC`);
+      } catch (e) {
+        lines.push(`Balance error: ${errMsg(e)}`);
+      }
+    }
+    return lines.join('\n');
+  }
 
   let busy = false;
   let errors = 0;
   let lastLow = 0;
   const loop = async () => {
-    if (busy || rateLimited()) return;
-    busy = true;
+    if (busy || rateLimited() || lifecycle.stopping) return;
+    busy = lifecycle.busy = true;
     try {
       await engine.tick();
       errors = 0;
@@ -283,7 +311,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
       log.error(`scan: ${errMsg(e)}`);
       if (errors === 5) await tg.send(`❗ Bot errors (5 in a row): ${errMsg(e)}`);
     } finally {
-      busy = false;
+      busy = lifecycle.busy = false;
     }
   };
   setInterval(loop, cfg.scanIntervalSec * 1000);

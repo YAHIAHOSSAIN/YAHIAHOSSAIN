@@ -32,8 +32,23 @@ export function toFloat(amount: bigint, decimals: number): number {
   return Number(`${s.slice(0, s.length - decimals)}.${s.slice(s.length - decimals) || '0'}`);
 }
 
-/** Float -> base units, truncated. */
+/** Float -> base units, truncated (never rounded up, so we never ask for more than we hold). */
 export function toUnits(x: number, decimals: number): bigint {
-  const [i, f = ''] = x.toFixed(Math.min(decimals, 18)).split('.');
+  if (!(x > 0) || !Number.isFinite(x)) return 0n;
+  // Work on the shortest exact decimal string of the number and CUT it: toFixed() would round
+  // (0.1239999999 -> "0.124"), and the full binary expansion is slightly above the intended value.
+  const [i, f = ''] = plainDecimal(x).split('.');
   return BigInt(i + f.padEnd(decimals, '0').slice(0, decimals));
+}
+
+/** Number -> plain decimal string without exponent ("1.5e-7" -> "0.00000015"). */
+function plainDecimal(x: number): string {
+  const s = String(x);
+  const m = /^(\d+)(?:\.(\d+))?e([+-]\d+)$/.exec(s);
+  if (!m) return s;
+  const digits = m[1] + (m[2] ?? '');
+  const point = m[1].length + Number(m[3]);
+  if (point <= 0) return `0.${'0'.repeat(-point)}${digits}`;
+  if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
+  return `${digits.slice(0, point)}.${digits.slice(point)}`;
 }

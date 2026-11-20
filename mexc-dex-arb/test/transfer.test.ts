@@ -38,7 +38,9 @@ function setup(
 ) {
   process.env.MODE = o.mode ?? 'live';
   process.env.STRATEGY = 'transfer';
+  process.env.ALLOW_WITHDRAWALS = 'yes';
   process.env.RPC_URL = 'http://localhost';
+  process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
   process.env.PRIVATE_KEY = '0x' + '22'.repeat(32);
   process.env.MEXC_API_KEY = 'k'.repeat(10);
   process.env.MEXC_API_SECRET = 's'.repeat(10);
@@ -144,7 +146,8 @@ test('loadUniverse keeps only ERC20 tokens with deposit AND withdraw open', asyn
 });
 
 test('findGaps: filters TVL, too-small and absurd gaps, sorts biggest first', () => {
-  const tok = (base: string, address: string): ScanToken => ({ base, symbol: `${base}USDT`, address, netWork: 'ETH', withdrawFee: 0, withdrawMin: 0, qtyStep: 0.01, priceDecimals: 4, volumeUsd: 1e6 });
+  const rules = { qtyStep: 0.01, priceDecimals: 4, minQty: 0, minNotional: 1, maxNotional: 1e6, orderTypes: ['LIMIT'], tradeSideType: 1 };
+  const tok = (base: string, address: string): ScanToken => ({ base, symbol: `${base}USDT`, address, netWork: 'ETH', withdrawFee: 0, withdrawMin: 0, qtyStep: 0.01, priceDecimals: 4, volumeUsd: 1e6, rules });
   const tokens = [tok('A', '0xa'), tok('B', '0xb'), tok('C', '0xc'), tok('D', '0xd'), tok('E', '0xe')];
   const tickers = new Map(['A', 'B', 'C', 'D', 'E'].map((b) => [`${b}USDT`, { bid: 0.99, ask: 1 }]));
   const dex = new Map([

@@ -27,15 +27,32 @@ export class Risk {
     return Number(this.db.getState('consecutive_fails') ?? '0');
   }
 
-  pause(reason: string): void {
-    this.db.setState('paused', '1');
-    this.db.setState('pause_reason', reason);
+  /** Critical pauses mean money may be in an unknown state; only `/start confirm` clears them. */
+  get critical(): boolean {
+    return this.db.getState('pause_critical') === '1';
   }
 
-  resume(): void {
+  pause(reason: string, critical = false): void {
+    // Never downgrade: a soft pause on top of a critical one keeps it critical.
+    const keepCritical = this.paused && this.critical && !critical;
+    this.db.setState('paused', '1');
+    if (!keepCritical) this.db.setState('pause_reason', reason);
+    this.db.setState('pause_critical', critical || keepCritical ? '1' : '0');
+  }
+
+  /** Returns false (and stays paused) if a critical pause is not confirmed. */
+  resume(confirm = false): boolean {
+    if (this.paused && this.critical && !confirm) return false;
     this.db.setState('paused', '0');
     this.db.setState('pause_reason', '');
+    this.db.setState('pause_critical', '0');
     this.db.setState('consecutive_fails', '0');
+    return true;
+  }
+
+  /** Remaining daily loss budget (USD) before the limit is hit. */
+  remainingLossBudget(): number {
+    return this.limits.dailyLossLimitUsd + this.today().pnl;
   }
 
   today() {

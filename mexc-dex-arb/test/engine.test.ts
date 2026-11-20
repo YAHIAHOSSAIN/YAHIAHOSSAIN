@@ -9,13 +9,14 @@ import type { Balances } from '../src/inventory.js';
 import type { Token } from '../src/watchlist.js';
 import type { Quote, QuoteRequest } from '../src/dex/aggregator.js';
 import type { TxResult } from '../src/dex/chain.js';
-import type { Book, Order } from '../src/mexc/rest.js';
+import { AmbiguousRequestError, type Book, type Order } from '../src/mexc/rest.js';
 
 const GWEI = 1_000_000_000n;
 const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 const LINK: Token = {
   base: 'LINK', symbol: 'LINKUSDT', address: '0x514910771af9ca656af840dff83e8264ecf986ca', decimals: 18,
   qtyStep: 0.01, priceDecimals: 3, dexTvlUsd: 1e6, mexcVolumeUsd: 1e7, depositOk: true, withdrawOk: true,
+  rules: { qtyStep: 0.01, priceDecimals: 3, minQty: 0.01, minNotional: 1, maxNotional: 2e6, orderTypes: ['LIMIT', 'MARKET', 'LIMIT_MAKER'], tradeSideType: 1 },
 };
 
 function setup(opts: {
@@ -26,11 +27,15 @@ function setup(opts: {
   simulateThrows?: boolean;
   approvalNeeded?: boolean;
   mexcFillRatio?: number;
-  marketFillRatio?: number;
+  closeFillRatio?: number;
   dexUnknown?: boolean;
+  placeAmbiguous?: boolean;
+  minNotional?: number;
+  unresolved?: boolean;
 }) {
   process.env.MODE = opts.mode ?? 'live';
   process.env.RPC_URL = 'http://localhost';
+  process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
   process.env.PRIVATE_KEY = '0x' + '11'.repeat(32);
   process.env.MEXC_API_KEY = 'k'.repeat(10);
   process.env.MEXC_API_SECRET = 's'.repeat(10);
@@ -66,6 +71,7 @@ function setup(opts: {
   let lastFirm: QuoteRequest | null = null;
 
   const orders = new Map<string, Order>();
+  const byCid = new Map<string, string>();
   let nextId = 1;
   const fill = (side: 'BUY' | 'SELL', qty: number, price: number) => {
     if (side === 'SELL') {
@@ -77,11 +83,12 @@ function setup(opts: {
     }
   };
 
+  const token = { ...LINK, rules: { ...LINK.rules, minNotional: opts.minNotional ?? 1 } };
   const engine = new Engine({
     cfg,
     db,
     risk,
-    tokens: [LINK],
+    tokens: [token],
     sleep: async () => {},
     tg: { send: async (t) => void alerts.push(t) },
     book: async (s) => books[s],
@@ -103,6 +110,7 @@ function setup(opts: {
         bal.walletEth -= 0.0006;
         return { ok: true, gasCostWei: 600_000n * GWEI };
       },
+      checkUnresolved: async () => ({ state: opts.unresolved ? 'pending' : 'clear' }),
       simulate: async () => {
         calls.push('simulate');
         if (opts.simulateThrows) throw new Error('execution reverted');
@@ -127,12 +135,16 @@ function setup(opts: {
       },
     },
     mexc: {
-      limitOrder: async (_s, side, q, p) => {
+      limitOrder: async (_s, side, q, p, cid) => {
         calls.push(`limit ${side} ${q} @ ${p}`);
         const id = String(nextId++);
-        const filled = Number(q) * (opts.mexcFillRatio ?? 1);
+        const first = id === '1';
+        const filled = Number(q) * ((first ? opts.mexcFillRatio : opts.closeFillRatio) ?? 1);
         fill(side, filled, Number(p));
         orders.set(id, { orderId: id, status: filled === Number(q) ? 'FILLED' : 'PARTIALLY_FILLED', executedQty: String(filled), cummulativeQuoteQty: '0', origQty: q, price: p, side });
+        if (cid) byCid.set(cid, id);
+        // MEXC executed it, but our HTTP request timed out / got a 5xx:
+        if (first && opts.placeAmbiguous) throw new AmbiguousRequestError('MEXC POST /api/v3/order -> 503');
         return { orderId: id };
       },
       marketSell: async (_s, q) => {
@@ -142,7 +154,7 @@ function setup(opts: {
         orders.set('m', { orderId: 'm', status: 'FILLED', executedQty: String(filled), cummulativeQuoteQty: String(filled * bid), origQty: q, price: '0', side: 'SELL' });
         return { orderId: 'm' };
       },
-      getOrderByClientId: async () => null,
+      getOrderByClientId: async (_s, cid) => (byCid.has(cid) ? orders.get(byCid.get(cid)!)! : null),
       getOrder: async (_s, id) => orders.get(id)!,
       cancelOrder: async (_s, id) => {
         calls.push(`cancel ${id}`);
@@ -161,12 +173,13 @@ test('profitable gap: both legs trade, PnL comes from real balance changes', asy
   const { engine, db, alerts, calls } = setup({});
   await engine.tick();
   // MEXC sell 20 LINK (bought 20 on DEX for $200), limit = 11.2 * (1 - 0.2%) rounded down.
-  assert.deepEqual(calls, ['simulate', 'limit SELL 20.00 @ 11.177', 'send']);
+  // MEXC sells what the DEX guarantees (minBuyAmount 19.98), not the expected 20.
+  assert.deepEqual(calls, ['simulate', 'limit SELL 19.98 @ 11.177', 'send']);
   const s = trades(db);
   assert.equal(s.total.trades, 1);
   assert.equal(s.total.failed, 0);
-  // +20 LINK in wallet, -20 on MEXC; -$200 USDC; +20*11.177*(1-0.0005) USDT; -0.0015 ETH gas
-  const expected = -200 + 20 * 11.177 * 0.9995 - 0.0015 * 2000;
+  // +20 LINK in wallet, -19.98 on MEXC (0.02 kept, valued at mid 11.205); -$200 USDC; USDT in; -0.0015 ETH gas
+  const expected = -200 + 19.98 * 11.177 * 0.9995 + 0.02 * 11.205 - 0.0015 * 2000;
   assert.ok(Math.abs(s.total.pnl - expected) < 1e-6, `${s.total.pnl} vs ${expected}`);
   assert.ok(Math.abs(s.total.gas - 3) < 1e-9);
   assert.ok(alerts.some((a) => a.includes('✅ LIVE LINK DEX_BUY [ok]') && a.includes('Net PnL')));
@@ -182,19 +195,19 @@ test('no trade when the gap is below max($15, 0.5%)', async () => {
 test('DEX leg fails after MEXC sold: buys back at market, alerts one-sided', async () => {
   const { engine, db, alerts, calls, bal } = setup({ dexOk: false });
   await engine.tick();
-  assert.ok(calls.includes('limit BUY 20.00 @ 11.435')); // close: aggressive limit 2% over ask 11.21
+  assert.ok(calls.includes('limit BUY 19.98 @ 11.435')); // close: aggressive limit 2% over ask 11.21
   const row = trades(db);
   assert.equal(row.total.failed, 1);
   assert.ok(alerts.some((a) => a.startsWith('⚠️ ONE-SIDED FILL LINK')));
   assert.ok(Math.abs(bal.walletToken.LINK - 100) < 1e-9); // wallet untouched
-  assert.ok(Math.abs(bal.mexc.LINK - 100 + 20 * 0.0005) < 1e-9); // flat again except the fee
+  assert.ok(Math.abs(bal.mexc.LINK - 100 + 19.98 * 0.0005) < 1e-9); // flat again except the fee
 });
 
 test('MEXC partial fill: rest is cancelled and closed at market', async () => {
   const { engine, calls } = setup({ mexcFillRatio: 0.5 });
   await engine.tick();
   assert.ok(calls.includes('cancel 1'));
-  assert.ok(calls.includes('market SELL 10.00'));
+  assert.ok(calls.includes('limit SELL 9.99 @ 10.976')); // rest closed with an aggressive limit 2% under the bid
 });
 
 test('simulation failure: nothing is sent, approval gas is still booked', async () => {
@@ -249,9 +262,68 @@ test('DEX outcome unknown: NO automatic unwind, trading paused', async () => {
 });
 
 test('unwind SELL that only partly fills is detected (not assumed flat)', async () => {
-  const { engine, risk, calls, alerts } = setup({ mexcFillRatio: 0.5, marketFillRatio: 0.5 });
+  const { engine, risk, calls, alerts } = setup({ mexcFillRatio: 0.5, closeFillRatio: 0.5 });
   await engine.tick();
-  assert.ok(calls.includes('market SELL 10.00'));
+  assert.ok(calls.includes('limit SELL 9.99 @ 10.976'));
   assert.equal(risk.paused, true);
-  assert.ok(alerts.some((a) => a.includes('market close FAILED') && a.includes('only filled')));
+  assert.equal(risk.critical, true);
+  // reports what is REALLY still open (half of 9.99), not the full quantity
+  assert.ok(alerts.some((a) => a.includes('market close FAILED') && a.includes('Still open: MEXC SELL 5 LINK')));
+});
+
+test('MEXC 5xx on order placement: found by clientOrderId, no double sell', async () => {
+  const { engine, db, calls } = setup({ placeAmbiguous: true });
+  await engine.tick();
+  assert.equal(calls.filter((c) => c.startsWith('limit SELL')).length, 1); // never re-sent, never "unwound"
+  assert.ok(!calls.some((c) => c.startsWith('limit BUY')));
+  assert.equal(trades(db).total.failed, 0);
+});
+
+test('order below MEXC minNotional: rejected BEFORE any DEX tx', async () => {
+  const { engine, calls } = setup({ minNotional: 1000 });
+  await engine.tick();
+  assert.deepEqual(calls, []); // no simulate, no send, no MEXC order
+});
+
+test('unresolved earlier DEX tx: no new trades', async () => {
+  const { engine, calls } = setup({ unresolved: true });
+  await engine.tick();
+  assert.deepEqual(calls, []);
+});
+
+test('critical pause needs /start confirm; soft pause does not', () => {
+  const { risk } = setup({});
+  risk.pause('Telegram /stop');
+  assert.equal(risk.resume(), true);
+  risk.pause('DEX tx unknown 0xabc', true);
+  risk.pause('Telegram /stop'); // a later soft pause must not downgrade it
+  assert.equal(risk.critical, true);
+  assert.equal(risk.resume(), false);
+  assert.equal(risk.paused, true);
+  assert.equal(risk.resume(true), true);
+  assert.equal(risk.paused, false);
+});
+
+test('worst case beyond the remaining daily loss budget: skipped before any order', async () => {
+  const { engine, db, calls } = setup({});
+  db.insertTrade({ ts: Date.now(), day: (await import('../src/util.js')).dhakaDay(), mode: 'live', symbol: 'X', direction: 'DEX_BUY', size_usd: 1, qty: 1, buy_price: 1, sell_price: 1, expected_net: 0, cex_fee_usd: 0, gas_usd: 0, pnl_usd: -25, status: 'ok', dex_tx: null, cex_order_id: null, note: null });
+  await engine.tick(); // budget left $5 < 5% of $200 + gas
+  assert.deepEqual(calls, []);
+});
+
+test('restart with an executing row: looked up, reported, paused until /start confirm', async () => {
+  const { db, risk } = setup({});
+  const { recoverExecuting } = await import('../src/recovery.js');
+  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xpending', cex_order_id: 'cidX', note: 'client order id cidX; nonce 7' });
+  const alerts: string[] = [];
+  await recoverExecuting(
+    db, risk, { send: async (t) => void alerts.push(t) },
+    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
+    async () => null,
+  );
+  assert.equal(risk.paused, true);
+  assert.equal(risk.critical, true);
+  assert.equal(risk.resume(), false);
+  assert.equal(db.executingTrades().length, 0);
+  assert.ok(alerts[0].includes('MEXC order 9: FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
 });

@@ -1,15 +1,22 @@
-// Telegram alerts + commands (/stop, /start, /status). Only the configured chat id is obeyed.
+// Telegram alerts + commands (/stop, /start, /status, ...).
+// Commands are obeyed only from the admin user, in a private chat with the bot.
 import { log, errMsg, redact } from './log.js';
 import { sleep } from './util.js';
 
 type Handler = (args: string[]) => Promise<string> | string;
 type FetchFn = typeof fetch;
+type Update = { message?: { chat?: { id: number | string; type?: string }; from?: { id: number | string }; text?: string } };
 
 export class Telegram {
   private offset = 0;
   private running = false;
 
-  constructor(private token: string, private chatId: string, private fetchFn: FetchFn = fetch) {}
+  constructor(
+    private token: string,
+    private chatId: string,
+    private fetchFn: FetchFn = fetch,
+    private adminId = '',
+  ) {}
 
   get enabled(): boolean {
     return Boolean(this.token && this.chatId);
@@ -40,9 +47,14 @@ export class Telegram {
   }
 
   /** Dispatch one update; exported for tests. */
-  async handle(update: { message?: { chat?: { id: number | string }; text?: string } }, handlers: Record<string, Handler>) {
+  async handle(update: Update, handlers: Record<string, Handler>) {
     const m = update.message;
-    if (!m?.text || String(m.chat?.id) !== String(this.chatId)) return; // ignore strangers
+    if (!m?.text || String(m.chat?.id) !== String(this.chatId)) return; // other chats
+    // In a group anyone could type /start: require the admin user in a private chat.
+    if (!this.adminId || String(m.from?.id) !== String(this.adminId) || m.chat?.type !== 'private') {
+      log.warn(`telegram: ignored command from user ${m.from?.id} in ${m.chat?.type ?? '?'} chat`);
+      return;
+    }
     const [first, ...args] = m.text.trim().split(/\s+/);
     const cmd = first.split('@')[0].toLowerCase();
     const h = handlers[cmd];
@@ -55,7 +67,7 @@ export class Telegram {
     this.running = true;
     while (this.running) {
       try {
-        const updates = await this.api<{ update_id: number; message?: { chat?: { id: number }; text?: string } }[]>(
+        const updates = await this.api<({ update_id: number } & Update)[]>(
           'getUpdates',
           { offset: this.offset, timeout: 25, allowed_updates: ['message'] },
           35_000,

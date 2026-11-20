@@ -265,7 +265,7 @@ export class TransferEngine {
       await this.buy(row, c.plan.worst * (1 + this.cfg.cexSlippageBps / 10_000));
     } catch (e) {
       if (String((e as Error).message).startsWith('UNKNOWN_ORDER_STATE')) {
-        this.d.risk.pause(`MEXC buy state unknown for transfer #${id}`);
+        this.d.risk.pause(`MEXC buy state unknown for transfer #${id}`, true);
         await this.d.tg.send(`🚨 TRANSFER #${id} ${t.base}: MEXC buy state unknown (${errMsg(e)}). Trading PAUSED; the bot keeps looking for the order.`);
         return;
       }
@@ -509,7 +509,7 @@ export class TransferEngine {
       gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * ethUsd,
       note: `${what} outcome unknown`,
     });
-    this.d.risk.pause(`transfer #${row.id}: ${what} outcome unknown`);
+    this.d.risk.pause(`transfer #${row.id}: ${what} outcome unknown`, true);
     await this.d.tg.send(
       `🚨 TRANSFER #${row.id} ${row.base}: ${what} was not mined and its cancel was not confirmed. Outcome UNKNOWN.\n` +
         `Trading PAUSED. Check the wallet on etherscan. Then /sell ${row.id} (if the tokens are still there) or /clear ${row.id}, and /start.`,
@@ -536,7 +536,7 @@ export class TransferEngine {
       const o = await this.d.mexc.getOrder(row.symbol, orderId);
       const filled = Number(o.executedQty);
       if (filled < Number(qty) * 0.999) {
-        this.d.risk.pause(`MEXC sell of ${row.base} only partly filled`);
+        this.d.risk.pause(`MEXC sell of ${row.base} only partly filled`, true);
         await this.d.tg.send(
           `🚨 ${row.base}: MEXC market sell filled only ${filled}/${qty}. The rest is still on MEXC. Trading PAUSED: sell it by hand, then /start.`,
         );
@@ -546,7 +546,7 @@ export class TransferEngine {
       // Fallback only if the balance read is clearly off (e.g. a concurrent deposit/withdrawal).
       return received > 0 ? received : Number(o.cummulativeQuoteQty) * (1 - this.cfg.mexcTakerFee);
     } catch (e) {
-      this.d.risk.pause(`could not close ${row.base} on MEXC`);
+      this.d.risk.pause(`could not close ${row.base} on MEXC`, true);
       await this.d.tg.send(`🚨 ${row.base}: MEXC market sell of ${qty} FAILED (${errMsg(e)}). Trading PAUSED. Close it manually, then /start.`);
       return 0;
     }
@@ -577,7 +577,9 @@ export class TransferEngine {
     if (!t) return `No transfer #${id}`;
     if (t.status === 'done' || t.status === 'failed') return `Transfer #${id} is already ${t.status}`;
     this.d.db.updateTransfer(id, { status: 'failed', note: 'cleared manually via /clear' });
-    return `Transfer #${id} closed manually. (Its PnL is not counted; check balances yourself.)`;
+    // Gas already burned on this transfer is a real cost: book it so the daily loss limit sees it.
+    if (t.gas_usd > 0) this.recordTrade(t, 'one_sided', -t.gas_usd, t.gas_usd, undefined, 'cleared manually; gas spent');
+    return `Transfer #${id} closed manually. Gas spent (${usd(t.gas_usd)}) is booked; the token result is not, check balances yourself.`;
   }
 
   private recordTrade(row: TransferRow, status: 'ok' | 'one_sided', pnl: number, gas: number, tx: string | undefined, note: string, sellPrice = 0) {
