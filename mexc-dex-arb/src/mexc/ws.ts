@@ -53,7 +53,10 @@ export class MexcBookStream {
       }
       try {
         const push = decodeDepthPush(data);
-        if (push && push.symbol) this.books.set(push.symbol, { bids: push.bids, asks: push.asks, ts: Date.now() });
+        // Sanity check: ignore empty or crossed books instead of trading on them.
+        if (push && push.symbol && push.bids.length && push.asks.length && push.bids[0][0] < push.asks[0][0]) {
+          this.books.set(push.symbol, { bids: push.bids, asks: push.asks, ts: Date.now() });
+        }
       } catch (e) {
         log.warn(`MEXC WS decode error: ${errMsg(e)}`);
       }

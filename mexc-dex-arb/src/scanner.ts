@@ -88,7 +88,7 @@ export function findGaps(
   tokens: ScanToken[],
   tickers: Map<string, { bid: number; ask: number }>,
   dex: Map<string, { price: number; tvl: number }>,
-  opts: { minTvlUsd: number; minGapPct: number },
+  opts: { minTvlUsd: number; minGapPct: number; maxGapPct?: number },
 ): Gap[] {
   const gaps: Gap[] = [];
   for (const token of tokens) {
@@ -96,8 +96,8 @@ export function findGaps(
     const d = dex.get(token.address);
     if (!t || !d || t.ask <= 0 || d.price <= 0 || d.tvl < opts.minTvlUsd) continue;
     const gapPct = (d.price / t.ask - 1) * 100;
-    // > 50% usually means a different/broken token or a dead pool, not an opportunity.
-    if (gapPct >= opts.minGapPct && gapPct < 50) gaps.push({ token, ask: t.ask, dexPrice: d.price, tvlUsd: d.tvl, gapPct });
+    // Huge gaps usually mean a different/broken token or a dead pool, not an opportunity.
+    if (gapPct >= opts.minGapPct && gapPct < (opts.maxGapPct ?? 30)) gaps.push({ token, ask: t.ask, dexPrice: d.price, tvlUsd: d.tvl, gapPct });
   }
   return gaps.sort((a, b) => b.gapPct - a.gapPct);
 }

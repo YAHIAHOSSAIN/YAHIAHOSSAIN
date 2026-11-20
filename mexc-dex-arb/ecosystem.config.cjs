@@ -6,9 +6,10 @@ module.exports = {
       script: 'dist/main.js',
       cwd: __dirname,
       autorestart: true,
-      max_restarts: 10,
+      // Keep restarting (with growing delay) instead of giving up silently after a few crashes.
+      max_restarts: 1000,
       min_uptime: '60s',
-      restart_delay: 10000,
+      exp_backoff_restart_delay: 5000,
       time: true,
       out_file: 'logs/out.log',
       error_file: 'logs/error.log',

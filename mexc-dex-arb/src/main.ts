@@ -1,11 +1,11 @@
 // Entry point. Wires everything together, runs one scan per Ethereum block.
 import fs from 'node:fs';
-import { loadConfig, secretsOf } from './config.js';
+import { loadConfig, secretsOf, validateConfig } from './config.js';
 import { log, errMsg, registerSecrets } from './log.js';
 import { Db } from './db.js';
 import { Risk } from './risk.js';
 import { Telegram } from './telegram.js';
-import { MexcRest } from './mexc/rest.js';
+import { MexcRest, RateLimitError } from './mexc/rest.js';
 import { MexcBookStream } from './mexc/ws.js';
 import { Chain } from './dex/chain.js';
 import { OneInch, ZeroEx, type Aggregator } from './dex/aggregator.js';
@@ -16,8 +16,48 @@ import { TransferEngine } from './transfer.js';
 import { formatReport } from './summary.js';
 import { dhakaDay, dhakaHourMinute, usd } from './util.js';
 
-const cfg = loadConfig();
+const cfg = validateConfig(loadConfig());
 registerSecrets(secretsOf(cfg));
+
+/** Backoff after HTTP 429/418 from any API: skip scans for 1, 2, 4 ... up to 15 minutes. */
+const rateLimit = { until: 0, level: 0 };
+function onScanError(e: unknown): boolean {
+  if (e instanceof RateLimitError || /\b(429|418)\b/.test(errMsg(e))) {
+    const wait = Math.min(15 * 60_000, 60_000 * 2 ** rateLimit.level++);
+    rateLimit.until = Date.now() + wait;
+    log.warn(`rate limited, pausing scans for ${wait / 60_000} min`);
+    return true;
+  }
+  return false;
+}
+function rateLimited(): boolean {
+  if (Date.now() < rateLimit.until) return true;
+  return false;
+}
+function rateLimitOk() {
+  rateLimit.level = 0;
+}
+
+/** Crash handlers: exit (pm2 restarts) only on real crashes; a stray rejected promise is logged and alerted. */
+function installProcessHandlers(tg: Telegram, cleanup: () => void) {
+  const shutdown = async (why: string, code: number) => {
+    await tg.send(`🔌 Bot stopped: ${why}`);
+    cleanup();
+    tg.stop();
+    process.exit(code);
+  };
+  let lastRejectAlert = 0;
+  process.on('SIGINT', () => void shutdown('SIGINT', 0));
+  process.on('SIGTERM', () => void shutdown('SIGTERM', 0));
+  process.on('unhandledRejection', (e) => {
+    log.error(`unhandled rejection: ${errMsg(e)}`);
+    if (Date.now() - lastRejectAlert > 3600_000) {
+      lastRejectAlert = Date.now();
+      void tg.send(`❗ Unhandled error (bot keeps running): ${errMsg(e)}`);
+    }
+  });
+  process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
+}
 
 /** Refuse to trade live if .env is readable by other users. */
 function checkEnvPermissions(path: string) {
@@ -37,14 +77,38 @@ async function main() {
   const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei);
   const agg: Aggregator = cfg.aggregator === '0x' ? new ZeroEx(cfg.zeroExApiKey) : new OneInch(cfg.oneInchApiKey);
 
-  // --- Pre-flight checks ---
+  // --- Pre-flight checks: fail at startup, not in the middle of the first trade ---
   const chainId = BigInt(await chain.provider.send('eth_chainId', []));
   if (chainId !== 1n) throw new Error(`RPC_URL is chain ${chainId}, expected Ethereum mainnet (1)`);
+  if (!cfg.mexcApiKey || !cfg.mexcApiSecret) {
+    // Coin/network info (contract addresses, deposit/withdraw status) is a signed MEXC endpoint.
+    throw new Error('MEXC_API_KEY/SECRET are required even in paper mode (a read-only key is enough for paper)');
+  }
+  const skew = await mexc.syncTime();
+  if (Math.abs(skew) > 1000) log.warn(`VPS clock is ${skew} ms off MEXC time; corrected, but enable NTP (timedatectl set-ntp true)`);
+  // Aggregator key and route smoke test: quote 100 USDC -> WETH.
+  await agg.price({
+    sellToken: cfg.usdc,
+    buyToken: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+    sellAmount: 100_000_000n,
+    taker: chain.wallet?.address ?? '0x000000000000000000000000000000000000dEaD',
+    slippageBps: cfg.dexSlippageBps,
+  });
   if (cfg.mode === 'live') {
     if (!tg.enabled) throw new Error('Live mode needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (kill switch)');
     const acc = await mexc.account();
     if (!acc.canTrade) throw new Error('MEXC API key cannot trade');
-    log.info(`wallet ${chain.address}`);
+    const eth = Number(await chain.ethBalance()) / 1e18;
+    if (eth < cfg.minEthForGas) throw new Error(`Hot wallet has ${eth} ETH, need at least MIN_ETH_FOR_GAS=${cfg.minEthForGas}`);
+    const usdt = Number(acc.balances.find((b) => b.asset === 'USDT')?.free ?? 0);
+    log.info(`wallet ${chain.address}: ${eth.toFixed(4)} ETH | MEXC USDT ${usdt.toFixed(2)}`);
+    if (usdt < cfg.minTradeUsd) log.warn(`MEXC USDT ${usdt} < MIN_TRADE_USD: MEXC buys are blocked until you deposit`);
+    if (cfg.strategy === 'transfer') {
+      await tg.send(
+        `🔐 Reminder: STRATEGY=transfer uses MEXC withdrawals. Make sure the API key is IP-bound to this VPS and the MEXC ` +
+          `withdrawal address whitelist contains ONLY ${chain.address}.`,
+      );
+    }
   }
 
   if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg);
@@ -63,7 +127,8 @@ async function main() {
   const book = async (symbol: string) => stream.get(symbol) ?? mexc.depth(symbol, 20);
   const balances = cfg.mode === 'live' ? () => snapshot(chain, mexc, cfg.usdc, tokens) : async () => paperBalances(tokens);
 
-  const engine = new Engine({ cfg, mexc, chain, agg, db, risk, tg, book, balances, tokens });
+  const freshBook = (symbol: string) => mexc.depth(symbol, 20);
+  const engine = new Engine({ cfg, mexc, chain, agg, db, risk, tg, book, freshBook, balances, tokens });
 
   // --- Telegram commands ---
   const statusText = async () => {
@@ -104,12 +169,14 @@ async function main() {
   let busy = false;
   let errors = 0;
   chain.provider.on('block', async () => {
-    if (busy) return;
+    if (busy || rateLimited()) return;
     busy = true;
     try {
       await engine.tick();
       errors = 0;
+      rateLimitOk();
     } catch (e) {
+      if (onScanError(e)) return;
       errors++;
       log.error(`tick: ${errMsg(e)}`);
       if (errors >= 5) await engine.alertThrottled('tick-errors', `❗ Bot errors (${errors} in a row): ${errMsg(e)}`, 3600_000);
@@ -138,16 +205,7 @@ async function main() {
     }
   }, 30_000);
 
-  const shutdown = async (why: string, code: number) => {
-    await tg.send(`🔌 Bot stopped: ${why}`);
-    stream.stop();
-    tg.stop();
-    process.exit(code);
-  };
-  process.on('SIGINT', () => void shutdown('SIGINT', 0));
-  process.on('SIGTERM', () => void shutdown('SIGTERM', 0));
-  process.on('unhandledRejection', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
-  process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
+  installProcessHandlers(tg, () => stream.stop());
 
   await tg.send(
     `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} via ${agg.name}\nTokens: ${tokens.map((t) => t.base).join(', ')}\n` +
@@ -182,6 +240,8 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
         `Top gaps: ${engine.lastTopGaps.map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ') || 'none'}`,
         open.length ? `Open: ${open.map((o) => `#${o.id} ${o.base} ${o.status}`).join(', ')}` : 'Open transfers: none',
       ];
+      const stuck = db.stuckTransfers();
+      if (stuck.length) lines.push(`🚨 Needs you: ${stuck.map((o) => `#${o.id} ${o.base} (${o.note ?? 'stuck'})`).join('; ')} -> /sell <id> or /clear <id>`);
       if (cfg.mode === 'live') {
         try {
           const b = await mexc.balances();
@@ -194,17 +254,20 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
       }
       return lines.join('\n');
     },
+    '/sell': ([id]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
+    '/clear': ([id]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
   });
 
   let busy = false;
   let errors = 0;
   let lastLow = 0;
   const loop = async () => {
-    if (busy) return;
+    if (busy || rateLimited()) return;
     busy = true;
     try {
       await engine.tick();
       errors = 0;
+      rateLimitOk();
       // MEXC USDT is spent by buys and comes back only when you move USDC from the wallet to MEXC.
       if (cfg.mode === 'live' && Date.now() - lastLow > 6 * 3600_000) {
         const usdt = (await mexc.balances()).USDT ?? 0;
@@ -215,6 +278,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
         }
       }
     } catch (e) {
+      if (onScanError(e)) return;
       errors++;
       log.error(`scan: ${errMsg(e)}`);
       if (errors === 5) await tg.send(`❗ Bot errors (5 in a row): ${errMsg(e)}`);
@@ -233,15 +297,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
     }
   }, 30_000);
 
-  const shutdown = async (why: string, code: number) => {
-    await tg.send(`🔌 Bot stopped: ${why}`);
-    tg.stop();
-    process.exit(code);
-  };
-  process.on('SIGINT', () => void shutdown('SIGINT', 0));
-  process.on('SIGTERM', () => void shutdown('SIGTERM', 0));
-  process.on('unhandledRejection', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
-  process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
+  installProcessHandlers(tg, () => {});
 
   const open = db.openTransfers();
   await tg.send(

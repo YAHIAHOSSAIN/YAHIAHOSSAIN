@@ -27,6 +27,16 @@ export interface Aggregator {
 
 type FetchFn = typeof fetch;
 
+// Allowlist: we only ever approve / send to these contracts (Ethereum mainnet).
+// A wrong or compromised API response pointing anywhere else is rejected.
+export const ZEROX_ALLOWANCE_HOLDER = '0x0000000000001ff3684f28c67538d4d072c22734';
+export const ONEINCH_ROUTER_V6 = '0x111111125421ca6dc452d289314280a0f8842a65';
+
+function requireAddress(kind: string, got: string | undefined, allowed: string): string {
+  if (!got || got.toLowerCase() !== allowed) throw new Error(`${kind} ${got} is not the allowlisted contract ${allowed}`);
+  return allowed;
+}
+
 async function getJson<T>(fetchFn: FetchFn, url: string, headers: Record<string, string>): Promise<T> {
   const res = await fetchFn(url, { headers, signal: AbortSignal.timeout(8000) });
   const text = await res.text();
@@ -65,7 +75,9 @@ export class ZeroEx implements Aggregator {
     const d = await getJson<ZeroExResponse>(this.fetchFn, this.url(kind, r), { '0x-api-key': this.apiKey, '0x-version': 'v2' });
     if (!d.liquidityAvailable) throw new Error('0x: no liquidity');
     const gas = BigInt(d.transaction?.gas ?? d.gas ?? '300000');
-    const spender = d.issues?.allowance?.spender ?? d.transaction?.to ?? '';
+    // With the AllowanceHolder flow, both the spender and tx.to are the AllowanceHolder contract.
+    const spender = requireAddress('0x spender', d.issues?.allowance?.spender ?? ZEROX_ALLOWANCE_HOLDER, ZEROX_ALLOWANCE_HOLDER);
+    if (d.transaction) requireAddress('0x tx.to', d.transaction.to, ZEROX_ALLOWANCE_HOLDER);
     return {
       buyAmount: BigInt(d.buyAmount),
       minBuyAmount: BigInt(d.minBuyAmount),
@@ -96,7 +108,8 @@ export class OneInch implements Aggregator {
   }
   private async getSpender(): Promise<string> {
     if (!this.spender) {
-      this.spender = (await getJson<{ address: string }>(this.fetchFn, `${this.base}/approve/spender`, this.headers)).address;
+      const a = (await getJson<{ address: string }>(this.fetchFn, `${this.base}/approve/spender`, this.headers)).address;
+      this.spender = requireAddress('1inch spender', a, ONEINCH_ROUTER_V6);
     }
     return this.spender;
   }
@@ -128,6 +141,7 @@ export class OneInch implements Aggregator {
       this.headers,
     );
     const buy = BigInt(d.dstAmount);
+    requireAddress('1inch tx.to', d.tx.to, ONEINCH_ROUTER_V6);
     return {
       buyAmount: buy,
       minBuyAmount: this.minOut(buy, r.slippageBps),

@@ -26,6 +26,8 @@ function setup(opts: {
   simulateThrows?: boolean;
   approvalNeeded?: boolean;
   mexcFillRatio?: number;
+  marketFillRatio?: number;
+  dexUnknown?: boolean;
 }) {
   process.env.MODE = opts.mode ?? 'live';
   process.env.RPC_URL = 'http://localhost';
@@ -110,6 +112,7 @@ function setup(opts: {
         calls.push('send');
         const gasWei = 150_000n * 10n * GWEI;
         bal.walletEth -= 0.0015;
+        if (opts.dexUnknown) return { ok: false, unknown: true, hash: '0xtx', gasCostWei: 0n, reason: 'unknown' };
         if (opts.dexOk === false) return { ok: false, hash: '0xtx', gasCostWei: gasWei, reason: 'reverted' };
         const r = lastFirm!;
         if (r.sellToken === USDC) {
@@ -134,9 +137,12 @@ function setup(opts: {
       },
       marketSell: async (_s, q) => {
         calls.push(`market SELL ${q}`);
-        fill('SELL', Number(q), bid);
+        const filled = Number(q) * (opts.marketFillRatio ?? 1);
+        fill('SELL', filled, bid);
+        orders.set('m', { orderId: 'm', status: 'FILLED', executedQty: String(filled), cummulativeQuoteQty: String(filled * bid), origQty: q, price: '0', side: 'SELL' });
         return { orderId: 'm' };
       },
+      getOrderByClientId: async () => null,
       getOrder: async (_s, id) => orders.get(id)!,
       cancelOrder: async (_s, id) => {
         calls.push(`cancel ${id}`);
@@ -232,4 +238,20 @@ test('paper mode: records the trade, sends nothing real', async () => {
   assert.deepEqual(calls, []);
   assert.equal(db.statsSince(0, 'paper').total.trades, 1);
   assert.ok(alerts.some((a) => a.startsWith('📝 PAPER LINK')));
+});
+
+test('DEX outcome unknown: NO automatic unwind, trading paused', async () => {
+  const { engine, risk, calls, alerts } = setup({ dexUnknown: true });
+  await engine.tick();
+  assert.ok(!calls.some((c) => c.startsWith('market') || c.startsWith('limit BUY')));
+  assert.equal(risk.paused, true);
+  assert.ok(alerts.some((a) => a.includes('outcome UNKNOWN')));
+});
+
+test('unwind SELL that only partly fills is detected (not assumed flat)', async () => {
+  const { engine, risk, calls, alerts } = setup({ mexcFillRatio: 0.5, marketFillRatio: 0.5 });
+  await engine.tick();
+  assert.ok(calls.includes('market SELL 10.00'));
+  assert.equal(risk.paused, true);
+  assert.ok(alerts.some((a) => a.includes('market close FAILED') && a.includes('only filled')));
 });

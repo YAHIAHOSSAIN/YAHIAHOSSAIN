@@ -2,7 +2,7 @@
 import { log, errMsg, redact } from './log.js';
 import { sleep } from './util.js';
 
-type Handler = () => Promise<string> | string;
+type Handler = (args: string[]) => Promise<string> | string;
 type FetchFn = typeof fetch;
 
 export class Telegram {
@@ -43,9 +43,10 @@ export class Telegram {
   async handle(update: { message?: { chat?: { id: number | string }; text?: string } }, handlers: Record<string, Handler>) {
     const m = update.message;
     if (!m?.text || String(m.chat?.id) !== String(this.chatId)) return; // ignore strangers
-    const cmd = m.text.trim().split(/[\s@]/)[0].toLowerCase();
+    const [first, ...args] = m.text.trim().split(/\s+/);
+    const cmd = first.split('@')[0].toLowerCase();
     const h = handlers[cmd];
-    const reply = h ? await h() : `Commands: ${Object.keys(handlers).join(' ')}`;
+    const reply = h ? await h(args) : `Commands: ${Object.keys(handlers).join(' ')}`;
     await this.send(reply);
   }
 

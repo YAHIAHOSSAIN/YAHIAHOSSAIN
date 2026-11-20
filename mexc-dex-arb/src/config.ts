@@ -75,10 +75,13 @@ export function loadConfig() {
     // --- Transfer strategy (scanner) ---
     scanIntervalSec: num('SCAN_INTERVAL_SEC', 20),
     scanMinGapPct: num('SCAN_MIN_GAP_PCT', 3), // cheap pre-filter before exact quotes
+    scanMaxGapPct: num('SCAN_MAX_GAP_PCT', 30), // bigger gaps are almost always a wrong token / dead pool
     scanExactQuotes: num('SCAN_EXACT_QUOTES', 5), // max exact DEX quotes per scan
     transferDriftBps: num('TRANSFER_DRIFT_BPS', 150), // price-move reserve while withdrawing
     transferTimeoutMin: num('TRANSFER_TIMEOUT_MIN', 90),
     maxOpenTransfers: num('MAX_OPEN_TRANSFERS', 1),
+    // After arrival, do not sell automatically if it would lose more than this % of the cost: hold + alert.
+    transferMaxLossPct: num('TRANSFER_MAX_LOSS_PCT', 3),
     // --- Misc ---
     dbPath: str('DB_PATH', 'data/bot.sqlite'),
     envPath: str('ENV_PATH', '.env'),
@@ -86,6 +89,36 @@ export function loadConfig() {
 }
 
 export type Config = ReturnType<typeof loadConfig>;
+
+/** Reject settings that would make the bot trade backwards or without limits. */
+export function validateConfig(c: Config): Config {
+  const errs: string[] = [];
+  const range = (name: string, v: number, min: number, max: number) => {
+    if (!(v >= min && v <= max)) errs.push(`${name}=${v} must be between ${min} and ${max}`);
+  };
+  range('MIN_PROFIT_USD', c.minProfitUsd, 0, 1e6);
+  range('MIN_PROFIT_PCT', c.minProfitPct, 0, 100);
+  range('DEX_SLIPPAGE_BPS', c.dexSlippageBps, 1, 500);
+  range('CEX_SLIPPAGE_BPS', c.cexSlippageBps, 0, 500);
+  range('SAFETY_MARGIN_USD', c.safetyMarginUsd, 0, 1e6);
+  range('MEXC_TAKER_FEE', c.mexcTakerFee, 0, 0.01);
+  range('MAX_TRADE_USD', c.maxTradeUsd, 1, 1e7);
+  range('MIN_TRADE_USD', c.minTradeUsd, 1, c.maxTradeUsd);
+  range('MAX_TRADES_PER_DAY', c.maxTradesPerDay, 1, 10_000);
+  range('DAILY_LOSS_LIMIT_USD', c.dailyLossLimitUsd, 0.01, 1e7);
+  range('MAX_GAS_GWEI', c.maxGasGwei, 0.01, 1000);
+  range('MAX_CONSECUTIVE_FAILS', c.maxConsecutiveFails, 1, 100);
+  range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 600);
+  range('SCAN_INTERVAL_SEC', c.scanIntervalSec, 5, 3600);
+  range('SCAN_MIN_GAP_PCT', c.scanMinGapPct, 0, c.scanMaxGapPct);
+  range('SCAN_MAX_GAP_PCT', c.scanMaxGapPct, c.scanMinGapPct, 100);
+  range('TRANSFER_DRIFT_BPS', c.transferDriftBps, 0, 5000);
+  range('TRANSFER_TIMEOUT_MIN', c.transferTimeoutMin, 5, 24 * 60);
+  range('TRANSFER_MAX_LOSS_PCT', c.transferMaxLossPct, 0, 100);
+  range('MAX_OPEN_TRANSFERS', c.maxOpenTransfers, 1, 10);
+  if (errs.length) throw new Error(`Invalid config:\n  ${errs.join('\n  ')}`);
+  return c;
+}
 
 /** Every secret value, so the logger can scrub them from any output. */
 export function secretsOf(cfg: Config): string[] {

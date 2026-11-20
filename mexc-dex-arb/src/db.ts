@@ -52,9 +52,20 @@ export interface TransferRow {
   expected_net: number;
   pnl: number | null;
   sell_attempts: number;
-  alerted_timeout: number;
+  alerted_timeout: number; // 0 none, 1 slow alert sent, 2 given up waiting (no longer blocks new trades)
   note: string | null;
+  withdraw_fee: number; // tokens, fixed at decision time
+  next_try: number; // ms timestamp: no sell attempt before this (backoff)
+  force_sell: number; // 1 = /sell command: sell even below the loss floor
+  hold_alerted: number;
 }
+
+const TRANSFER_MIGRATIONS = [
+  'ALTER TABLE transfers ADD COLUMN withdraw_fee REAL NOT NULL DEFAULT 0',
+  'ALTER TABLE transfers ADD COLUMN next_try INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE transfers ADD COLUMN force_sell INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE transfers ADD COLUMN hold_alerted INTEGER NOT NULL DEFAULT 0',
+];
 
 export class Db {
   private db: Database.Database;
@@ -85,6 +96,11 @@ export class Db {
         sell_attempts INTEGER NOT NULL DEFAULT 0, alerted_timeout INTEGER NOT NULL DEFAULT 0, note TEXT
       );
     `);
+    const cols = new Set((this.db.prepare('PRAGMA table_info(transfers)').all() as { name: string }[]).map((c) => c.name));
+    for (const m of TRANSFER_MIGRATIONS) {
+      const col = m.split(' ')[5];
+      if (!cols.has(col)) this.db.exec(m);
+    }
   }
 
   insertTrade(t: TradeRow): void {
@@ -147,8 +163,22 @@ export class Db {
     this.db.prepare(`UPDATE transfers SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...f, id });
   }
 
+  /** Transfers the bot still works on automatically ('stuck' waits for a human: /sell or /clear). */
   openTransfers(): TransferRow[] {
-    return this.db.prepare(`SELECT * FROM transfers WHERE status IN ('buying','withdrawing','selling','stuck') ORDER BY id`).all() as TransferRow[];
+    return this.db.prepare(`SELECT * FROM transfers WHERE status IN ('buying','withdrawing','selling') ORDER BY id`).all() as TransferRow[];
+  }
+
+  /** Transfers that hold back new trades (open, and not given up on). */
+  blockingTransfers(): TransferRow[] {
+    return this.openTransfers().filter((t) => t.alerted_timeout < 2);
+  }
+
+  stuckTransfers(): TransferRow[] {
+    return this.db.prepare(`SELECT * FROM transfers WHERE status = 'stuck' ORDER BY id`).all() as TransferRow[];
+  }
+
+  getTransfer(id: number): TransferRow | undefined {
+    return this.db.prepare('SELECT * FROM transfers WHERE id = ?').get(id) as TransferRow | undefined;
   }
 
   getState(key: string): string | undefined {

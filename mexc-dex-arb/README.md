@@ -30,7 +30,12 @@ Stack: Node 20+, TypeScript, ethers v6, MEXC Spot API v3 (REST + protobuf WebSoc
 6. **DEX-এ বেচে:** exact approval দেয়, firm quote নেয়, simulate করে, private RPC দিয়ে পাঠায়। আসল USDC কত এলো সেটা মেপে PnL বের করে।
 7. **কিছু ভুল হলে:**
    - withdraw প্রত্যাখ্যাত হলে বা MEXC-এর দিক থেকে fail করলে, token আবার MEXC-তেই market-এ বেচে দেয়।
-   - DEX-এ ৩ বার বেচতে না পারলে 🚨 alert দেয়, তারপরও প্রতিবার scan-এর সময় আবার চেষ্টা করে।
+   - withdraw request timeout হলে **আবার পাঠায় না**। নিজের দেওয়া `withdrawOrderId` দিয়ে history-তে খুঁজে নেয়।
+   - token আসার পর দাম `TRANSFER_MAX_LOSS_PCT`-এর বেশি পড়ে গেলে লোকসানে বেচে না, **token ধরে রাখে**। প্রতি ৫ মিনিটে আবার দেখে, আর alert দেয়।
+   - DEX-এ বিক্রি fail করলে ২, ১০ আর ৩০ মিনিট পরপর আবার চেষ্টা করে। ৪ বার fail করলে নিজে থেকে আর চেষ্টা করে না,
+     তখন `/sell <id>` বা `/clear <id>` দিতে হবে। এতে gas পোড়ার loop হয় না।
+   - Tx mine হলো কিনা বোঝা না গেলে কখনো আবার চেষ্টা বা unwind করে না। Trading pause করে আর মানুষকে জানায়।
+   - Withdraw `2 × TRANSFER_TIMEOUT_MIN`-এর বেশি আটকে থাকলে নতুন trade আর আটকে রাখে না, তবে wallet-এ নজর রাখতে থাকে।
 8. প্রতিটা ধাপ SQLite-এ লেখা থাকে, তাই **restart হলেও** মাঝপথের transfer যেখানে থেমেছিল সেখান থেকে চলবে।
 9. লাভ জমা হয় wallet-এ USDC হিসেবে, আর MEXC-এর USDT কমতে থাকে। কমে গেলে বট "rebalance" alert দেবে।
    তখন wallet থেকে USDC নিজে MEXC-তে পাঠাতে হবে। বট নিজে কখনো MEXC-তে টাকা পাঠায় না।
@@ -75,7 +80,9 @@ Stack: Node 20+, TypeScript, ethers v6, MEXC Spot API v3 (REST + protobuf WebSoc
 
 সব state (pause, fail streak, দিনের PnL) SQLite-এ থাকে, তাই pm2 restart করলেও limit reset হয় না।
 
-**Telegram commands:** `/stop` দিলে সাথে সাথে সব trading বন্ধ হয়, `/start` দিলে আবার চালু হয়, `/status` দেখায় PnL, inventory আর limit।
+**Telegram commands:** `/stop` দিলে সাথে সাথে নতুন trade বন্ধ হয়, `/start` দিলে আবার চালু হয়, `/status` দেখায় PnL, inventory, limit আর আটকে থাকা transfer।
+Transfer strategy-তে আরও দুইটা command আছে: `/sell <id>` আটকে থাকা বা hold করা token এখনই বেচার চেষ্টা করে (loss floor উপেক্ষা করে), আর
+`/clear <id>` হাতে সমাধান করা transfer বন্ধ করে।
 বট শুধু `TELEGRAM_CHAT_ID`-এর মেসেজ মানে।
 **Alert পাঠায়:** প্রতিটা trade, loss limit hit, একদিক fill, বট stop বা crash, inventory কম, MEXC deposit/withdraw বন্ধ হলে।
 প্রতিদিন রাত ১১টায় (বাংলাদেশ সময়) একটা summary পাঠায়।

@@ -18,16 +18,53 @@ import {
   unwindPlan,
 } from './pricing.js';
 import { log, errMsg } from './log.js';
+import { AmbiguousRequestError } from './mexc/rest.js';
+
+/** Unique id we give MEXC orders, so an order can be found even if the request timed out. */
+export const clientId = (tag: string) => `arb${tag}${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`.slice(0, 32);
+
+/**
+ * Place an order; if the request is ambiguous (timeout / 5xx) look it up by client id
+ * instead of assuming it was not placed. Throws UNKNOWN_ORDER_STATE if that is impossible.
+ */
+export async function placeSafely(
+  mexc: Pick<CexApi, 'getOrderByClientId'>,
+  symbol: string,
+  cid: string,
+  place: () => Promise<{ orderId: string }>,
+  sleep: (ms: number) => Promise<void>,
+): Promise<{ orderId: string }> {
+  try {
+    return await place();
+  } catch (e) {
+    if (!(e instanceof AmbiguousRequestError)) throw e; // clearly rejected: nothing was placed
+    let notFound = 0;
+    for (let i = 0; i < 5; i++) {
+      await sleep(1000);
+      let o: Order | null;
+      try {
+        o = await mexc.getOrderByClientId(symbol, cid);
+      } catch {
+        continue; // lookup itself failed: try again
+      }
+      if (o) return { orderId: o.orderId }; // it WAS placed
+      if (++notFound >= 3) throw e; // MEXC says three times that no such order exists
+    }
+    throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
+  }
+}
 import { decimalsOfStep, dhakaDay, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
 
 export const USDC_DECIMALS = 6;
-export const ZEROX_ALLOWANCE_HOLDER = '0x0000000000001fF3684f28c67538d4D072C22734';
+export { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
+import { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
 const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
 
 // Narrow interfaces so tests can plug in fakes.
 export interface CexApi {
-  limitOrder(symbol: string, side: Side, quantity: string, price: string): Promise<{ orderId: string }>;
-  marketSell(symbol: string, quantity: string): Promise<{ orderId: string }>;
+  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
+  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
+  getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
   getOrder(symbol: string, orderId: string): Promise<Order>;
   cancelOrder(symbol: string, orderId: string): Promise<Order>;
 }
@@ -52,6 +89,8 @@ export interface EngineDeps {
   risk: Risk;
   tg: Notifier;
   book: (symbol: string) => Promise<Book>;
+  /** Authoritative book (REST) used for the final check right before trading; defaults to `book`. */
+  freshBook?: (symbol: string) => Promise<Book>;
   balances: () => Promise<Balances>;
   tokens: Token[];
   sleep?: (ms: number) => Promise<void>;
@@ -259,8 +298,8 @@ export class Engine {
     }
     const tx = firm.tx;
 
-    // 3) Re-evaluate with fresh book, firm amounts and simulated gas.
-    const b = await this.d.book(t.symbol);
+    // 3) Re-evaluate with a fresh REST book, firm amounts and simulated gas.
+    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
     const g = gasUsd(gasEst, gas.effective, ethUsd);
     let opp: Opportunity | null;
     if (c.opp.direction === 'DEX_BUY') {
@@ -289,7 +328,8 @@ export class Engine {
     const need = this.need(c.opp.sizeUsd);
     if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
 
-    // 4) Both legs at the same time.
+    // 4) Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
+    //    the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
     const before = await this.d.balances();
     log.info(`${t.base} EXECUTE ${opp.direction} size ${usd(opp.sizeUsd)} expected ${usd(opp.net)}`);
     const [cexR, dexR] = await Promise.allSettled([
@@ -316,8 +356,16 @@ export class Engine {
     let status: TradeStatus = 'ok';
     const notes: string[] = [];
     if (!dex.ok) notes.push(`DEX: ${dex.reason}`);
-    const unwind = cexUnknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.cfg.mexcTakerFee, t.qtyStep);
-    if (cexUnknown) {
+    if (dex.unknown) {
+      // We cannot tell if the swap executed. Unwinding could DOUBLE the position. Stop and ask a human.
+      this.d.risk.pause(`DEX tx outcome unknown (${dex.hash})`);
+      await this.d.tg.send(
+        `🚨 ${t.base}: DEX tx ${dex.hash} outcome UNKNOWN (not mined, cancel not confirmed). MEXC filled ${cexFilled}/${opp.cexQty}.\n` +
+          `NOT unwinding automatically. Trading PAUSED. Check the wallet on etherscan, fix by hand, then /start.`,
+      );
+    }
+    const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.cfg.mexcTakerFee, t.qtyStep);
+    if (cexUnknown || dex.unknown) {
       status = 'one_sided';
     } else if (unwind) {
       status = 'one_sided';
@@ -369,13 +417,18 @@ export class Engine {
    */
   async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number }> {
     if (side === 'SELL') {
-      const { orderId } = await this.d.mexc.marketSell(t.symbol, qty);
-      return { orderId, filled: Number(qty) };
+      const cid = clientId('c');
+      const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.marketSell(t.symbol, qty, cid), this.sleep);
+      await this.sleep(1000);
+      const o = await this.d.mexc.getOrder(t.symbol, orderId);
+      if (Number(o.executedQty) < Number(qty) * 0.999) throw new Error(`close SELL only filled ${o.executedQty}/${qty}`);
+      return { orderId, filled: Number(o.executedQty) };
     }
-    const b = await this.d.book(t.symbol);
+    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
     const f = 10 ** t.priceDecimals;
     const px = (Math.ceil(b.asks[0][0] * 1.02 * f) / f).toFixed(t.priceDecimals);
-    const { orderId } = await this.d.mexc.limitOrder(t.symbol, 'BUY', qty, px);
+    const cid = clientId('c');
+    const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, 'BUY', qty, px, cid), this.sleep);
     await this.sleep(1500);
     let o = await this.d.mexc.getOrder(t.symbol, orderId);
     if (o.status !== 'FILLED') {
@@ -392,7 +445,14 @@ export class Engine {
     const qty = opp.cexQty.toFixed(decimalsOfStep(t.qtyStep));
     const f = 10 ** t.priceDecimals;
     const px = side === 'SELL' ? Math.floor(opp.cexLimitPrice * f) / f : Math.ceil(opp.cexLimitPrice * f) / f;
-    const { orderId } = await this.d.mexc.limitOrder(t.symbol, side, qty, px.toFixed(t.priceDecimals));
+    const cid = clientId('t');
+    const { orderId } = await placeSafely(
+      this.d.mexc,
+      t.symbol,
+      cid,
+      () => this.d.mexc.limitOrder(t.symbol, side, qty, px.toFixed(t.priceDecimals), cid),
+      this.sleep,
+    );
     log.info(`MEXC ${side} ${qty} ${t.symbol} @ ${px} id=${orderId}`);
     await this.sleep(1500);
 

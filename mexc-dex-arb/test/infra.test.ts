@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { decodeDepthPush } from '../src/mexc/proto.js';
 import { MexcRest } from '../src/mexc/rest.js';
-import { ZeroEx } from '../src/dex/aggregator.js';
+import { ZeroEx, ZEROX_ALLOWANCE_HOLDER } from '../src/dex/aggregator.js';
+import { AmbiguousRequestError } from '../src/mexc/rest.js';
+import { placeSafely } from '../src/engine.js';
+import { loadConfig, validateConfig } from '../src/config.js';
 import { Telegram } from '../src/telegram.js';
 import { redact, registerSecrets } from '../src/log.js';
 import { Db } from '../src/db.js';
@@ -70,29 +73,66 @@ test('MEXC errors never contain the secret', async () => {
   assert.equal(redact('key=SUPERSECRETVALUE'), 'key=***');
 });
 
-test('0x quote parsing: amounts, gas, spender, tx', async () => {
-  let called = '';
-  const fetchFn = (async (u: string, o: { headers: Record<string, string> }) => {
-    called = u;
+const AH = '0x0000000000001fF3684f28c67538d4D072C22734'; // 0x AllowanceHolder (mixed case like the API)
+const zeroExWith = (body: object) =>
+  new ZeroEx('k', (async (_u: string, o: { headers: Record<string, string> }) => {
     assert.equal(o.headers['0x-version'], 'v2');
-    return new Response(
-      JSON.stringify({
-        liquidityAvailable: true,
-        buyAmount: '1000',
-        minBuyAmount: '990',
-        issues: { allowance: { spender: '0xSpender' } },
-        transaction: { to: '0xAH', data: '0xabc', gas: '150000', value: '0' },
-      }),
-    );
-  }) as unknown as typeof fetch;
-  const z = new ZeroEx('k', fetchFn);
-  const q = await z.quote({ sellToken: '0xa', buyToken: '0xb', sellAmount: 5n, taker: '0xt', slippageBps: 30 });
-  assert.match(called, /allowance-holder\/quote\?chainId=1/);
+    return new Response(JSON.stringify({ liquidityAvailable: true, buyAmount: '1000', minBuyAmount: '990', ...body }));
+  }) as unknown as typeof fetch);
+const req = { sellToken: '0xa', buyToken: '0xb', sellAmount: 5n, taker: '0xt', slippageBps: 30 };
+
+test('0x quote parsing: amounts, gas, spender, tx', async () => {
+  const q = await zeroExWith({
+    issues: { allowance: { spender: AH } },
+    transaction: { to: AH, data: '0xabc', gas: '150000', value: '0' },
+  }).quote(req);
   assert.equal(q.buyAmount, 1000n);
   assert.equal(q.minBuyAmount, 990n);
   assert.equal(q.gas, 150000n);
-  assert.equal(q.spender, '0xSpender');
+  assert.equal(q.spender, ZEROX_ALLOWANCE_HOLDER);
   assert.equal(q.tx?.data, '0xabc');
+  // no allowance issue -> spender is still the AllowanceHolder, never tx.to blindly
+  const p = await zeroExWith({ transaction: { to: AH, data: '0x', gas: '1', value: '0' } }).quote(req);
+  assert.equal(p.spender, ZEROX_ALLOWANCE_HOLDER);
+});
+
+test('0x response pointing at an unknown contract is rejected (allowlist)', async () => {
+  await assert.rejects(
+    zeroExWith({ transaction: { to: '0x000000000000000000000000000000000000bad1', data: '0x', gas: '1', value: '0' } }).quote(req),
+    /not the allowlisted contract/,
+  );
+  await assert.rejects(zeroExWith({ issues: { allowance: { spender: '0x000000000000000000000000000000000000bad2' } } }).price(req), /allowlisted/);
+});
+
+test('placeSafely: a timed-out order that WAS placed is found by client id; one that was not is reported', async () => {
+  const sleep = async () => {};
+  const ambiguous = async (): Promise<{ orderId: string }> => {
+    throw new AmbiguousRequestError('timeout');
+  };
+  const found = await placeSafely({ getOrderByClientId: async () => ({ orderId: '77' }) as never }, 'X', 'cid', ambiguous, sleep);
+  assert.equal(found.orderId, '77');
+  await assert.rejects(placeSafely({ getOrderByClientId: async () => null }, 'X', 'cid', ambiguous, sleep), /timeout/);
+  await assert.rejects(
+    placeSafely({ getOrderByClientId: async () => { throw new Error('down'); } }, 'X', 'cid', ambiguous, sleep),
+    /UNKNOWN_ORDER_STATE/,
+  );
+  // a clear rejection is not looked up at all
+  let looked = false;
+  await assert.rejects(
+    placeSafely({ getOrderByClientId: async () => ((looked = true), null) }, 'X', 'cid', async () => { throw new Error('insufficient balance'); }, sleep),
+    /insufficient/,
+  );
+  assert.equal(looked, false);
+});
+
+test('config validation rejects dangerous values', () => {
+  process.env.RPC_URL = 'http://x';
+  process.env.MODE = 'paper';
+  const ok = loadConfig();
+  assert.doesNotThrow(() => validateConfig(ok));
+  assert.throws(() => validateConfig({ ...ok, minProfitPct: -1 }), /MIN_PROFIT_PCT/);
+  assert.throws(() => validateConfig({ ...ok, dexSlippageBps: 20_000 }), /DEX_SLIPPAGE_BPS/);
+  assert.throws(() => validateConfig({ ...ok, minTradeUsd: 500, maxTradeUsd: 200 }), /MIN_TRADE_USD/);
 });
 
 test('Telegram only obeys the configured chat', async () => {

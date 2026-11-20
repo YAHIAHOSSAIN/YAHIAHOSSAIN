@@ -26,6 +26,11 @@ export interface TxResult {
   hash?: string;
   gasCostWei: bigint;
   reason?: string;
+  /**
+   * true = we do NOT know whether the tx executed (not mined, cancel not confirmed either).
+   * Callers must not unwind or retry: pause and let a human check the wallet.
+   */
+  unknown?: boolean;
 }
 
 export class Chain {
@@ -85,12 +90,25 @@ export class Chain {
     const current: bigint = await c.allowance(this.address, spender);
     if (current >= amount) return { ok: true, gasCostWei: 0n };
     if (current > 0n) {
-      const r = await this.send({ to: token, data: c.interface.encodeFunctionData('approve', [spender, 0n]) }, APPROVE_GAS, gas, 60);
+      const data0 = c.interface.encodeFunctionData('approve', [spender, 0n]);
+      const r = await this.send({ to: token, data: data0 }, await this.approveGasLimit(token, data0), gas, 60);
       cost += r.gasCostWei;
       if (!r.ok) return { ...r, gasCostWei: cost };
     }
-    const r = await this.send({ to: token, data: c.interface.encodeFunctionData('approve', [spender, amount]) }, APPROVE_GAS, gas, 60);
+    const data = c.interface.encodeFunctionData('approve', [spender, amount]);
+    const r = await this.send({ to: token, data }, await this.approveGasLimit(token, data), gas, 60);
     return { ...r, gasCostWei: cost + r.gasCostWei };
+  }
+
+  /** Some tokens need more than 60k gas for approve: estimate, +30%, never below 60k. */
+  private async approveGasLimit(token: string, data: string): Promise<bigint> {
+    try {
+      const est = await this.provider.estimateGas({ from: this.address, to: token, data });
+      const limit = (est * 13n) / 10n;
+      return limit > APPROVE_GAS ? limit : APPROVE_GAS;
+    } catch {
+      return APPROVE_GAS * 2n;
+    }
   }
 
   /** eth_call + estimateGas. Returns the gas estimate, or throws with the revert reason. */
@@ -141,7 +159,9 @@ export class Chain {
         }
         if (!receipt) await sleep(3000);
       }
-      if (!receipt) return { ok: false, hash, gasCostWei: 0n, reason: 'not mined and cancel not confirmed: CHECK WALLET' };
+      if (!receipt) {
+        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancelHash} not confirmed: outcome UNKNOWN, check wallet` };
+      }
     }
     const cost = receipt.gasUsed * receipt.gasPrice;
     return receipt.status === 1 ? { ok: true, hash, gasCostWei: cost } : { ok: false, hash, gasCostWei: cost, reason: 'reverted' };

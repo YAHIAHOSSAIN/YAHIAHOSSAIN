@@ -47,7 +47,27 @@ export interface Order {
 
 type FetchFn = typeof fetch;
 
+/** HTTP 429/418 from any API: callers back off instead of hammering. */
+export class RateLimitError extends Error {}
+
+/**
+ * The request may or may not have reached MEXC (timeout / connection reset on a POST).
+ * Never assume "not placed": look the order / withdrawal up by our own client id.
+ */
+export class AmbiguousRequestError extends Error {}
+
+export interface WithdrawRecord {
+  id: string;
+  status: number;
+  amount: string;
+  txId?: string;
+  withdrawOrderId?: string;
+}
+
 export class MexcRest {
+  /** serverTime - localTime, so signed timestamps stay inside recvWindow even if the VPS clock drifts. */
+  timeOffsetMs = 0;
+
   constructor(
     private apiKey = '',
     private apiSecret = '',
@@ -64,26 +84,47 @@ export class MexcRest {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (signed) {
       if (!this.apiKey || !this.apiSecret) throw new Error('MEXC API key/secret not configured');
-      qs.set('timestamp', String(Date.now()));
+      qs.set('timestamp', String(Date.now() + this.timeOffsetMs));
       qs.set('recvWindow', '5000');
       qs.set('signature', this.sign(qs.toString()));
       headers['X-MEXC-APIKEY'] = this.apiKey;
     }
     const q = qs.toString();
-    const res = await this.fetchFn(`${this.baseUrl}${path}${q ? `?${q}` : ''}`, {
-      method,
-      headers,
-      signal: AbortSignal.timeout(10_000),
-    });
-    const text = await res.text();
+    let res: Response;
+    let text: string;
+    try {
+      res = await this.fetchFn(`${this.baseUrl}${path}${q ? `?${q}` : ''}`, {
+        method,
+        headers,
+        signal: AbortSignal.timeout(10_000),
+      });
+      text = await res.text();
+    } catch (e) {
+      const msg = redact(`MEXC ${method} ${path}: ${(e as Error).message}`);
+      // A write that timed out may still have been executed by MEXC.
+      if (method !== 'GET') throw new AmbiguousRequestError(msg);
+      throw new Error(msg);
+    }
     let body: unknown;
     try {
       body = JSON.parse(text);
     } catch {
       body = text;
     }
-    if (!res.ok) throw new Error(redact(`MEXC ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`));
+    const err = redact(`MEXC ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`);
+    if (res.status === 429 || res.status === 418) throw new RateLimitError(err);
+    if (res.status >= 500 && method !== 'GET') throw new AmbiguousRequestError(err);
+    if (!res.ok) throw new Error(err);
     return body as T;
+  }
+
+  /** Measure clock skew against MEXC; returns the offset in ms. */
+  async syncTime(): Promise<number> {
+    const t0 = Date.now();
+    const r = await this.request<{ serverTime: number }>('GET', '/api/v3/time');
+    const t1 = Date.now();
+    this.timeOffsetMs = Math.round(r.serverTime - (t0 + t1) / 2);
+    return this.timeOffsetMs;
   }
 
   async depth(symbol: string, limit = 20): Promise<Book> {
@@ -135,20 +176,46 @@ export class MexcRest {
     return r.id;
   }
 
-  /** Status: 1 APPLY .. 6 WAIT_CONFIRM, 7 SUCCESS, 8 FAILED, 9 CANCEL, 10 MANUAL. */
-  async withdrawStatus(coin: string, id: string): Promise<{ status: number; txId?: string } | null> {
-    const r = await this.request<{ id: string; status: number | string; txId?: string }[]>('GET', '/api/v3/capital/withdraw/history', { coin, limit: 50 }, true);
-    const w = r.find((x) => x.id === id);
-    return w ? { status: Number(w.status), txId: w.txId } : null;
+  /** Recent withdrawals of a coin (status: 1 APPLY .. 6 WAIT_CONFIRM, 7 SUCCESS, 8 FAILED, 9 CANCEL, 10 MANUAL). */
+  async withdrawHistory(coin: string, sinceTs: number): Promise<WithdrawRecord[]> {
+    const r = await this.request<{ id: string; status: number | string; amount: string; txId?: string; withdrawOrderId?: string }[]>(
+      'GET',
+      '/api/v3/capital/withdraw/history',
+      { coin, startTime: Math.max(0, Math.floor(sinceTs)), limit: 1000 },
+      true,
+    );
+    return r.map((w) => ({ id: w.id, status: Number(w.status), amount: w.amount, txId: w.txId, withdrawOrderId: w.withdrawOrderId }));
   }
 
-  limitOrder(symbol: string, side: Side, quantity: string, price: string): Promise<{ orderId: string }> {
-    return this.request('POST', '/api/v3/order', { symbol, side, type: 'LIMIT', quantity, price }, true);
+  /** Find a withdrawal by MEXC id or by our own withdrawOrderId. null = not in history. */
+  async findWithdraw(coin: string, sinceTs: number, ref: { id?: string | null; withdrawOrderId?: string }): Promise<WithdrawRecord | null> {
+    const h = await this.withdrawHistory(coin, sinceTs);
+    return h.find((w) => (ref.id && w.id === ref.id) || (ref.withdrawOrderId && w.withdrawOrderId === ref.withdrawOrderId)) ?? null;
+  }
+
+  /** `clientOrderId` makes the order findable even if this request times out. */
+  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }> {
+    const p: Record<string, string> = { symbol, side, type: 'LIMIT', quantity, price };
+    if (clientOrderId) p.newClientOrderId = clientOrderId;
+    return this.request('POST', '/api/v3/order', p, true);
+  }
+
+  /** Look an order up by our own client id; null if MEXC has no such order. */
+  async getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null> {
+    try {
+      return await this.request<Order>('GET', '/api/v3/order', { symbol, origClientOrderId: clientOrderId }, true);
+    } catch (e) {
+      // MEXC documents -2011 "Unknown order sent"; anything else is a real error (caller retries).
+      if (/-2011|unknown order|does not exist|not exist/i.test((e as Error).message)) return null;
+      throw e;
+    }
   }
 
   /** MARKET SELL by base quantity (documented). For buys use an aggressive LIMIT instead. */
-  marketSell(symbol: string, quantity: string): Promise<{ orderId: string }> {
-    return this.request('POST', '/api/v3/order', { symbol, side: 'SELL', type: 'MARKET', quantity }, true);
+  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }> {
+    const p: Record<string, string> = { symbol, side: 'SELL', type: 'MARKET', quantity };
+    if (clientOrderId) p.newClientOrderId = clientOrderId;
+    return this.request('POST', '/api/v3/order', p, true);
   }
 
   getOrder(symbol: string, orderId: string): Promise<Order> {
