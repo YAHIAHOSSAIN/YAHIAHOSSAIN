@@ -15,6 +15,7 @@ import { Engine } from './engine.js';
 import { TransferEngine } from './transfer.js';
 import { formatReport } from './summary.js';
 import { recoverExecuting } from './recovery.js';
+import { makeUnresolvedCheck, resolveTrade, startHandler, unresolvedLines } from './commands.js';
 import { dhakaDay, dhakaHourMinute, usd } from './util.js';
 
 const cfg = validateConfig(loadConfig());
@@ -24,7 +25,8 @@ registerSecrets(secretsOf(cfg));
 const rateLimit = { until: 0, level: 0 };
 function onScanError(e: unknown): boolean {
   if (e instanceof RateLimitError || /\b(429|418)\b/.test(errMsg(e))) {
-    const wait = Math.min(15 * 60_000, 60_000 * 2 ** rateLimit.level++);
+    const retryAfter = e instanceof RateLimitError ? e.retryAfterSec * 1000 : 0;
+    const wait = Math.max(retryAfter, Math.min(15 * 60_000, 60_000 * 2 ** rateLimit.level++));
     rateLimit.until = Date.now() + wait;
     log.warn(`rate limited, pausing scans for ${wait / 60_000} min`);
     return true;
@@ -52,7 +54,10 @@ function installProcessHandlers(tg: Telegram, cleanup: () => void) {
     if (shuttingDown) return;
     shuttingDown = true;
     lifecycle.stopping = true;
-    const deadline = Date.now() + (cfg.txTimeoutSec * 2 + 30) * 1000;
+    // pm2 sends SIGKILL after kill_timeout (ecosystem.config.cjs: 240 s; pm2's default is only 1.6 s).
+    // A running trade can need ~2x TX_TIMEOUT_SEC (swap + cancel) plus lookups and an unwind, so wait for
+    // TX_TIMEOUT_SEC*2 + 60 s. validateConfig caps TX_TIMEOUT_SEC at 80, so this always stays below 240 s.
+    const deadline = Date.now() + cfg.txTimeoutSec * 2 * 1000 + 60_000;
     if (lifecycle.busy) log.info('shutdown: waiting for the running trade to finish');
     while (lifecycle.busy && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
     await tg.send(`🔌 Bot stopped: ${why}${lifecycle.busy ? ' (a trade was still running: check /status after restart)' : ''}`);
@@ -71,37 +76,6 @@ function installProcessHandlers(tg: Telegram, cleanup: () => void) {
     }
   });
   process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
-}
-
-/**
- * /start handler shared by both strategies: critical pauses need "/start confirm", and even then
- * the bot re-checks that nothing is still unresolved (pending DEX tx, executing trade) before resuming.
- */
-function startHandler(risk: Risk, statusText: () => Promise<string>, stillUnresolved: () => Promise<string | null>) {
-  return async (args: string[]) => {
-    const confirm = args[0]?.toLowerCase() === 'confirm';
-    if (risk.paused && risk.critical && !confirm) {
-      return `⚠️ Critical pause: ${risk.pauseReason}\nCheck these positions and balances first:\n\n${await statusText()}\n\nThen send: /start confirm`;
-    }
-    if (risk.paused && risk.critical) {
-      const open = await stillUnresolved();
-      if (open) return `⛔ Not resuming: ${open}\nResolve it first (check etherscan / MEXC), then /start confirm again.`;
-    }
-    risk.resume(confirm);
-    const block = risk.blockReason();
-    return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
-  };
-}
-
-/** What still blocks a critical resume, or null. */
-function makeUnresolvedCheck(db: Db, chain: Chain) {
-  return async (): Promise<string | null> => {
-    const u = await chain.checkUnresolved();
-    if (u.state === 'pending') return `DEX tx ${chain.unresolved?.hashes.join(' / ')} (nonce ${chain.unresolved?.nonce}) is still pending`;
-    const ex = db.executingTrades();
-    if (ex.length) return `${ex.length} trade(s) still marked executing (#${ex.map((t) => t.id).join(', #')})`;
-    return null;
-  };
 }
 
 /** Refuse to trade live if .env is readable by other users. */
@@ -163,7 +137,11 @@ async function main() {
     }
   }
 
-  if (cfg.mode === 'live') await recoverExecuting(db, risk, tg, mexc, (h) => chain.provider.getTransactionReceipt(h), () => chain.checkUnresolved());
+  if (cfg.mode === 'live') {
+    // Symbols to sweep for open bot orders: the inventory watchlist (transfer orders use persisted ids).
+    const symbols = cfg.strategy === 'inventory' && cfg.watchlist.length ? cfg.watchlist.map((b) => `${b}USDT`) : [];
+    await recoverExecuting(db, risk, tg, mexc, (h) => chain.provider.getTransactionReceipt(h), () => chain.checkUnresolved(), { symbols });
+  }
   // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
   setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
 
@@ -195,6 +173,7 @@ async function main() {
       `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
       `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, max gas ${cfg.maxGasGwei} gwei (now ${engine.lastGasGwei.toFixed(1)})`,
       `Fail streak: ${risk.consecutiveFails}/${cfg.maxConsecutiveFails}`,
+      ...unresolvedLines(db, chain),
     ];
     if (cfg.mode === 'live') {
       try {
@@ -216,6 +195,8 @@ async function main() {
     },
     '/start': startHandler(risk, statusText, makeUnresolvedCheck(db, chain)),
     '/status': statusText,
+    '/cancelnonce': () => chain.cancelNonce(),
+    '/resolve': ([id, pnl]) => resolveTrade(db, id, pnl),
   });
 
   // --- Main loop: one scan per block ---
@@ -292,6 +273,8 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
     },
     '/start': async (args: string[]) => startHandler(risk, transferStatus, makeUnresolvedCheck(db, chain))(args),
     '/status': async () => transferStatus(),
+    '/cancelnonce': () => chain.cancelNonce(),
+    '/resolve': ([id, pnl]: string[]) => resolveTrade(db, id, pnl),
     '/sell': ([id]: string[]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
     '/clear': ([id]: string[]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
   });
@@ -306,6 +289,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
       `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, gas ${engine.lastGasGwei.toFixed(1)}/${cfg.maxGasGwei} gwei`,
       `Top gaps: ${engine.lastTopGaps.map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ') || 'none'}`,
       open.length ? `Open: ${open.map((o) => `#${o.id} ${o.base} ${o.status}`).join(', ')}` : 'Open transfers: none',
+      ...unresolvedLines(db, chain),
     ];
     const stuck = db.stuckTransfers();
     if (stuck.length) lines.push(`🚨 Needs you: ${stuck.map((o) => `#${o.id} ${o.base} (${o.note ?? 'stuck'})`).join('; ')} -> /sell <id> or /clear <id>`);

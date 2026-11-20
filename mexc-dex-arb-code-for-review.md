@@ -1,6 +1,6 @@
 # mexc-dex-arb: full source for review
 
-MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=inventory. Line numbers are per file.
+MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=inventory. Line numbers are per file. See CHANGES.md.
 
 ## `package.json`
 
@@ -20,22 +20,23 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     13	    "dev": "tsx src/main.ts",
     14	    "report": "node dist/report.js",
     15	    "test": "tsx --test test/*.test.ts",
-    16	    "typecheck": "tsc -p tsconfig.json --noEmit"
-    17	  },
-    18	  "dependencies": {
-    19	    "better-sqlite3": "^12.0.0",
-    20	    "dotenv": "^16.6.1",
-    21	    "ethers": "6.17.0",
-    22	    "ws": "^8.18.3"
-    23	  },
-    24	  "devDependencies": {
-    25	    "@types/better-sqlite3": "^7.6.13",
-    26	    "@types/node": "^20.19.0",
-    27	    "@types/ws": "^8.18.1",
-    28	    "tsx": "^4.20.0",
-    29	    "typescript": "^5.9.0"
-    30	  }
-    31	}
+    16	    "typecheck": "tsc -p tsconfig.json --noEmit",
+    17	    "check:0x": "tsx scripts/check-0x-quote.ts"
+    18	  },
+    19	  "dependencies": {
+    20	    "better-sqlite3": "^12.0.0",
+    21	    "dotenv": "^16.6.1",
+    22	    "ethers": "6.17.0",
+    23	    "ws": "^8.18.3"
+    24	  },
+    25	  "devDependencies": {
+    26	    "@types/better-sqlite3": "^7.6.13",
+    27	    "@types/node": "^20.19.0",
+    28	    "@types/ws": "^8.18.1",
+    29	    "tsx": "^4.20.0",
+    30	    "typescript": "^5.9.0"
+    31	  }
+    32	}
 ```
 
 ## `tsconfig.json`
@@ -174,12 +175,134 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     10	      max_restarts: 1000,
     11	      min_uptime: '60s',
     12	      exp_backoff_restart_delay: 5000,
-    13	      time: true,
-    14	      out_file: 'logs/out.log',
-    15	      error_file: 'logs/error.log',
-    16	    },
-    17	  ],
-    18	};
+    13	      // pm2 sends SIGKILL 1.6 s after SIGINT by default, which would kill the bot halfway through a trade.
+    14	      // The bot waits up to TX_TIMEOUT_SEC*2+60 s (max 220 s) for a running trade, so give it 240 s.
+    15	      kill_timeout: 240000,
+    16	      time: true,
+    17	      out_file: 'logs/out.log',
+    18	      error_file: 'logs/error.log',
+    19	    },
+    20	  ],
+    21	};
+```
+
+## `CHANGES.md`
+
+```md
+     1	# Changes for Grok's round-2 fix prompt
+     2	
+     3	Defaults are unchanged: `MODE=paper`, `STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`, `MAX_TRADE_USD=50`.
+     4	Nothing was run live. `tsc --noEmit` passes, and `npm test` passes all 83 tests.
+     5	
+     6	Note: Grok reviewed the 57-test version. Muse's round-2 fixes (commit `04b9c84`) had already covered
+     7	part of these items. The lines below are where each item lives now.
+     8	
+     9	| # | Item | Where (file:line) | Tests |
+    10	|---|---|---|---|
+    11	| 1 | Nonce gap after a failed broadcast | `src/dex/txsender.ts:68` `classifySendError`; `:214` a definite rejection rolls back the nonce and returns `rejected`, never `unknown`; `:151` `readyToSend()` refuses while a tx is unresolved and resets a local nonce that ran ahead of the chain; `src/engine.ts:448` calls `readyToSend()` before the MEXC leg | `test/txsender.test.ts` (rejection keeps nonce 5, 5); `test/grok-r2.test.ts` "1) readyToSend"; `test/engine.test.ts` "nonce not ready: the MEXC leg never fires" |
+    12	| 2 | `/start confirm` must not clear a pending tx | `src/commands.ts:55` `makeUnresolvedCheck`: refuses while pending ("outcome still unknown; use /cancelnonce or wait") and resets the nonce when clear; `src/dex/txsender.ts:168` `cancelNonce()` (2x fee, private + public RPC, waits up to 10 min, reports which hash won); `/cancelnonce` registered in `src/main.ts` for both strategies; `src/engine.ts:494` new alert text "Do NOT hedge by hand until the nonce is consumed"; `src/engine.ts:284` `reportResolved` alerts with `executedHash` / `ok` and notes it on the trade row (says so explicitly when there is no receipt) | `test/grok-r2.test.ts` "2) /start confirm is refused while a tx is pending; when clear it resets the nonce" |
+    13	| 3 | Save the pending tx and restore it at startup | `src/dex/txsender.ts:207`: every tx is persisted as in flight when it is signed, BEFORE broadcast, and cleared when mined or rejected. The cancel hash is added too. It lives in the SQLite `state` table (`unresolved_tx`), not a separate `pending_tx` table. Only one tx is ever in flight, because sends are blocked while one is unresolved. On restart `checkUnresolved()` runs inside `recoverExecuting` (`src/recovery.ts:28`, called from `src/main.ts:143`). A pending one triggers a critical pause and an alert, and nothing trades until the nonce is used | `test/grok-r2.test.ts` "3) a tx is recorded as in flight BEFORE broadcast"; `test/txsender.test.ts` "restart with a pending tx"; `test/engine.test.ts` "recovery: a pending DEX tx ... keeps the bot critically paused" |
+    14	| 4 | MEXC order settled after a cancel | `src/engine.ts:48` `cancelAndConfirm` (the "cancelAndSettle" of the prompt): it cancels and re-reads until the order is FILLED / CANCELED / PARTIALLY_CANCELED, otherwise it throws `OrderStillOpenError`. Used in `cexLeg`, where it becomes `UNKNOWN_ORDER_STATE` (critical pause, no unwind), in `closeAtMarket` (`src/engine.ts:590`), in transfer `finishBuy`, and in the transfer MEXC sell | `test/infra.test.ts` "cancelAndConfirm: never reports a still-open order as closed" (cancel throws and stays NEW; late cancel) |
+    15	| 5 | pm2 kill timeout | `ecosystem.config.cjs:15` `kill_timeout: 240000`; `src/main.ts:59` the shutdown waits `TX_TIMEOUT_SEC*2*1000 + 60000`; `src/config.ts:126` caps TX_TIMEOUT_SEC at 80, so the wait (at most 220 s) is always below kill_timeout. SIGINT and SIGTERM are both handled | (config) |
+    16	| 6 | Recovery of open MEXC orders and close orders | `src/db.ts:129` `appendCid` (new column `trades.cids`, a JSON array); `src/engine.ts:458` records the entry cid, and `closeAtMarket` records every close cid BEFORE placing it; `src/recovery.ts:28` looks up every cid, cancels and settles any order that is still open, and reports the final status and qty; `src/recovery.ts:95` + `src/mexc/rest.ts:241` `openOrders` sweep the watched symbols for orders with the bot prefix `arb`. The critical pause is kept | `test/grok-r2.test.ts` "6) recovery cancels a close order that is still open and sweeps open bot orders" |
+    17	| 7 | Unknown approval and silent stalls | `src/engine.ts:390` "approval outcome UNKNOWN, nonce N, hashes …" (no longer "Approval failed"); `src/engine.ts:223` hourly alert when a tx has been unresolved for more than 10 min, with nonce, hashes and a `/cancelnonce` hint | (covered by the engine paths above) |
+    18	| 8 | PERCENT_PRICE_BY_SIDE | `src/mexc/rules.ts`: `priceBand` is parsed from `filters` (default 0.2); `:44` `closePrice` = `min(ask*1.02, ref*(1+0.8*band))` for BUY and `max(bid*0.98, ref*(1-0.8*band))` for SELL, with ref = mid of a fresh book, rounded in the safe direction (with a float epsilon); `:54` `bandProblem`; `src/engine.ts:445` rejects an entry outside the band | `test/grok-r2.test.ts` "8) a 0.5% band clamps the close price", "8) an entry limit outside the band is rejected" |
+    19	| 9 | placeSafely "not found" logic | `src/mexc/rest.ts:234`: null ONLY for parsed MEXC code `-2011`, the text regex is removed and every other error is rethrown; `src/engine.ts:84` looks up over 1, 2, 3 and 4 s, and if still not found after an ambiguous error (5xx / timeout) the result is `UNKNOWN_ORDER_STATE`, never "not placed" | `test/grok-r2.test.ts` "9) ... 'currency does not exist' is rethrown", "9) placeSafely: a 5xx followed by 'not found' is UNKNOWN_ORDER_STATE" |
+    20	| 10a | PnL | `src/engine.ts:562` `stableBalances`: reads until two consecutive reads match (up to about 15 s), otherwise the note says "pnl approximate" | (engine tests) |
+    21	| 10b | Transfer sell without MARKET | `src/transfer.ts:597`: uses the aggressive banded LIMIT plus `cancelAndConfirm` when the symbol has no MARKET | (transfer tests) |
+    22	| 10c | Retry-After | `src/mexc/rest.ts:134` `RateLimitError.retryAfterSec` from the header; `src/main.ts:28` backs off for at least that long | (none) |
+    23	| 10d | 0x firm-quote check | `scripts/check-0x-quote.ts:1`, run with `npm run check:0x`. It signs and sends nothing, and prints only `transaction.to`, `allowanceTarget` and `issues` | not run (no key in this environment) |
+    24	| 10e | Recovery booking | Rows recovered as `one_sided` carry "pnl unknown"; `src/db.ts:142` `unresolvedTrades()`; `/status` lists them; `src/commands.ts:36` `/resolve <id> <pnl>` books the PnL, which then counts in the daily loss budget | `test/grok-r2.test.ts` "10e) /resolve" |
+    25	
+    26	## Deviations from the prompt (and why)
+    27	- **Item 3:** the in-flight tx is persisted in the existing `state` table rather than a new `pending_tx`
+    28	  table. Sends are serialized (nothing new is sent while a tx is unresolved), so there is at most one nonce
+    29	  in flight, and a single record holds all of that nonce's hashes (the tx and its cancels).
+    30	- **Item 4 name:** the helper is `cancelAndConfirm`. It was added for Muse's round-2 review and does what the
+    31	  prompt calls `cancelAndSettle`.
+    32	- **Item 6 sweep:** `openOrders` is swept for the `WATCHLIST` symbols when `STRATEGY=inventory` and
+    33	  `WATCHLIST` is set. With auto-discovery, the watchlist is not known yet when recovery runs, so only the
+    34	  cids recorded on the trade rows are checked.
+    35	- **IOC:** MEXC's docs list `IMMEDIATE_OR_CANCEL` as an order type, and there is no `timeInForce` parameter.
+    36	  But no live symbol lists IOC in `orderTypes`, so closes stay LIMIT plus a confirmed cancel.
+    37	
+    38	## Not verified (no keys here)
+    39	- Whether 0x `buyAmount` is already net of `zeroExFee`.
+    40	- Which asset MEXC charges the buy fee in.
+    41	- 1inch v6 request parameters.
+    42	- Live `transaction.to`. Run `npm run check:0x` once before going live.
+```
+
+## `src/commands.ts`
+
+```ts
+     1	// Telegram command logic shared by both strategies (kept out of main.ts so it can be unit tested).
+     2	import type { Db } from './db.js';
+     3	import type { Risk } from './risk.js';
+     4	import { usd } from './util.js';
+     5	
+     6	export interface ChainLike {
+     7	  readonly unresolved: { nonce: number; hashes: string[]; unknown?: boolean } | null;
+     8	  checkUnresolved(): Promise<{ state: 'clear' | 'pending' }>;
+     9	  resetNonce(): void;
+    10	}
+    11	
+    12	/**
+    13	 * /start handler shared by both strategies: critical pauses need "/start confirm", and even then
+    14	 * the bot re-checks that nothing is still unresolved (pending DEX tx, executing trade) before resuming.
+    15	 */
+    16	export function startHandler(risk: Risk, statusText: () => Promise<string>, stillUnresolved: () => Promise<string | null>) {
+    17	  return async (args: string[]) => {
+    18	    const confirm = args[0]?.toLowerCase() === 'confirm';
+    19	    if (risk.paused && risk.critical && !confirm) {
+    20	      return `⚠️ Critical pause: ${risk.pauseReason}\nCheck these positions and balances first:\n\n${await statusText()}\n\nThen send: /start confirm`;
+    21	    }
+    22	    if (risk.paused && risk.critical) {
+    23	      const open = await stillUnresolved();
+    24	      if (open) return `⛔ Not resuming: ${open}\nResolve it first (check etherscan / MEXC), then /start confirm again.`;
+    25	    }
+    26	    risk.resume(confirm);
+    27	    const block = risk.blockReason();
+    28	    return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
+    29	  };
+    30	}
+    31	
+    32	/**
+    33	 * /resolve <trade id> <pnl>: book the real PnL of a trade that ended one-sided / unknown (after you fixed it by hand),
+    34	 * so the daily loss budget sees it.
+    35	 */
+    36	export function resolveTrade(db: Db, id: string | undefined, pnl: string | undefined): string {
+    37	  const n = Number(pnl);
+    38	  if (!id || pnl === undefined || !Number.isFinite(n)) return 'Usage: /resolve <trade id> <pnl in USD, e.g. -3.20>';
+    39	  const open = db.unresolvedTrades().find((t) => t.id === Number(id));
+    40	  if (!open) return `Trade #${id} is not waiting for a PnL.`;
+    41	  db.updateTrade(open.id, { pnl_usd: n, note: `${open.note ?? ''}; pnl set by hand: ${n}; pnl resolved` });
+    42	  return `Trade #${id}: PnL ${usd(n)} booked.`;
+    43	}
+    44	
+    45	export function unresolvedLines(db: Db, chain: ChainLike): string[] {
+    46	  const out: string[] = [];
+    47	  const u = chain.unresolved;
+    48	  if (u) out.push(`⏳ DEX tx at nonce ${u.nonce} ${u.unknown ? 'UNKNOWN' : 'in flight'}: ${u.hashes.join(', ')} (/cancelnonce)`);
+    49	  const t = db.unresolvedTrades();
+    50	  if (t.length) out.push(`🧾 PnL unknown: ${t.map((r) => `#${r.id} ${r.symbol}`).join(', ')} -> /resolve <id> <pnl>`);
+    51	  return out;
+    52	}
+    53	
+    54	/** What still blocks a critical resume, or null. */
+    55	export function makeUnresolvedCheck(db: Db, chain: ChainLike) {
+    56	  return async (): Promise<string | null> => {
+    57	    const u = await chain.checkUnresolved();
+    58	    if (u.state === 'pending') {
+    59	      return `DEX tx ${chain.unresolved?.hashes.join(' / ')} (nonce ${chain.unresolved?.nonce}): outcome still unknown; use /cancelnonce or wait`;
+    60	    }
+    61	    const ex = db.executingTrades();
+    62	    if (ex.length) return `${ex.length} trade(s) still marked executing (#${ex.map((t) => t.id).join(', #')})`;
+    63	    chain.resetNonce(); // clear: re-read the next nonce from the chain
+    64	    return null;
+    65	  };
+    66	}
+    67	
 ```
 
 ## `src/config.ts`
@@ -309,25 +432,26 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
    122	  range('WORST_CASE_LOSS_PCT', c.worstCaseLossPct, 0, 100);
    123	  range('MAX_GAS_GWEI', c.maxGasGwei, 0.01, 1000);
    124	  range('MAX_CONSECUTIVE_FAILS', c.maxConsecutiveFails, 1, 100);
-   125	  range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 600);
-   126	  range('SCAN_INTERVAL_SEC', c.scanIntervalSec, 5, 3600);
-   127	  range('SCAN_MIN_GAP_PCT', c.scanMinGapPct, 0, c.scanMaxGapPct);
-   128	  range('SCAN_MAX_GAP_PCT', c.scanMaxGapPct, c.scanMinGapPct, 100);
-   129	  range('TRANSFER_DRIFT_BPS', c.transferDriftBps, 0, 5000);
-   130	  range('TRANSFER_TIMEOUT_MIN', c.transferTimeoutMin, 5, 24 * 60);
-   131	  range('TRANSFER_MAX_LOSS_PCT', c.transferMaxLossPct, 0, 100);
-   132	  range('MAX_OPEN_TRANSFERS', c.maxOpenTransfers, 1, 10);
-   133	  if (errs.length) throw new Error(`Invalid config:\n  ${errs.join('\n  ')}`);
-   134	  return c;
-   135	}
-   136	
-   137	/** Every secret value, so the logger can scrub them from any output. */
-   138	export function secretsOf(cfg: Config): string[] {
-   139	  // RPC URLs usually embed a provider API key (Alchemy/Infura), so they are secrets too.
-   140	  return [cfg.privateKey, cfg.mexcApiKey, cfg.mexcApiSecret, cfg.zeroExApiKey, cfg.oneInchApiKey, cfg.telegramToken, cfg.rpcUrl, cfg.sendRpcUrl]
-   141	    .filter((s) => s && s.length >= 8)
-   142	    .flatMap((s) => [s, s.replace(/^0x/, '')]);
-   143	}
+   125	  // Upper bound keeps the graceful-shutdown wait (2x this + 60 s) below pm2's kill_timeout (240 s).
+   126	  range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 80);
+   127	  range('SCAN_INTERVAL_SEC', c.scanIntervalSec, 5, 3600);
+   128	  range('SCAN_MIN_GAP_PCT', c.scanMinGapPct, 0, c.scanMaxGapPct);
+   129	  range('SCAN_MAX_GAP_PCT', c.scanMaxGapPct, c.scanMinGapPct, 100);
+   130	  range('TRANSFER_DRIFT_BPS', c.transferDriftBps, 0, 5000);
+   131	  range('TRANSFER_TIMEOUT_MIN', c.transferTimeoutMin, 5, 24 * 60);
+   132	  range('TRANSFER_MAX_LOSS_PCT', c.transferMaxLossPct, 0, 100);
+   133	  range('MAX_OPEN_TRANSFERS', c.maxOpenTransfers, 1, 10);
+   134	  if (errs.length) throw new Error(`Invalid config:\n  ${errs.join('\n  ')}`);
+   135	  return c;
+   136	}
+   137	
+   138	/** Every secret value, so the logger can scrub them from any output. */
+   139	export function secretsOf(cfg: Config): string[] {
+   140	  // RPC URLs usually embed a provider API key (Alchemy/Infura), so they are secrets too.
+   141	  return [cfg.privateKey, cfg.mexcApiKey, cfg.mexcApiSecret, cfg.zeroExApiKey, cfg.oneInchApiKey, cfg.telegramToken, cfg.rpcUrl, cfg.sendRpcUrl]
+   142	    .filter((s) => s && s.length >= 8)
+   143	    .flatMap((s) => [s, s.replace(/^0x/, '')]);
+   144	}
 ```
 
 ## `src/db.ts`
@@ -434,114 +558,140 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     99	        sell_attempts INTEGER NOT NULL DEFAULT 0, alerted_timeout INTEGER NOT NULL DEFAULT 0, note TEXT
    100	      );
    101	    `);
-   102	    const cols = new Set((this.db.prepare('PRAGMA table_info(transfers)').all() as { name: string }[]).map((c) => c.name));
-   103	    for (const m of TRANSFER_MIGRATIONS) {
-   104	      const col = m.split(' ')[5];
-   105	      if (!cols.has(col)) this.db.exec(m);
-   106	    }
-   107	  }
-   108	
-   109	  insertTrade(t: TradeRow): number {
-   110	    return Number(this.db
-   111	      .prepare(
-   112	        `INSERT INTO trades (ts, day, mode, symbol, direction, size_usd, qty, buy_price, sell_price, expected_net,
-   113	          cex_fee_usd, gas_usd, pnl_usd, status, dex_tx, cex_order_id, note)
-   114	         VALUES (@ts, @day, @mode, @symbol, @direction, @size_usd, @qty, @buy_price, @sell_price, @expected_net,
-   115	          @cex_fee_usd, @gas_usd, @pnl_usd, @status, @dex_tx, @cex_order_id, @note)`,
-   116	      )
-   117	      .run(t).lastInsertRowid);
-   118	  }
-   119	
-   120	  updateTrade(id: number, fields: Partial<TradeRow>): void {
-   121	    const cols = Object.keys(fields);
-   122	    if (!cols.length) return;
-   123	    this.db.prepare(`UPDATE trades SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...fields, id });
-   124	  }
-   125	
-   126	  /** Trades that were in flight when the bot stopped. */
-   127	  executingTrades(): (TradeRow & { id: number })[] {
-   128	    return this.db.prepare(`SELECT * FROM trades WHERE status = 'executing' ORDER BY id`).all() as (TradeRow & { id: number })[];
-   129	  }
-   130	
-   131	  dayStats(day: string, mode: string): { trades: number; pnl: number; gas: number; failed: number } {
-   132	    const r = this.db
-   133	      .prepare(
-   134	        `SELECT SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades,
-   135	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
-   136	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
-   137	         FROM trades WHERE day = ? AND mode = ?`,
-   138	      )
-   139	      .get(day, mode) as { trades: number | null; pnl: number; gas: number; failed: number | null };
-   140	    return { trades: r.trades ?? 0, pnl: r.pnl, gas: r.gas, failed: r.failed ?? 0 };
-   141	  }
-   142	
-   143	  /** Stats since a timestamp, overall and per symbol. */
-   144	  statsSince(sinceTs: number, mode?: string) {
-   145	    const where = mode ? 'ts >= ? AND mode = ?' : 'ts >= ?';
-   146	    const args = mode ? [sinceTs, mode] : [sinceTs];
-   147	    const total = this.db
-   148	      .prepare(
-   149	        `SELECT COALESCE(SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END),0) trades,
-   150	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
-   151	                COALESCE(SUM(cex_fee_usd),0) fees,
-   152	                COALESCE(SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END),0) failed
-   153	         FROM trades WHERE ${where}`,
-   154	      )
-   155	      .get(...args) as { trades: number; pnl: number; gas: number; fees: number; failed: number };
-   156	    const bySymbol = this.db
-   157	      .prepare(
-   158	        `SELECT symbol, SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades, SUM(pnl_usd) pnl, SUM(gas_usd) gas,
-   159	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
-   160	         FROM trades WHERE ${where} GROUP BY symbol ORDER BY pnl DESC`,
-   161	      )
-   162	      .all(...args) as { symbol: string; trades: number; pnl: number; gas: number; failed: number }[];
-   163	    return { total, bySymbol };
-   164	  }
-   165	
-   166	  insertTransfer(t: TransferRow): number {
-   167	    const cols = Object.keys(t).filter((k) => k !== 'id');
-   168	    const r = this.db
-   169	      .prepare(`INSERT INTO transfers (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`)
-   170	      .run(t);
-   171	    return Number(r.lastInsertRowid);
-   172	  }
-   173	
-   174	  updateTransfer(id: number, fields: Partial<TransferRow>): void {
-   175	    const f = { ...fields, updated: Date.now() };
-   176	    const cols = Object.keys(f).filter((k) => k !== 'id');
-   177	    this.db.prepare(`UPDATE transfers SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...f, id });
-   178	  }
-   179	
-   180	  /** Transfers the bot still works on automatically ('stuck' waits for a human: /sell or /clear). */
-   181	  openTransfers(): TransferRow[] {
-   182	    return this.db.prepare(`SELECT * FROM transfers WHERE status IN ('buying','withdrawing','selling') ORDER BY id`).all() as TransferRow[];
-   183	  }
-   184	
-   185	  /** Transfers that hold back new trades (open, and not given up on). */
-   186	  blockingTransfers(): TransferRow[] {
-   187	    return this.openTransfers().filter((t) => t.alerted_timeout < 2);
-   188	  }
-   189	
-   190	  stuckTransfers(): TransferRow[] {
-   191	    return this.db.prepare(`SELECT * FROM transfers WHERE status = 'stuck' ORDER BY id`).all() as TransferRow[];
-   192	  }
-   193	
-   194	  getTransfer(id: number): TransferRow | undefined {
-   195	    return this.db.prepare('SELECT * FROM transfers WHERE id = ?').get(id) as TransferRow | undefined;
-   196	  }
-   197	
-   198	  getState(key: string): string | undefined {
-   199	    return (this.db.prepare('SELECT value FROM state WHERE key = ?').get(key) as { value: string } | undefined)?.value;
-   200	  }
-   201	
-   202	  setState(key: string, value: string): void {
-   203	    this.db.prepare('INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+   102	    // trades.cids: JSON array of every MEXC client order id used by the trade (entry, closes), written BEFORE placing.
+   103	    const tcols = new Set((this.db.prepare('PRAGMA table_info(trades)').all() as { name: string }[]).map((c) => c.name));
+   104	    if (!tcols.has('cids')) this.db.exec('ALTER TABLE trades ADD COLUMN cids TEXT');
+   105	    const cols = new Set((this.db.prepare('PRAGMA table_info(transfers)').all() as { name: string }[]).map((c) => c.name));
+   106	    for (const m of TRANSFER_MIGRATIONS) {
+   107	      const col = m.split(' ')[5];
+   108	      if (!cols.has(col)) this.db.exec(m);
+   109	    }
+   110	  }
+   111	
+   112	  insertTrade(t: TradeRow): number {
+   113	    return Number(this.db
+   114	      .prepare(
+   115	        `INSERT INTO trades (ts, day, mode, symbol, direction, size_usd, qty, buy_price, sell_price, expected_net,
+   116	          cex_fee_usd, gas_usd, pnl_usd, status, dex_tx, cex_order_id, note)
+   117	         VALUES (@ts, @day, @mode, @symbol, @direction, @size_usd, @qty, @buy_price, @sell_price, @expected_net,
+   118	          @cex_fee_usd, @gas_usd, @pnl_usd, @status, @dex_tx, @cex_order_id, @note)`,
+   119	      )
+   120	      .run(t).lastInsertRowid);
+   121	  }
+   122	
+   123	  updateTrade(id: number, fields: Partial<TradeRow>): void {
+   124	    const cols = Object.keys(fields);
+   125	    if (!cols.length) return;
+   126	    this.db.prepare(`UPDATE trades SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...fields, id });
+   127	  }
+   128	
+   129	  appendCid(tradeId: number, cid: string): void {
+   130	    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
+   131	    const list = row?.cids ? (JSON.parse(row.cids) as string[]) : [];
+   132	    list.push(cid);
+   133	    this.db.prepare('UPDATE trades SET cids = ? WHERE id = ?').run(JSON.stringify(list), tradeId);
+   134	  }
+   135	
+   136	  cidsOf(tradeId: number): string[] {
+   137	    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
+   138	    return row?.cids ? (JSON.parse(row.cids) as string[]) : [];
+   139	  }
+   140	
+   141	  /** Trades whose real PnL is unknown (one-sided / recovered) and not yet set with /resolve. */
+   142	  unresolvedTrades(): (TradeRow & { id: number })[] {
+   143	    return this.db
+   144	      .prepare(`SELECT * FROM trades WHERE status = 'one_sided' AND (note IS NULL OR note NOT LIKE '%pnl resolved%') AND note LIKE '%pnl unknown%' ORDER BY id`)
+   145	      .all() as (TradeRow & { id: number })[];
+   146	  }
+   147	
+   148	  tradeByDexTx(hash: string): (TradeRow & { id: number }) | undefined {
+   149	    return this.db.prepare('SELECT * FROM trades WHERE dex_tx = ? ORDER BY id DESC LIMIT 1').get(hash) as (TradeRow & { id: number }) | undefined;
+   150	  }
+   151	
+   152	  /** Trades that were in flight when the bot stopped. */
+   153	  executingTrades(): (TradeRow & { id: number })[] {
+   154	    return this.db.prepare(`SELECT * FROM trades WHERE status = 'executing' ORDER BY id`).all() as (TradeRow & { id: number })[];
+   155	  }
+   156	
+   157	  dayStats(day: string, mode: string): { trades: number; pnl: number; gas: number; failed: number } {
+   158	    const r = this.db
+   159	      .prepare(
+   160	        `SELECT SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades,
+   161	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
+   162	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
+   163	         FROM trades WHERE day = ? AND mode = ?`,
+   164	      )
+   165	      .get(day, mode) as { trades: number | null; pnl: number; gas: number; failed: number | null };
+   166	    return { trades: r.trades ?? 0, pnl: r.pnl, gas: r.gas, failed: r.failed ?? 0 };
+   167	  }
+   168	
+   169	  /** Stats since a timestamp, overall and per symbol. */
+   170	  statsSince(sinceTs: number, mode?: string) {
+   171	    const where = mode ? 'ts >= ? AND mode = ?' : 'ts >= ?';
+   172	    const args = mode ? [sinceTs, mode] : [sinceTs];
+   173	    const total = this.db
+   174	      .prepare(
+   175	        `SELECT COALESCE(SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END),0) trades,
+   176	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
+   177	                COALESCE(SUM(cex_fee_usd),0) fees,
+   178	                COALESCE(SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END),0) failed
+   179	         FROM trades WHERE ${where}`,
+   180	      )
+   181	      .get(...args) as { trades: number; pnl: number; gas: number; fees: number; failed: number };
+   182	    const bySymbol = this.db
+   183	      .prepare(
+   184	        `SELECT symbol, SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades, SUM(pnl_usd) pnl, SUM(gas_usd) gas,
+   185	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
+   186	         FROM trades WHERE ${where} GROUP BY symbol ORDER BY pnl DESC`,
+   187	      )
+   188	      .all(...args) as { symbol: string; trades: number; pnl: number; gas: number; failed: number }[];
+   189	    return { total, bySymbol };
+   190	  }
+   191	
+   192	  insertTransfer(t: TransferRow): number {
+   193	    const cols = Object.keys(t).filter((k) => k !== 'id');
+   194	    const r = this.db
+   195	      .prepare(`INSERT INTO transfers (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`)
+   196	      .run(t);
+   197	    return Number(r.lastInsertRowid);
+   198	  }
+   199	
+   200	  updateTransfer(id: number, fields: Partial<TransferRow>): void {
+   201	    const f = { ...fields, updated: Date.now() };
+   202	    const cols = Object.keys(f).filter((k) => k !== 'id');
+   203	    this.db.prepare(`UPDATE transfers SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...f, id });
    204	  }
    205	
-   206	  close(): void {
-   207	    this.db.close();
-   208	  }
-   209	}
+   206	  /** Transfers the bot still works on automatically ('stuck' waits for a human: /sell or /clear). */
+   207	  openTransfers(): TransferRow[] {
+   208	    return this.db.prepare(`SELECT * FROM transfers WHERE status IN ('buying','withdrawing','selling') ORDER BY id`).all() as TransferRow[];
+   209	  }
+   210	
+   211	  /** Transfers that hold back new trades (open, and not given up on). */
+   212	  blockingTransfers(): TransferRow[] {
+   213	    return this.openTransfers().filter((t) => t.alerted_timeout < 2);
+   214	  }
+   215	
+   216	  stuckTransfers(): TransferRow[] {
+   217	    return this.db.prepare(`SELECT * FROM transfers WHERE status = 'stuck' ORDER BY id`).all() as TransferRow[];
+   218	  }
+   219	
+   220	  getTransfer(id: number): TransferRow | undefined {
+   221	    return this.db.prepare('SELECT * FROM transfers WHERE id = ?').get(id) as TransferRow | undefined;
+   222	  }
+   223	
+   224	  getState(key: string): string | undefined {
+   225	    return (this.db.prepare('SELECT value FROM state WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+   226	  }
+   227	
+   228	  setState(key: string, value: string): void {
+   229	    this.db.prepare('INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+   230	  }
+   231	
+   232	  close(): void {
+   233	    this.db.close();
+   234	  }
+   235	}
 ```
 
 ## `src/engine.ts`
@@ -568,7 +718,7 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     19	} from './pricing.js';
     20	import { log, errMsg } from './log.js';
     21	import { AmbiguousRequestError } from './mexc/rest.js';
-    22	import { aggressiveOffset, orderProblem } from './mexc/rules.js';
+    22	import { bandProblem, closePrice, orderProblem } from './mexc/rules.js';
     23	import crypto from 'node:crypto';
     24	
     25	/** A close/unwind that only partly filled: `remaining` is what is still open. */
@@ -630,545 +780,606 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     81	    return await place();
     82	  } catch (e) {
     83	    if (!(e instanceof AmbiguousRequestError)) throw e; // clearly rejected: nothing was placed
-    84	    // MEXC may take a few seconds to index a just-placed order: look for ~20s with backoff.
-    85	    let notFound = 0;
-    86	    for (const wait of [1000, 2000, 3000, 4000, 5000, 5000]) {
-    87	      await sleep(wait);
-    88	      let o: Order | null;
+    84	    // MEXC may take a few seconds to index a just-placed order: look for ~10s (1, 2, 3, 4 s).
+    85	    // MEXC docs: after a 5xx "the execution status is UNKNOWN". So if it is still not found, the state is
+    86	    // UNKNOWN (critical pause, no unwind) - never "not placed", which could double the exposure.
+    87	    for (const wait of [1000, 2000, 3000, 4000]) {
+    88	      await sleep(wait);
     89	      try {
-    90	        o = await mexc.getOrderByClientId(symbol, cid);
-    91	      } catch {
-    92	        continue; // lookup itself failed: try again
-    93	      }
-    94	      if (o) return { orderId: o.orderId }; // it WAS placed
-    95	      if (++notFound >= 4) throw e; // MEXC says four times (over ~10s+) that no such order exists
-    96	    }
-    97	    throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
-    98	  }
-    99	}
-   100	import { decimalsOfStep, dhakaDay, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
-   101	
-   102	export const USDC_DECIMALS = 6;
-   103	export { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
-   104	import { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
-   105	const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
-   106	
-   107	// Narrow interfaces so tests can plug in fakes.
-   108	export interface CexApi {
-   109	  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
-   110	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
-   111	  getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
-   112	  getOrder(symbol: string, orderId: string): Promise<Order>;
-   113	  cancelOrder(symbol: string, orderId: string): Promise<Order>;
-   114	}
-   115	export interface ChainApi {
-   116	  readonly address: string;
-   117	  gas(): Promise<GasInfo>;
-   118	  approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint>;
-   119	  approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
-   120	  simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
-   121	  send(
-   122	    tx: { to: string; data: string; value?: bigint },
-   123	    gasLimit: bigint,
-   124	    gas: GasInfo,
-   125	    timeoutSec: number,
-   126	    onSigned?: (hash: string, nonce: number) => void,
-   127	  ): Promise<TxResult>;
-   128	  /** Unresolved earlier tx (outcome unknown): no new trades until it is 'clear'. */
-   129	  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean }>;
-   130	}
-   131	export interface Notifier {
-   132	  send(text: string): Promise<void>;
-   133	}
-   134	
-   135	export interface EngineDeps {
-   136	  cfg: Config;
-   137	  mexc: CexApi;
-   138	  chain: ChainApi;
-   139	  agg: Aggregator;
-   140	  db: Db;
-   141	  risk: Risk;
-   142	  tg: Notifier;
-   143	  book: (symbol: string) => Promise<Book>;
-   144	  /** Authoritative book (REST) used for the final check right before trading; defaults to `book`. */
-   145	  freshBook?: (symbol: string) => Promise<Book>;
-   146	  /** total=true: free + locked MEXC balances (for exact PnL); default free (for sizing). */
-   147	  balances: (total?: boolean) => Promise<Balances>;
-   148	  tokens: Token[];
-   149	  sleep?: (ms: number) => Promise<void>;
-   150	}
-   151	
-   152	export interface Candidate {
-   153	  token: Token;
-   154	  opp: Opportunity;
-   155	  req: QuoteRequest;
-   156	  spender: string;
-   157	  approvalGas: bigint;
-   158	  tokenUsd: number;
-   159	}
-   160	
-   161	const mid = (b: Book) => (b.bids[0][0] + b.asks[0][0]) / 2;
+    90	        const o = await mexc.getOrderByClientId(symbol, cid);
+    91	        if (o) return { orderId: o.orderId }; // it WAS placed
+    92	      } catch {
+    93	        // lookup failed: try again
+    94	      }
+    95	    }
+    96	    throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
+    97	  }
+    98	}
+    99	import { decimalsOfStep, dhakaDay, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+   100	
+   101	export const USDC_DECIMALS = 6;
+   102	export { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
+   103	import { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
+   104	const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
+   105	
+   106	// Narrow interfaces so tests can plug in fakes.
+   107	export interface CexApi {
+   108	  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
+   109	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
+   110	  getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
+   111	  getOrder(symbol: string, orderId: string): Promise<Order>;
+   112	  cancelOrder(symbol: string, orderId: string): Promise<Order>;
+   113	}
+   114	export interface ChainApi {
+   115	  readonly address: string;
+   116	  gas(): Promise<GasInfo>;
+   117	  approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint>;
+   118	  approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
+   119	  simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
+   120	  send(
+   121	    tx: { to: string; data: string; value?: bigint },
+   122	    gasLimit: bigint,
+   123	    gas: GasInfo,
+   124	    timeoutSec: number,
+   125	    onSigned?: (hash: string, nonce: number) => void,
+   126	  ): Promise<TxResult>;
+   127	  /** Unresolved earlier tx (outcome unknown): no new trades until it is 'clear'. */
+   128	  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean; executedHash?: string; ok?: boolean }>;
+   129	  /** ok only if nothing is unresolved and our next nonce equals the chain's (no gap). */
+   130	  readyToSend?(): Promise<{ ok: boolean; reason?: string }>;
+   131	  readonly unresolved?: { nonce: number; hashes: string[]; since: number; unknown?: boolean } | null;
+   132	}
+   133	export interface Notifier {
+   134	  send(text: string): Promise<void>;
+   135	}
+   136	
+   137	export interface EngineDeps {
+   138	  cfg: Config;
+   139	  mexc: CexApi;
+   140	  chain: ChainApi;
+   141	  agg: Aggregator;
+   142	  db: Db;
+   143	  risk: Risk;
+   144	  tg: Notifier;
+   145	  book: (symbol: string) => Promise<Book>;
+   146	  /** Authoritative book (REST) used for the final check right before trading; defaults to `book`. */
+   147	  freshBook?: (symbol: string) => Promise<Book>;
+   148	  /** total=true: free + locked MEXC balances (for exact PnL); default free (for sizing). */
+   149	  balances: (total?: boolean) => Promise<Balances>;
+   150	  tokens: Token[];
+   151	  sleep?: (ms: number) => Promise<void>;
+   152	}
+   153	
+   154	export interface Candidate {
+   155	  token: Token;
+   156	  opp: Opportunity;
+   157	  req: QuoteRequest;
+   158	  spender: string;
+   159	  approvalGas: bigint;
+   160	  tokenUsd: number;
+   161	}
    162	
-   163	export class Engine {
-   164	  private lastNote = new Map<string, string>();
-   165	  private lastAlert = new Map<string, number>();
-   166	  private sleep: (ms: number) => Promise<void>;
-   167	  lastGasGwei = 0;
-   168	
-   169	  constructor(private d: EngineDeps) {
-   170	    this.sleep = d.sleep ?? realSleep;
-   171	  }
+   163	const mid = (b: Book) => (b.bids[0][0] + b.asks[0][0]) / 2;
+   164	
+   165	export class Engine {
+   166	  /** Trade row being executed: every MEXC client id is recorded on it before the order is placed. */
+   167	  private currentTradeId: number | null = null;
+   168	  private lastNote = new Map<string, string>();
+   169	  private lastAlert = new Map<string, number>();
+   170	  private sleep: (ms: number) => Promise<void>;
+   171	  lastGasGwei = 0;
    172	
-   173	  private get cfg() {
-   174	    return this.d.cfg;
+   173	  constructor(private d: EngineDeps) {
+   174	    this.sleep = d.sleep ?? realSleep;
    175	  }
-   176	  private get live() {
-   177	    return this.cfg.mode === 'live';
-   178	  }
-   179	  private get taker() {
-   180	    return this.live ? this.d.chain.address : PAPER_TAKER;
-   181	  }
-   182	  private costs() {
-   183	    return { takerFee: this.cfg.mexcTakerFee, cexSlippageBps: this.cfg.cexSlippageBps, safetyMarginUsd: this.cfg.safetyMarginUsd };
-   184	  }
-   185	  private need(sizeUsd: number) {
-   186	    return threshold(sizeUsd, this.cfg.minProfitUsd, this.cfg.minProfitPct);
-   187	  }
-   188	
-   189	  /** Log a status line only when it changes (avoids spamming every block). */
-   190	  private note(key: string, msg: string) {
-   191	    if (this.lastNote.get(key) !== msg) {
-   192	      this.lastNote.set(key, msg);
-   193	      log.info(msg);
-   194	    }
-   195	  }
-   196	
-   197	  async alertThrottled(key: string, text: string, everyMs = 6 * 3600_000) {
-   198	    const last = this.lastAlert.get(key) ?? 0;
-   199	    if (Date.now() - last < everyMs) return;
-   200	    this.lastAlert.set(key, Date.now());
-   201	    await this.d.tg.send(text);
-   202	  }
-   203	
-   204	  /** One scan; executes at most one trade. */
-   205	  async tick(): Promise<void> {
-   206	    const block = this.d.risk.blockReason();
-   207	    if (block) return this.note('block', `trading blocked: ${block}`);
-   208	    this.note('block', 'trading enabled');
-   209	
-   210	    if (this.d.chain.checkUnresolved) {
-   211	      const u = await this.d.chain.checkUnresolved();
-   212	      if (u.dropped) await this.d.tg.send('ℹ️ An unresolved DEX tx was dropped by every RPC (never mined); its nonce is free again.');
-   213	      if (u.state === 'pending') {
-   214	        await this.alertThrottled('unresolved', '⏳ An earlier DEX tx is still unresolved: no new trades until it is mined or dropped. /status for details.', 3600_000);
-   215	        return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or dropped');
-   216	      }
-   217	    }
-   218	    this.note('unresolved', 'no unresolved tx');
-   219	
-   220	    const gas = await this.d.chain.gas();
-   221	    this.lastGasGwei = Number(gas.effective) / 1e9;
-   222	    if (this.lastGasGwei > this.cfg.maxGasGwei) {
-   223	      return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > MAX_GAS_GWEI ${this.cfg.maxGasGwei}, waiting`);
-   224	    }
-   225	    this.note('gas', 'gas ok');
-   226	
-   227	    const ethUsd = mid(await this.d.book('ETHUSDT'));
-   228	    const bal = await this.d.balances();
-   229	    const books = new Map<string, Book>();
-   230	    const prices: Record<string, number> = {};
-   231	    for (const t of this.d.tokens) {
-   232	      try {
-   233	        const b = await this.d.book(t.symbol);
-   234	        if (b.bids.length && b.asks.length) {
-   235	          books.set(t.symbol, b);
-   236	          prices[t.base] = mid(b);
-   237	        }
-   238	      } catch (e) {
-   239	        log.warn(`${t.symbol} book: ${errMsg(e)}`);
-   240	      }
-   241	    }
-   242	
-   243	    if (this.live) {
-   244	      for (const w of inventoryWarnings(bal, this.d.tokens, prices, this.cfg.minTradeUsd, this.cfg.minEthForGas)) {
-   245	        await this.alertThrottled(`inv-${w.key}`, `📦 Inventory: ${w.text}`);
-   246	      }
-   247	    }
-   248	
-   249	    let best: Candidate | null = null;
-   250	    for (const t of this.d.tokens) {
-   251	      const b = books.get(t.symbol);
-   252	      if (!b) continue;
-   253	      if (!t.depositOk || !t.withdrawOk) {
-   254	        this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
-   255	        continue;
-   256	      }
-   257	      this.note(`susp-${t.base}`, `${t.base}: active`);
-   258	      try {
-   259	        for (const c of await this.candidates(t, b, bal, gas, ethUsd)) {
-   260	          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(this.need(c.opp.sizeUsd))})`);
-   261	          if (c.opp.net > this.need(c.opp.sizeUsd) && (!best || c.opp.net > best.opp.net)) best = c;
-   262	        }
-   263	      } catch (e) {
-   264	        log.warn(`${t.base} quote: ${errMsg(e)}`);
-   265	      }
-   266	    }
-   267	    if (best) await this.execute(best, gas, ethUsd);
-   268	  }
-   269	
-   270	  /** Indicative opportunities in both directions for one token. */
-   271	  async candidates(t: Token, b: Book, bal: Balances, gas: GasInfo, ethUsd: number): Promise<Candidate[]> {
-   272	    const out: Candidate[] = [];
-   273	    const bestBid = b.bids[0][0];
-   274	    const tokenUsd = mid(b);
-   275	    const cexTok = bal.mexc[t.base] ?? 0;
-   276	    const walTok = bal.walletToken[t.base] ?? 0;
-   277	    const slippageBps = this.cfg.dexSlippageBps;
-   278	
-   279	    // DEX_BUY: USDC -> token on DEX, token -> USDT on MEXC.
-   280	    const sizeA = Math.floor(Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99) * 100) / 100;
-   281	    if (sizeA >= this.cfg.minTradeUsd) {
-   282	      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(sizeA, USDC_DECIMALS), taker: this.taker, slippageBps };
-   283	      const q = await this.d.agg.price(req);
-   284	      const spender = this.spenderOf(q);
-   285	      const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
-   286	      const opp = evaluateDexBuy({
-   287	        sizeUsd: sizeA,
-   288	        tokensOut: toFloat(q.buyAmount, t.decimals),
-   289	        tokensMin: toFloat(q.minBuyAmount, t.decimals),
-   290	        bids: b.bids,
-   291	        qtyStep: t.qtyStep,
-   292	        gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
-   293	        costs: this.costs(),
-   294	      });
-   295	      const problem = opp && orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
-   296	      if (problem) this.note(`rule-${t.base}-A`, `${t.base} DEX_BUY skipped: MEXC would reject the sell (${problem})`);
-   297	      else if (opp && opp.cexQty <= cexTok) out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
-   298	    }
-   299	
-   300	    // CEX_BUY: USDT -> token on MEXC, token -> USDC on DEX.
-   301	    const sizeB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
-   302	    if (sizeB >= this.cfg.minTradeUsd) {
-   303	      const plan = planCexBuy({ sizeUsd: sizeB, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.cfg.mexcTakerFee });
-   304	      if (plan && plan.tokensToSell <= walTok) {
-   305	        const req = { sellToken: t.address, buyToken: this.cfg.usdc, sellAmount: toUnits(plan.tokensToSell, t.decimals), taker: this.taker, slippageBps };
-   306	        const q = await this.d.agg.price(req);
-   307	        const spender = this.spenderOf(q);
-   308	        const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
-   309	        const opp = evaluateCexBuy({
-   310	          plan,
-   311	          usdcOut: toFloat(q.buyAmount, USDC_DECIMALS),
-   312	          usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
-   313	          gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
-   314	          costs: this.costs(),
-   315	        });
-   316	        const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
-   317	        if (problem) this.note(`rule-${t.base}-B`, `${t.base} CEX_BUY skipped: MEXC would reject the buy (${problem})`);
-   318	        else out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
-   319	      }
-   320	    }
-   321	    return out;
-   322	  }
-   323	
-   324	  private spenderOf(q: Quote): string {
-   325	    if (q.spender) return q.spender;
-   326	    if (this.d.agg.name === '0x') return ZEROX_ALLOWANCE_HOLDER;
-   327	    throw new Error('aggregator did not return a spender');
-   328	  }
-   329	
-   330	  /** Re-check with a firm quote + simulation, then trade both legs at once. */
-   331	  async execute(c: Candidate, gas: GasInfo, ethUsd: number): Promise<void> {
-   332	    const { token: t } = c;
-   333	    if (!this.live) return this.recordPaper(c);
-   334	
-   335	    let approvalCostWei = 0n;
-   336	    const skip = async (why: string) => {
-   337	      log.info(`${t.base} skip: ${why}`);
-   338	      if (approvalCostWei > 0n) {
-   339	        // The approval gas was really spent; book it so PnL and the loss limit stay honest.
-   340	        const g = (Number(approvalCostWei) / 1e18) * ethUsd;
-   341	        this.record(c, 'approval', { pnl: -g, gas: g, note: `approval, then skipped: ${why}` });
-   342	      }
-   343	    };
-   344	
-   345	    // 0) Worst case must fit in what is left of today's loss budget.
-   346	    const worst = (c.opp.sizeUsd * this.cfg.worstCaseLossPct) / 100 + c.opp.gasUsd;
-   347	    const budget = this.d.risk.remainingLossBudget();
-   348	    if (worst > budget) return skip(`worst case ${usd(worst)} > remaining daily loss budget ${usd(budget)}`);
-   349	
-   350	    // Snapshot BEFORE the approval, so approval gas is part of the measured PnL.
-   351	    const before = await this.d.balances(true);
-   352	
-   353	    // 1) Exact approval (never unlimited).
-   354	    if (c.approvalGas > 0n) {
-   355	      const r = await this.d.chain.approveExact(c.req.sellToken, c.spender, c.req.sellAmount, gas);
-   356	      approvalCostWei = r.gasCostWei;
-   357	      if (!r.ok) {
-   358	        await skip(`approval failed (${r.reason})`);
-   359	        await this.d.tg.send(`⚠️ Approval failed for ${t.base}: ${r.reason} ${r.hash ?? ''}`);
-   360	        return;
-   361	      }
-   362	    }
+   176	
+   177	  private get cfg() {
+   178	    return this.d.cfg;
+   179	  }
+   180	  private get live() {
+   181	    return this.cfg.mode === 'live';
+   182	  }
+   183	  private get taker() {
+   184	    return this.live ? this.d.chain.address : PAPER_TAKER;
+   185	  }
+   186	  private costs() {
+   187	    return { takerFee: this.cfg.mexcTakerFee, cexSlippageBps: this.cfg.cexSlippageBps, safetyMarginUsd: this.cfg.safetyMarginUsd };
+   188	  }
+   189	  private need(sizeUsd: number) {
+   190	    return threshold(sizeUsd, this.cfg.minProfitUsd, this.cfg.minProfitPct);
+   191	  }
+   192	
+   193	  /** Log a status line only when it changes (avoids spamming every block). */
+   194	  private note(key: string, msg: string) {
+   195	    if (this.lastNote.get(key) !== msg) {
+   196	      this.lastNote.set(key, msg);
+   197	      log.info(msg);
+   198	    }
+   199	  }
+   200	
+   201	  async alertThrottled(key: string, text: string, everyMs = 6 * 3600_000) {
+   202	    const last = this.lastAlert.get(key) ?? 0;
+   203	    if (Date.now() - last < everyMs) return;
+   204	    this.lastAlert.set(key, Date.now());
+   205	    await this.d.tg.send(text);
+   206	  }
+   207	
+   208	  /** One scan; executes at most one trade. */
+   209	  async tick(): Promise<void> {
+   210	    const block = this.d.risk.blockReason();
+   211	    if (block) return this.note('block', `trading blocked: ${block}`);
+   212	    this.note('block', 'trading enabled');
+   213	
+   214	    if (this.d.chain.checkUnresolved) {
+   215	      const pending = this.d.chain.unresolved;
+   216	      const u = await this.d.chain.checkUnresolved();
+   217	      if (u.state === 'clear' && pending) await this.reportResolved(pending, u);
+   218	      if (u.state === 'pending') {
+   219	        const p = this.d.chain.unresolved;
+   220	        if (p && Date.now() - p.since > 10 * 60_000) {
+   221	          await this.alertThrottled(
+   222	            'unresolved',
+   223	            `⏳ DEX tx at nonce ${p.nonce} still unresolved after ${Math.round((Date.now() - p.since) / 60_000)} min (${p.hashes.join(', ')}). ` +
+   224	              `No new trades. Send /cancelnonce to replace it with a cancel, or wait.`,
+   225	            3600_000,
+   226	          );
+   227	        }
+   228	        return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or dropped');
+   229	      }
+   230	    }
+   231	    this.note('unresolved', 'no unresolved tx');
+   232	
+   233	    const gas = await this.d.chain.gas();
+   234	    this.lastGasGwei = Number(gas.effective) / 1e9;
+   235	    if (this.lastGasGwei > this.cfg.maxGasGwei) {
+   236	      return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > MAX_GAS_GWEI ${this.cfg.maxGasGwei}, waiting`);
+   237	    }
+   238	    this.note('gas', 'gas ok');
+   239	
+   240	    const ethUsd = mid(await this.d.book('ETHUSDT'));
+   241	    const bal = await this.d.balances();
+   242	    const books = new Map<string, Book>();
+   243	    const prices: Record<string, number> = {};
+   244	    for (const t of this.d.tokens) {
+   245	      try {
+   246	        const b = await this.d.book(t.symbol);
+   247	        if (b.bids.length && b.asks.length) {
+   248	          books.set(t.symbol, b);
+   249	          prices[t.base] = mid(b);
+   250	        }
+   251	      } catch (e) {
+   252	        log.warn(`${t.symbol} book: ${errMsg(e)}`);
+   253	      }
+   254	    }
+   255	
+   256	    if (this.live) {
+   257	      for (const w of inventoryWarnings(bal, this.d.tokens, prices, this.cfg.minTradeUsd, this.cfg.minEthForGas)) {
+   258	        await this.alertThrottled(`inv-${w.key}`, `📦 Inventory: ${w.text}`);
+   259	      }
+   260	    }
+   261	
+   262	    let best: Candidate | null = null;
+   263	    for (const t of this.d.tokens) {
+   264	      const b = books.get(t.symbol);
+   265	      if (!b) continue;
+   266	      if (!t.depositOk || !t.withdrawOk) {
+   267	        this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
+   268	        continue;
+   269	      }
+   270	      this.note(`susp-${t.base}`, `${t.base}: active`);
+   271	      try {
+   272	        for (const c of await this.candidates(t, b, bal, gas, ethUsd)) {
+   273	          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(this.need(c.opp.sizeUsd))})`);
+   274	          if (c.opp.net > this.need(c.opp.sizeUsd) && (!best || c.opp.net > best.opp.net)) best = c;
+   275	        }
+   276	      } catch (e) {
+   277	        log.warn(`${t.base} quote: ${errMsg(e)}`);
+   278	      }
+   279	    }
+   280	    if (best) await this.execute(best, gas, ethUsd);
+   281	  }
+   282	
+   283	  /** An unresolved tx got its outcome: tell the human which tx won, and note it on the trade row. */
+   284	  private async reportResolved(
+   285	    p: { nonce: number; hashes: string[] },
+   286	    u: { executedHash?: string; ok?: boolean; dropped?: boolean },
+   287	  ) {
+   288	    const what = u.executedHash
+   289	      ? `${u.executedHash} was mined (${u.ok ? 'SUCCESS' : 'REVERTED'})${u.executedHash === p.hashes[0] ? ': the ORIGINAL tx executed' : ': the cancel won, the original did NOT execute'}`
+   290	      : u.dropped
+   291	        ? 'no RPC knows the tx any more: it was dropped and never executed'
+   292	        : 'the nonce was used, but no receipt was found for our hashes: check etherscan';
+   293	    await this.d.tg.send(`ℹ️ Nonce ${p.nonce} resolved: ${what}. You may now fix any position by hand, then /start confirm.`);
+   294	    const row = this.d.db.tradeByDexTx(p.hashes[0]);
+   295	    if (row) this.d.db.updateTrade(row.id, { note: `${row.note ?? ''}; dex resolved: ${what}` });
+   296	  }
+   297	
+   298	  /** Indicative opportunities in both directions for one token. */
+   299	  async candidates(t: Token, b: Book, bal: Balances, gas: GasInfo, ethUsd: number): Promise<Candidate[]> {
+   300	    const out: Candidate[] = [];
+   301	    const bestBid = b.bids[0][0];
+   302	    const tokenUsd = mid(b);
+   303	    const cexTok = bal.mexc[t.base] ?? 0;
+   304	    const walTok = bal.walletToken[t.base] ?? 0;
+   305	    const slippageBps = this.cfg.dexSlippageBps;
+   306	
+   307	    // DEX_BUY: USDC -> token on DEX, token -> USDT on MEXC.
+   308	    const sizeA = Math.floor(Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99) * 100) / 100;
+   309	    if (sizeA >= this.cfg.minTradeUsd) {
+   310	      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(sizeA, USDC_DECIMALS), taker: this.taker, slippageBps };
+   311	      const q = await this.d.agg.price(req);
+   312	      const spender = this.spenderOf(q);
+   313	      const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
+   314	      const opp = evaluateDexBuy({
+   315	        sizeUsd: sizeA,
+   316	        tokensOut: toFloat(q.buyAmount, t.decimals),
+   317	        tokensMin: toFloat(q.minBuyAmount, t.decimals),
+   318	        bids: b.bids,
+   319	        qtyStep: t.qtyStep,
+   320	        gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
+   321	        costs: this.costs(),
+   322	      });
+   323	      const problem = opp && orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
+   324	      if (problem) this.note(`rule-${t.base}-A`, `${t.base} DEX_BUY skipped: MEXC would reject the sell (${problem})`);
+   325	      else if (opp && opp.cexQty <= cexTok) out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
+   326	    }
+   327	
+   328	    // CEX_BUY: USDT -> token on MEXC, token -> USDC on DEX.
+   329	    const sizeB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
+   330	    if (sizeB >= this.cfg.minTradeUsd) {
+   331	      const plan = planCexBuy({ sizeUsd: sizeB, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.cfg.mexcTakerFee });
+   332	      if (plan && plan.tokensToSell <= walTok) {
+   333	        const req = { sellToken: t.address, buyToken: this.cfg.usdc, sellAmount: toUnits(plan.tokensToSell, t.decimals), taker: this.taker, slippageBps };
+   334	        const q = await this.d.agg.price(req);
+   335	        const spender = this.spenderOf(q);
+   336	        const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
+   337	        const opp = evaluateCexBuy({
+   338	          plan,
+   339	          usdcOut: toFloat(q.buyAmount, USDC_DECIMALS),
+   340	          usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
+   341	          gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
+   342	          costs: this.costs(),
+   343	        });
+   344	        const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
+   345	        if (problem) this.note(`rule-${t.base}-B`, `${t.base} CEX_BUY skipped: MEXC would reject the buy (${problem})`);
+   346	        else out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
+   347	      }
+   348	    }
+   349	    return out;
+   350	  }
+   351	
+   352	  private spenderOf(q: Quote): string {
+   353	    if (q.spender) return q.spender;
+   354	    if (this.d.agg.name === '0x') return ZEROX_ALLOWANCE_HOLDER;
+   355	    throw new Error('aggregator did not return a spender');
+   356	  }
+   357	
+   358	  /** Re-check with a firm quote + simulation, then trade both legs at once. */
+   359	  async execute(c: Candidate, gas: GasInfo, ethUsd: number): Promise<void> {
+   360	    const { token: t } = c;
+   361	    this.currentTradeId = null;
+   362	    if (!this.live) return this.recordPaper(c);
    363	
-   364	    // 2) Firm quote + simulation (eth_call). Abort on any doubt.
-   365	    let firm: Quote;
-   366	    let gasEst: bigint;
-   367	    try {
-   368	      firm = await this.d.agg.quote(c.req);
-   369	      if (!firm.tx) return skip('firm quote has no transaction');
-   370	      gasEst = await this.d.chain.simulate(firm.tx);
-   371	    } catch (e) {
-   372	      return skip(`simulation/quote failed: ${errMsg(e)}`);
-   373	    }
-   374	    const tx = firm.tx;
-   375	
-   376	    // 3) Re-evaluate with a fresh REST book, firm amounts and simulated gas.
-   377	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
-   378	    const g = gasUsd(gasEst, gas.effective, ethUsd);
-   379	    let opp: Opportunity | null;
-   380	    if (c.opp.direction === 'DEX_BUY') {
-   381	      opp = evaluateDexBuy({
-   382	        sizeUsd: c.opp.sizeUsd,
-   383	        tokensOut: toFloat(firm.buyAmount, t.decimals),
-   384	        tokensMin: toFloat(firm.minBuyAmount, t.decimals),
-   385	        bids: b.bids,
-   386	        qtyStep: t.qtyStep,
-   387	        gasUsd: g,
-   388	        costs: this.costs(),
-   389	      });
-   390	    } else {
-   391	      // Same quantity as quoted on the DEX, priced against the fresh MEXC book.
-   392	      const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.cfg.mexcTakerFee);
-   393	      opp = plan
-   394	        ? evaluateCexBuy({
-   395	            plan,
-   396	            usdcOut: toFloat(firm.buyAmount, USDC_DECIMALS),
-   397	            usdcMin: toFloat(firm.minBuyAmount, USDC_DECIMALS),
-   398	            gasUsd: g,
-   399	            costs: this.costs(),
-   400	          })
-   401	        : null;
-   402	    }
-   403	    const need = this.need(c.opp.sizeUsd);
-   404	    if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
-   405	    // MEXC symbol rules on the FINAL numbers, before anything is sent: a rejected MEXC leg after a sent DEX tx = one-sided.
-   406	    const problem = orderProblem(t.rules, opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY', opp.cexQty, opp.cexLimitPrice);
-   407	    if (problem) return skip(`MEXC would reject the order: ${problem}`);
-   408	
-   409	    // 4) Persist the trade as 'executing' BEFORE anything is sent: if the bot dies now, startup sees it.
-   410	    const cid = clientId('t');
-   411	    const tradeId = this.record({ ...c, opp }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
-   412	
-   413	    // Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
-   414	    // the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
-   415	    log.info(`${t.base} EXECUTE ${opp.direction} size ${usd(opp.sizeUsd)} expected ${usd(opp.net)}`);
-   416	    const [cexR, dexR] = await Promise.allSettled([
-   417	      this.cexLeg(t, opp, cid),
-   418	      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash, nonce) =>
-   419	        this.d.db.updateTrade(tradeId, { dex_tx: hash, note: `client order id ${cid}; nonce ${nonce}` }),
-   420	      ),
-   421	    ]);
-   422	
-   423	    const dex: TxResult = dexR.status === 'fulfilled' ? dexR.value : { ok: false, gasCostWei: 0n, reason: errMsg(dexR.reason) };
-   424	    let cexFilled = 0;
-   425	    let orderId: string | null = null;
-   426	    let cexUnknown = false;
-   427	    if (cexR.status === 'fulfilled') {
-   428	      cexFilled = cexR.value.filled;
-   429	      orderId = cexR.value.orderId;
-   430	    } else if (String((cexR.reason as Error)?.message ?? '').startsWith('UNKNOWN_ORDER_STATE')) {
-   431	      cexUnknown = true;
-   432	      this.d.risk.pause('MEXC order state unknown', true);
-   433	      await this.d.tg.send(`🚨 ${t.base}: MEXC order state unknown after placing. Trading PAUSED. Check MEXC manually.\n${errMsg(cexR.reason)}`);
-   434	    } else {
-   435	      log.warn(`${t.base} MEXC leg failed: ${errMsg(cexR.reason)}`);
-   436	    }
-   437	
-   438	    // 5) One-sided? Close the open position at market right away.
-   439	    let status: TradeStatus = 'ok';
-   440	    const notes: string[] = [];
-   441	    if (!dex.ok) notes.push(`DEX: ${dex.reason}`);
-   442	    if (dex.unknown) {
-   443	      // We cannot tell if the swap executed. Unwinding could DOUBLE the position. Stop and ask a human.
-   444	      this.d.risk.pause(`DEX tx unknown ${dex.hash}`, true);
-   445	      await this.d.tg.send(
-   446	        `🚨 ${t.base}: DEX tx ${dex.hash} outcome UNKNOWN (not mined, cancel not confirmed). MEXC filled ${cexFilled}/${opp.cexQty}.\n` +
-   447	          `NOT unwinding automatically. Trading PAUSED. Check the wallet on etherscan, fix by hand, then /start confirm.`,
-   448	      );
-   449	    }
-   450	    const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.cfg.mexcTakerFee, t.qtyStep);
-   451	    if (cexUnknown || dex.unknown) {
-   452	      status = 'one_sided';
-   453	    } else if (unwind) {
-   454	      status = 'one_sided';
-   455	      const qty = unwind.qty.toFixed(decimalsOfStep(t.qtyStep));
-   456	      try {
-   457	        const r = await this.closeAtMarket(t, unwind.side, qty);
-   458	        if (r.dust) {
-   459	          notes.push(`unwind ${unwind.side} ${qty} not sent: ${r.dust}`);
-   460	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base}: leftover ${unwind.side} ${qty} is below MEXC minimums (${r.dust}). Left as dust; fix inventory by hand.`);
-   461	        } else {
-   462	          notes.push(`unwind ${unwind.side} ${qty} (${r.orderId}, filled ${r.filled})`);
-   463	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base} ${opp.direction}\n${unwind.reason}\nClosed: MEXC ${unwind.side} ${r.filled} ${t.base}`);
-   464	        }
-   465	      } catch (e) {
-   466	        const remaining = e instanceof PartialCloseError ? e.remaining : Number(qty);
-   467	        if (e instanceof OrderStillOpenError) notes.push(`close order ${e.orderId} may still be live on MEXC: cancel it by hand`);
-   468	        this.d.risk.pause(`unwind failed for ${t.base}`, true);
-   469	        notes.push(`UNWIND FAILED: ${errMsg(e)}`);
-   470	        await this.d.tg.send(
-   471	          `🚨 ONE-SIDED FILL ${t.base} and the market close FAILED: ${errMsg(e)}\n` +
-   472	            `Still open: MEXC ${unwind.side} ${remaining} ${t.base} needed.\nTrading PAUSED. Close it manually, then /start confirm.`,
-   473	        );
-   474	      }
-   475	    } else if (!dex.ok) {
-   476	      status = 'dex_failed'; // nothing filled on either side
-   477	    }
-   478	
-   479	    // 6) Exact PnL = change in total value of everything the trade touched, at pre-trade prices.
-   480	    //    Orders are closed (filled/cancelled) by now; free + locked balances avoid counting held funds as lost.
-   481	    await this.sleep(2500);
-   482	    const after = await this.d.balances(true);
-   483	    const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd) - portfolioUsd(before, t, c.tokenUsd, ethUsd);
-   484	    const gasPaid = (Number(dex.gasCostWei + approvalCostWei) / 1e18) * ethUsd;
-   485	    this.d.db.updateTrade(tradeId, {
-   486	      status,
-   487	      pnl_usd: pnl,
-   488	      gas_usd: gasPaid,
-   489	      dex_tx: dex.hash ?? null,
-   490	      cex_order_id: orderId ?? cid,
-   491	      note: [`client order id ${cid}`, ...notes].join('; '),
-   492	    });
-   493	
-   494	    const dexIsBuy = opp.direction === 'DEX_BUY';
-   495	    await this.d.tg.send(
-   496	      [
-   497	        `${status === 'ok' ? '✅' : '⚠️'} LIVE ${t.base} ${opp.direction} [${status}]`,
-   498	        `Buy  ${dexIsBuy ? 'DEX ' : 'MEXC'} @ ${opp.buyPrice.toPrecision(6)}`,
-   499	        `Sell ${dexIsBuy ? 'MEXC' : 'DEX '} @ ${opp.sellPrice.toPrecision(6)}`,
-   500	        `Qty ${opp.cexQty} ${t.base} | size ${usd(opp.sizeUsd)}`,
-   501	        `MEXC fee ${usd(opp.cexFeeUsd)} | Gas ${usd(gasPaid)}`,
-   502	        `Expected ${usd(opp.net)} | Net PnL ${usd(pnl)}`,
-   503	        dex.hash ? `https://etherscan.io/tx/${dex.hash}` : '',
-   504	        notes.length ? `Notes: ${notes.join('; ')}` : '',
-   505	      ]
-   506	        .filter(Boolean)
-   507	        .join('\n'),
-   508	    );
-   509	    await this.handleRisk(this.d.risk.afterTrade(status));
-   510	  }
-   511	
-   512	  /**
-   513	   * Close a position on MEXC now with an aggressive LIMIT 2% through the book, for BOTH sides.
-   514	   * (No MEXC spot symbol offers IMMEDIATE_OR_CANCEL, and some have no MARKET; LIMIT works everywhere.)
-   515	   * Reads the order back and never assumes it filled. Below MEXC minimums -> returns `dust`, sends nothing.
-   516	   */
-   517	  async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number; dust?: string }> {
-   518	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
-   519	    const f = 10 ** t.priceDecimals;
-   520	    const off = aggressiveOffset(t.rules); // 2%, or less if the symbol's price band is tight
-   521	    const pxNum = side === 'BUY' ? Math.ceil(b.asks[0][0] * (1 + off) * f) / f : Math.floor(b.bids[0][0] * (1 - off) * f) / f;
-   522	    const dust = orderProblem(t.rules, side, Number(qty), pxNum);
-   523	    if (dust) return { orderId: '', filled: 0, dust };
-   524	    const px = pxNum.toFixed(t.priceDecimals);
-   525	    const cid = clientId('c');
-   526	    const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, side, qty, px, cid), this.sleep);
-   527	    await this.sleep(1500);
-   528	    let o = await this.d.mexc.getOrder(t.symbol, orderId);
-   529	    if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
-   530	    const filled = Number(o.executedQty);
-   531	    if (filled < Number(qty) * 0.999) {
-   532	      const remaining = Number((Number(qty) - filled).toFixed(decimalsOfStep(t.qtyStep)));
-   533	      throw new PartialCloseError(`close ${side} only filled ${filled}/${qty}, ${remaining} remaining`, remaining);
-   534	    }
-   535	    return { orderId, filled };
-   536	  }
-   537	
-   538	  /** MEXC marketable limit order; cancels any unfilled rest. Returns filled quantity. */
-   539	  async cexLeg(t: Token, opp: Opportunity, cid = clientId('t')): Promise<{ orderId: string; filled: number }> {
-   540	    const side: Side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
-   541	    const qty = opp.cexQty.toFixed(decimalsOfStep(t.qtyStep));
-   542	    const f = 10 ** t.priceDecimals;
-   543	    const px = side === 'SELL' ? Math.floor(opp.cexLimitPrice * f) / f : Math.ceil(opp.cexLimitPrice * f) / f;
-   544	    const { orderId } = await placeSafely(
-   545	      this.d.mexc,
-   546	      t.symbol,
-   547	      cid,
-   548	      () => this.d.mexc.limitOrder(t.symbol, side, qty, px.toFixed(t.priceDecimals), cid),
-   549	      this.sleep,
-   550	    );
-   551	    log.info(`MEXC ${side} ${qty} ${t.symbol} @ ${px} id=${orderId}`);
-   552	    await this.sleep(1500);
-   553	
-   554	    const read = async (): Promise<Order> => {
-   555	      for (let i = 0; i < 3; i++) {
-   556	        try {
-   557	          return await this.d.mexc.getOrder(t.symbol, orderId);
-   558	        } catch (e) {
-   559	          log.warn(`getOrder retry: ${errMsg(e)}`);
-   560	          await this.sleep(1000);
-   561	        }
-   562	      }
-   563	      throw new Error(`UNKNOWN_ORDER_STATE ${orderId}`);
-   564	    };
-   565	    let o = await read();
-   566	    if (o.status !== 'FILLED') {
-   567	      try {
-   568	        o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
-   569	      } catch (e) {
-   570	        // The order may still fill later: its state is unknown, so no unwind may be based on it.
-   571	        if (e instanceof OrderStillOpenError) throw new Error(`UNKNOWN_ORDER_STATE ${e.message}`);
-   572	        throw e;
-   573	      }
-   574	    }
-   575	    return { orderId, filled: Number(o.executedQty) };
-   576	  }
-   577	
-   578	  private async recordPaper(c: Candidate) {
-   579	    const { token: t, opp } = c;
-   580	    this.record(c, 'paper', { pnl: opp.net, gas: opp.gasUsd });
-   581	    await this.d.tg.send(
-   582	      `📝 PAPER ${t.base} ${opp.direction}\nBuy @ ${opp.buyPrice.toPrecision(6)} | Sell @ ${opp.sellPrice.toPrecision(6)}\n` +
-   583	        `Qty ${opp.cexQty} | size ${usd(opp.sizeUsd)} | fee ${usd(opp.cexFeeUsd)} | gas ${usd(opp.gasUsd)}\nNet ${usd(opp.net)}`,
-   584	    );
-   585	    await this.handleRisk(this.d.risk.afterTrade('paper'));
-   586	  }
-   587	
-   588	  private record(
-   589	    c: Candidate,
-   590	    status: TradeStatus,
-   591	    r: { pnl: number; gas: number; dexTx?: string; orderId?: string | null; note?: string | null },
-   592	  ): number {
-   593	    const now = Date.now();
-   594	    return this.d.db.insertTrade({
-   595	      ts: now,
-   596	      day: dhakaDay(now),
-   597	      mode: this.cfg.mode,
-   598	      symbol: c.token.base,
-   599	      direction: c.opp.direction,
-   600	      size_usd: c.opp.sizeUsd,
-   601	      qty: c.opp.cexQty,
-   602	      buy_price: c.opp.buyPrice,
-   603	      sell_price: c.opp.sellPrice,
-   604	      expected_net: c.opp.net,
-   605	      cex_fee_usd: status === 'approval' ? 0 : c.opp.cexFeeUsd,
-   606	      gas_usd: r.gas,
-   607	      pnl_usd: r.pnl,
-   608	      status,
-   609	      dex_tx: r.dexTx ?? null,
-   610	      cex_order_id: r.orderId ?? null,
-   611	      note: r.note ?? null,
-   612	    });
-   613	  }
+   364	    let approvalCostWei = 0n;
+   365	    const skip = async (why: string) => {
+   366	      log.info(`${t.base} skip: ${why}`);
+   367	      if (approvalCostWei > 0n) {
+   368	        // The approval gas was really spent; book it so PnL and the loss limit stay honest.
+   369	        const g = (Number(approvalCostWei) / 1e18) * ethUsd;
+   370	        this.record(c, 'approval', { pnl: -g, gas: g, note: `approval, then skipped: ${why}` });
+   371	      }
+   372	    };
+   373	
+   374	    // 0) Worst case must fit in what is left of today's loss budget.
+   375	    const worst = (c.opp.sizeUsd * this.cfg.worstCaseLossPct) / 100 + c.opp.gasUsd;
+   376	    const budget = this.d.risk.remainingLossBudget();
+   377	    if (worst > budget) return skip(`worst case ${usd(worst)} > remaining daily loss budget ${usd(budget)}`);
+   378	
+   379	    // Snapshot BEFORE the approval, so approval gas is part of the measured PnL.
+   380	    const before = await this.d.balances(true);
+   381	
+   382	    // 1) Exact approval (never unlimited).
+   383	    if (c.approvalGas > 0n) {
+   384	      const r = await this.d.chain.approveExact(c.req.sellToken, c.spender, c.req.sellAmount, gas);
+   385	      approvalCostWei = r.gasCostWei;
+   386	      if (r.unknown) {
+   387	        const u = this.d.chain.unresolved;
+   388	        await skip('approval outcome unknown');
+   389	        await this.d.tg.send(
+   390	          `⚠️ ${t.base}: approval outcome UNKNOWN (nonce ${u?.nonce ?? '?'}, ${u?.hashes.join(', ') ?? r.hash}). No trade was made. ` +
+   391	            `New txs wait until it resolves; /cancelnonce replaces it.`,
+   392	        );
+   393	        return;
+   394	      }
+   395	      if (!r.ok) {
+   396	        await skip(`approval failed (${r.reason})`);
+   397	        await this.d.tg.send(`⚠️ Approval failed for ${t.base}: ${r.reason} ${r.hash ?? ''}`);
+   398	        return;
+   399	      }
+   400	    }
+   401	
+   402	    // 2) Firm quote + simulation (eth_call). Abort on any doubt.
+   403	    let firm: Quote;
+   404	    let gasEst: bigint;
+   405	    try {
+   406	      firm = await this.d.agg.quote(c.req);
+   407	      if (!firm.tx) return skip('firm quote has no transaction');
+   408	      gasEst = await this.d.chain.simulate(firm.tx);
+   409	    } catch (e) {
+   410	      return skip(`simulation/quote failed: ${errMsg(e)}`);
+   411	    }
+   412	    const tx = firm.tx;
+   413	
+   414	    // 3) Re-evaluate with a fresh REST book, firm amounts and simulated gas.
+   415	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
+   416	    const g = gasUsd(gasEst, gas.effective, ethUsd);
+   417	    let opp: Opportunity | null;
+   418	    if (c.opp.direction === 'DEX_BUY') {
+   419	      opp = evaluateDexBuy({
+   420	        sizeUsd: c.opp.sizeUsd,
+   421	        tokensOut: toFloat(firm.buyAmount, t.decimals),
+   422	        tokensMin: toFloat(firm.minBuyAmount, t.decimals),
+   423	        bids: b.bids,
+   424	        qtyStep: t.qtyStep,
+   425	        gasUsd: g,
+   426	        costs: this.costs(),
+   427	      });
+   428	    } else {
+   429	      // Same quantity as quoted on the DEX, priced against the fresh MEXC book.
+   430	      const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.cfg.mexcTakerFee);
+   431	      opp = plan
+   432	        ? evaluateCexBuy({
+   433	            plan,
+   434	            usdcOut: toFloat(firm.buyAmount, USDC_DECIMALS),
+   435	            usdcMin: toFloat(firm.minBuyAmount, USDC_DECIMALS),
+   436	            gasUsd: g,
+   437	            costs: this.costs(),
+   438	          })
+   439	        : null;
+   440	    }
+   441	    const need = this.need(c.opp.sizeUsd);
+   442	    if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
+   443	    // MEXC symbol rules on the FINAL numbers, before anything is sent: a rejected MEXC leg after a sent DEX tx = one-sided.
+   444	    const side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
+   445	    const problem = orderProblem(t.rules, side, opp.cexQty, opp.cexLimitPrice) ?? bandProblem(t.rules, side, opp.cexLimitPrice, mid(b));
+   446	    if (problem) return skip(`MEXC would reject the order: ${problem}`);
+   447	
+   448	    // The CEX leg must never fire if the DEX tx cannot get the next valid nonce.
+   449	    if (this.d.chain.readyToSend) {
+   450	      const ready = await this.d.chain.readyToSend();
+   451	      if (!ready.ok) return skip(`DEX side not ready to send: ${ready.reason}`);
+   452	    }
+   453	
+   454	    // 4) Persist the trade as 'executing' BEFORE anything is sent: if the bot dies now, startup sees it.
+   455	    const cid = clientId('t');
+   456	    const tradeId = this.record({ ...c, opp }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
+   457	    this.currentTradeId = tradeId;
+   458	    this.d.db.appendCid(tradeId, cid);
+   459	
+   460	    // Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
+   461	    // the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
+   462	    log.info(`${t.base} EXECUTE ${opp.direction} size ${usd(opp.sizeUsd)} expected ${usd(opp.net)}`);
+   463	    const [cexR, dexR] = await Promise.allSettled([
+   464	      this.cexLeg(t, opp, cid),
+   465	      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash, nonce) =>
+   466	        this.d.db.updateTrade(tradeId, { dex_tx: hash, note: `client order id ${cid}; nonce ${nonce}` }),
+   467	      ),
+   468	    ]);
+   469	
+   470	    const dex: TxResult = dexR.status === 'fulfilled' ? dexR.value : { ok: false, gasCostWei: 0n, reason: errMsg(dexR.reason) };
+   471	    let cexFilled = 0;
+   472	    let orderId: string | null = null;
+   473	    let cexUnknown = false;
+   474	    if (cexR.status === 'fulfilled') {
+   475	      cexFilled = cexR.value.filled;
+   476	      orderId = cexR.value.orderId;
+   477	    } else if (String((cexR.reason as Error)?.message ?? '').startsWith('UNKNOWN_ORDER_STATE')) {
+   478	      cexUnknown = true;
+   479	      this.d.risk.pause('MEXC order state unknown', true);
+   480	      await this.d.tg.send(`🚨 ${t.base}: MEXC order state unknown after placing. Trading PAUSED. Check MEXC manually.\n${errMsg(cexR.reason)}`);
+   481	    } else {
+   482	      log.warn(`${t.base} MEXC leg failed: ${errMsg(cexR.reason)}`);
+   483	    }
+   484	
+   485	    // 5) One-sided? Close the open position at market right away.
+   486	    let status: TradeStatus = 'ok';
+   487	    const notes: string[] = [];
+   488	    if (!dex.ok) notes.push(`DEX: ${dex.reason}`);
+   489	    if (dex.unknown) {
+   490	      // We cannot tell if the swap executed. Unwinding could DOUBLE the position. Stop and ask a human.
+   491	      this.d.risk.pause(`DEX tx unknown ${dex.hash}`, true);
+   492	      await this.d.tg.send(
+   493	        `🚨 ${t.base}: DEX tx ${dex.hash} outcome UNKNOWN (not mined, cancel not confirmed). MEXC filled ${cexFilled}/${opp.cexQty}.\n` +
+   494	          `NOT unwinding automatically. Trading PAUSED.\nDo NOT hedge by hand until the nonce is consumed - the bot will alert you. (/cancelnonce replaces it.)`,
+   495	      );
+   496	    }
+   497	    const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.cfg.mexcTakerFee, t.qtyStep);
+   498	    if (cexUnknown || dex.unknown) {
+   499	      status = 'one_sided';
+   500	      notes.push('pnl unknown'); // the measured balance change may not include the final outcome yet
+   501	    } else if (unwind) {
+   502	      status = 'one_sided';
+   503	      const qty = unwind.qty.toFixed(decimalsOfStep(t.qtyStep));
+   504	      try {
+   505	        const r = await this.closeAtMarket(t, unwind.side, qty);
+   506	        if (r.dust) {
+   507	          notes.push(`unwind ${unwind.side} ${qty} not sent: ${r.dust}`);
+   508	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base}: leftover ${unwind.side} ${qty} is below MEXC minimums (${r.dust}). Left as dust; fix inventory by hand.`);
+   509	        } else {
+   510	          notes.push(`unwind ${unwind.side} ${qty} (${r.orderId}, filled ${r.filled})`);
+   511	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base} ${opp.direction}\n${unwind.reason}\nClosed: MEXC ${unwind.side} ${r.filled} ${t.base}`);
+   512	        }
+   513	      } catch (e) {
+   514	        const remaining = e instanceof PartialCloseError ? e.remaining : Number(qty);
+   515	        if (e instanceof OrderStillOpenError) notes.push(`close order ${e.orderId} may still be live on MEXC: cancel it by hand`);
+   516	        this.d.risk.pause(`unwind failed for ${t.base}`, true);
+   517	        notes.push(`UNWIND FAILED: ${errMsg(e)}`);
+   518	        await this.d.tg.send(
+   519	          `🚨 ONE-SIDED FILL ${t.base} and the market close FAILED: ${errMsg(e)}\n` +
+   520	            `Still open: MEXC ${unwind.side} ${remaining} ${t.base} needed.\nTrading PAUSED. Close it manually, then /start confirm.`,
+   521	        );
+   522	      }
+   523	    } else if (!dex.ok) {
+   524	      status = 'dex_failed'; // nothing filled on either side
+   525	    }
+   526	
+   527	    // 6) Exact PnL = change in total value of everything the trade touched, at pre-trade prices.
+   528	    //    Orders are closed (filled/cancelled) by now; free + locked balances avoid counting held funds as lost.
+   529	    const { balances: after, stable } = await this.stableBalances(t, c.tokenUsd, ethUsd);
+   530	    if (!stable) notes.push('pnl approximate (balances still changing after 15 s)');
+   531	    const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd) - portfolioUsd(before, t, c.tokenUsd, ethUsd);
+   532	    const gasPaid = (Number(dex.gasCostWei + approvalCostWei) / 1e18) * ethUsd;
+   533	    this.d.db.updateTrade(tradeId, {
+   534	      status,
+   535	      pnl_usd: pnl,
+   536	      gas_usd: gasPaid,
+   537	      dex_tx: dex.hash ?? null,
+   538	      cex_order_id: orderId ?? cid,
+   539	      note: [`client order id ${cid}`, ...notes].join('; '),
+   540	    });
+   541	
+   542	    const dexIsBuy = opp.direction === 'DEX_BUY';
+   543	    await this.d.tg.send(
+   544	      [
+   545	        `${status === 'ok' ? '✅' : '⚠️'} LIVE ${t.base} ${opp.direction} [${status}]`,
+   546	        `Buy  ${dexIsBuy ? 'DEX ' : 'MEXC'} @ ${opp.buyPrice.toPrecision(6)}`,
+   547	        `Sell ${dexIsBuy ? 'MEXC' : 'DEX '} @ ${opp.sellPrice.toPrecision(6)}`,
+   548	        `Qty ${opp.cexQty} ${t.base} | size ${usd(opp.sizeUsd)}`,
+   549	        `MEXC fee ${usd(opp.cexFeeUsd)} | Gas ${usd(gasPaid)}`,
+   550	        `Expected ${usd(opp.net)} | Net PnL ${usd(pnl)}`,
+   551	        dex.hash ? `https://etherscan.io/tx/${dex.hash}` : '',
+   552	        notes.length ? `Notes: ${notes.join('; ')}` : '',
+   553	      ]
+   554	        .filter(Boolean)
+   555	        .join('\n'),
+   556	    );
+   557	    this.currentTradeId = null;
+   558	    await this.handleRisk(this.d.risk.afterTrade(status));
+   559	  }
+   560	
+   561	  /** Read balances until two reads in a row give the same value (settled), for at most ~15 s. */
+   562	  private async stableBalances(t: Token, tokenUsd: number, ethUsd: number): Promise<{ balances: Balances; stable: boolean }> {
+   563	    let prev = await this.d.balances(true);
+   564	    for (let i = 0; i < 6; i++) {
+   565	      await this.sleep(2500);
+   566	      const cur = await this.d.balances(true);
+   567	      if (Math.abs(portfolioUsd(cur, t, tokenUsd, ethUsd) - portfolioUsd(prev, t, tokenUsd, ethUsd)) < 1e-6) return { balances: cur, stable: true };
+   568	      prev = cur;
+   569	    }
+   570	    return { balances: prev, stable: false };
+   571	  }
+   572	
+   573	  /**
+   574	   * Close a position on MEXC now with an aggressive LIMIT 2% through the book, for BOTH sides.
+   575	   * (No MEXC spot symbol offers IMMEDIATE_OR_CANCEL, and some have no MARKET; LIMIT works everywhere.)
+   576	   * Reads the order back and never assumes it filled. Below MEXC minimums -> returns `dust`, sends nothing.
+   577	   */
+   578	  async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number; dust?: string }> {
+   579	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
+   580	    // 2% through the book, but inside the symbol's PERCENT_PRICE_BY_SIDE band (some are 0.5% - 2%).
+   581	    const pxNum = closePrice({ ...t.rules, priceDecimals: t.priceDecimals }, side, { bid: b.bids[0][0], ask: b.asks[0][0] });
+   582	    const dust = orderProblem(t.rules, side, Number(qty), pxNum);
+   583	    if (dust) return { orderId: '', filled: 0, dust };
+   584	    const px = pxNum.toFixed(t.priceDecimals);
+   585	    const cid = clientId('c');
+   586	    if (this.currentTradeId !== null) this.d.db.appendCid(this.currentTradeId, cid); // before placing (crash safety)
+   587	    const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, side, qty, px, cid), this.sleep);
+   588	    await this.sleep(1500);
+   589	    let o = await this.d.mexc.getOrder(t.symbol, orderId);
+   590	    if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
+   591	    const filled = Number(o.executedQty);
+   592	    if (filled < Number(qty) * 0.999) {
+   593	      const remaining = Number((Number(qty) - filled).toFixed(decimalsOfStep(t.qtyStep)));
+   594	      throw new PartialCloseError(`close ${side} only filled ${filled}/${qty}, ${remaining} remaining`, remaining);
+   595	    }
+   596	    return { orderId, filled };
+   597	  }
+   598	
+   599	  /** MEXC marketable limit order; cancels any unfilled rest. Returns filled quantity. */
+   600	  async cexLeg(t: Token, opp: Opportunity, cid = clientId('t')): Promise<{ orderId: string; filled: number }> {
+   601	    const side: Side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
+   602	    const qty = opp.cexQty.toFixed(decimalsOfStep(t.qtyStep));
+   603	    const f = 10 ** t.priceDecimals;
+   604	    const px = side === 'SELL' ? Math.floor(opp.cexLimitPrice * f) / f : Math.ceil(opp.cexLimitPrice * f) / f;
+   605	    const { orderId } = await placeSafely(
+   606	      this.d.mexc,
+   607	      t.symbol,
+   608	      cid,
+   609	      () => this.d.mexc.limitOrder(t.symbol, side, qty, px.toFixed(t.priceDecimals), cid),
+   610	      this.sleep,
+   611	    );
+   612	    log.info(`MEXC ${side} ${qty} ${t.symbol} @ ${px} id=${orderId}`);
+   613	    await this.sleep(1500);
    614	
-   615	  private async handleRisk(events: RiskEvent[]) {
-   616	    for (const e of events) {
-   617	      if (e.kind === 'loss_limit') await this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). Trading STOPPED. Send /start to resume.`);
-   618	      if (e.kind === 'fail_streak') await this.d.tg.send(`🛑 ${e.count} failed trades in a row. Trading PAUSED. Check logs, then /start.`);
-   619	      if (e.kind === 'trade_limit') await this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}). Resumes tomorrow (Dhaka time).`);
-   620	    }
-   621	  }
-   622	}
+   615	    const read = async (): Promise<Order> => {
+   616	      for (let i = 0; i < 3; i++) {
+   617	        try {
+   618	          return await this.d.mexc.getOrder(t.symbol, orderId);
+   619	        } catch (e) {
+   620	          log.warn(`getOrder retry: ${errMsg(e)}`);
+   621	          await this.sleep(1000);
+   622	        }
+   623	      }
+   624	      throw new Error(`UNKNOWN_ORDER_STATE ${orderId}`);
+   625	    };
+   626	    let o = await read();
+   627	    if (o.status !== 'FILLED') {
+   628	      try {
+   629	        o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
+   630	      } catch (e) {
+   631	        // The order may still fill later: its state is unknown, so no unwind may be based on it.
+   632	        if (e instanceof OrderStillOpenError) throw new Error(`UNKNOWN_ORDER_STATE ${e.message}`);
+   633	        throw e;
+   634	      }
+   635	    }
+   636	    return { orderId, filled: Number(o.executedQty) };
+   637	  }
+   638	
+   639	  private async recordPaper(c: Candidate) {
+   640	    const { token: t, opp } = c;
+   641	    this.record(c, 'paper', { pnl: opp.net, gas: opp.gasUsd });
+   642	    await this.d.tg.send(
+   643	      `📝 PAPER ${t.base} ${opp.direction}\nBuy @ ${opp.buyPrice.toPrecision(6)} | Sell @ ${opp.sellPrice.toPrecision(6)}\n` +
+   644	        `Qty ${opp.cexQty} | size ${usd(opp.sizeUsd)} | fee ${usd(opp.cexFeeUsd)} | gas ${usd(opp.gasUsd)}\nNet ${usd(opp.net)}`,
+   645	    );
+   646	    await this.handleRisk(this.d.risk.afterTrade('paper'));
+   647	  }
+   648	
+   649	  private record(
+   650	    c: Candidate,
+   651	    status: TradeStatus,
+   652	    r: { pnl: number; gas: number; dexTx?: string; orderId?: string | null; note?: string | null },
+   653	  ): number {
+   654	    const now = Date.now();
+   655	    return this.d.db.insertTrade({
+   656	      ts: now,
+   657	      day: dhakaDay(now),
+   658	      mode: this.cfg.mode,
+   659	      symbol: c.token.base,
+   660	      direction: c.opp.direction,
+   661	      size_usd: c.opp.sizeUsd,
+   662	      qty: c.opp.cexQty,
+   663	      buy_price: c.opp.buyPrice,
+   664	      sell_price: c.opp.sellPrice,
+   665	      expected_net: c.opp.net,
+   666	      cex_fee_usd: status === 'approval' ? 0 : c.opp.cexFeeUsd,
+   667	      gas_usd: r.gas,
+   668	      pnl_usd: r.pnl,
+   669	      status,
+   670	      dex_tx: r.dexTx ?? null,
+   671	      cex_order_id: r.orderId ?? null,
+   672	      note: r.note ?? null,
+   673	    });
+   674	  }
+   675	
+   676	  private async handleRisk(events: RiskEvent[]) {
+   677	    for (const e of events) {
+   678	      if (e.kind === 'loss_limit') await this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). Trading STOPPED. Send /start to resume.`);
+   679	      if (e.kind === 'fail_streak') await this.d.tg.send(`🛑 ${e.count} failed trades in a row. Trading PAUSED. Check logs, then /start.`);
+   680	      if (e.kind === 'trade_limit') await this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}). Resumes tomorrow (Dhaka time).`);
+   681	    }
+   682	  }
+   683	}
 ```
 
 ## `src/inventory.ts`
@@ -1319,368 +1530,352 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     15	import { TransferEngine } from './transfer.js';
     16	import { formatReport } from './summary.js';
     17	import { recoverExecuting } from './recovery.js';
-    18	import { dhakaDay, dhakaHourMinute, usd } from './util.js';
-    19	
-    20	const cfg = validateConfig(loadConfig());
-    21	registerSecrets(secretsOf(cfg));
-    22	
-    23	/** Backoff after HTTP 429/418 from any API: skip scans for 1, 2, 4 ... up to 15 minutes. */
-    24	const rateLimit = { until: 0, level: 0 };
-    25	function onScanError(e: unknown): boolean {
-    26	  if (e instanceof RateLimitError || /\b(429|418)\b/.test(errMsg(e))) {
-    27	    const wait = Math.min(15 * 60_000, 60_000 * 2 ** rateLimit.level++);
-    28	    rateLimit.until = Date.now() + wait;
-    29	    log.warn(`rate limited, pausing scans for ${wait / 60_000} min`);
-    30	    return true;
-    31	  }
-    32	  return false;
-    33	}
-    34	function rateLimited(): boolean {
-    35	  if (Date.now() < rateLimit.until) return true;
-    36	  return false;
-    37	}
-    38	function rateLimitOk() {
-    39	  rateLimit.level = 0;
-    40	}
-    41	
-    42	/** Set by shutdown: loops stop starting new ticks. */
-    43	export const lifecycle = { stopping: false, busy: false };
-    44	
-    45	/**
-    46	 * Crash handlers: exit (pm2 restarts) only on real crashes; a stray rejected promise is logged and alerted.
-    47	 * On SIGINT/SIGTERM/crash: stop new ticks and wait for a running trade to finish (up to TX_TIMEOUT_SEC*2+30s).
-    48	 */
-    49	function installProcessHandlers(tg: Telegram, cleanup: () => void) {
-    50	  let shuttingDown = false;
-    51	  const shutdown = async (why: string, code: number) => {
-    52	    if (shuttingDown) return;
-    53	    shuttingDown = true;
-    54	    lifecycle.stopping = true;
-    55	    const deadline = Date.now() + (cfg.txTimeoutSec * 2 + 30) * 1000;
-    56	    if (lifecycle.busy) log.info('shutdown: waiting for the running trade to finish');
-    57	    while (lifecycle.busy && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
-    58	    await tg.send(`🔌 Bot stopped: ${why}${lifecycle.busy ? ' (a trade was still running: check /status after restart)' : ''}`);
-    59	    cleanup();
-    60	    tg.stop();
-    61	    process.exit(code);
-    62	  };
-    63	  let lastRejectAlert = 0;
-    64	  process.on('SIGINT', () => void shutdown('SIGINT', 0));
-    65	  process.on('SIGTERM', () => void shutdown('SIGTERM', 0));
-    66	  process.on('unhandledRejection', (e) => {
-    67	    log.error(`unhandled rejection: ${errMsg(e)}`);
-    68	    if (Date.now() - lastRejectAlert > 3600_000) {
-    69	      lastRejectAlert = Date.now();
-    70	      void tg.send(`❗ Unhandled error (bot keeps running): ${errMsg(e)}`);
-    71	    }
-    72	  });
-    73	  process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
-    74	}
-    75	
-    76	/**
-    77	 * /start handler shared by both strategies: critical pauses need "/start confirm", and even then
-    78	 * the bot re-checks that nothing is still unresolved (pending DEX tx, executing trade) before resuming.
-    79	 */
-    80	function startHandler(risk: Risk, statusText: () => Promise<string>, stillUnresolved: () => Promise<string | null>) {
-    81	  return async (args: string[]) => {
-    82	    const confirm = args[0]?.toLowerCase() === 'confirm';
-    83	    if (risk.paused && risk.critical && !confirm) {
-    84	      return `⚠️ Critical pause: ${risk.pauseReason}\nCheck these positions and balances first:\n\n${await statusText()}\n\nThen send: /start confirm`;
-    85	    }
-    86	    if (risk.paused && risk.critical) {
-    87	      const open = await stillUnresolved();
-    88	      if (open) return `⛔ Not resuming: ${open}\nResolve it first (check etherscan / MEXC), then /start confirm again.`;
-    89	    }
-    90	    risk.resume(confirm);
-    91	    const block = risk.blockReason();
-    92	    return block ? `Resumed, but still blocked: ${block}` : '▶️ Trading resumed.';
-    93	  };
-    94	}
-    95	
-    96	/** What still blocks a critical resume, or null. */
-    97	function makeUnresolvedCheck(db: Db, chain: Chain) {
-    98	  return async (): Promise<string | null> => {
-    99	    const u = await chain.checkUnresolved();
-   100	    if (u.state === 'pending') return `DEX tx ${chain.unresolved?.hashes.join(' / ')} (nonce ${chain.unresolved?.nonce}) is still pending`;
-   101	    const ex = db.executingTrades();
-   102	    if (ex.length) return `${ex.length} trade(s) still marked executing (#${ex.map((t) => t.id).join(', #')})`;
-   103	    return null;
-   104	  };
-   105	}
-   106	
-   107	/** Refuse to trade live if .env is readable by other users. */
-   108	function checkEnvPermissions(path: string) {
-   109	  if (!fs.existsSync(path)) return log.warn(`${path} not found; make sure secrets come from a protected place`);
-   110	  const mode = fs.statSync(path).mode & 0o777;
-   111	  if (mode & 0o077) throw new Error(`${path} has permissions ${mode.toString(8)}; run: chmod 600 ${path}`);
-   112	}
-   113	
-   114	async function main() {
-   115	  if (cfg.mode === 'live') checkEnvPermissions(cfg.envPath);
-   116	
-   117	  const db = new Db(cfg.dbPath);
-   118	  const risk = new Risk(db, cfg.mode, cfg);
-   119	  const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, {
-   120	    get: () => db.getState('telegram_offset'),
-   121	    set: (v) => db.setState('telegram_offset', v),
-   122	  });
-   123	  if (!tg.enabled) log.warn('Telegram not configured: alerts only go to the log and there is no /stop');
-   124	  const mexc = new MexcRest(cfg.mexcApiKey, cfg.mexcApiSecret);
-   125	  const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei, {
-   126	    get: () => db.getState('unresolved_tx') || undefined,
-   127	    set: (v) => db.setState('unresolved_tx', v ?? ''),
-   128	  });
-   129	  const agg: Aggregator = cfg.aggregator === '0x' ? new ZeroEx(cfg.zeroExApiKey) : new OneInch(cfg.oneInchApiKey);
-   130	
-   131	  // --- Pre-flight checks: fail at startup, not in the middle of the first trade ---
-   132	  const chainId = BigInt(await chain.provider.send('eth_chainId', []));
-   133	  if (chainId !== 1n) throw new Error(`RPC_URL is chain ${chainId}, expected Ethereum mainnet (1)`);
-   134	  if (!cfg.mexcApiKey || !cfg.mexcApiSecret) {
-   135	    // Coin/network info (contract addresses, deposit/withdraw status) is a signed MEXC endpoint.
-   136	    throw new Error('MEXC_API_KEY/SECRET are required even in paper mode (a read-only key is enough for paper)');
-   137	  }
-   138	  const skew = await mexc.syncTime();
-   139	  if (Math.abs(skew) > 1000) log.warn(`VPS clock is ${skew} ms off MEXC time; corrected, but enable NTP (timedatectl set-ntp true)`);
-   140	  // Aggregator key and route smoke test: quote 100 USDC -> WETH.
-   141	  await agg.price({
-   142	    sellToken: cfg.usdc,
-   143	    buyToken: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
-   144	    sellAmount: 100_000_000n,
-   145	    taker: chain.wallet?.address ?? '0x000000000000000000000000000000000000dEaD',
-   146	    slippageBps: cfg.dexSlippageBps,
-   147	  });
-   148	  if (cfg.mode === 'live') {
-   149	    if (!tg.enabled) throw new Error('Live mode needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (kill switch)');
-   150	    if (!cfg.telegramAdminId) throw new Error('Live mode needs TELEGRAM_ADMIN_ID (only this user may send /stop /start)');
-   151	    const acc = await mexc.account();
-   152	    if (!acc.canTrade) throw new Error('MEXC API key cannot trade');
-   153	    const eth = Number(await chain.ethBalance()) / 1e18;
-   154	    if (eth < cfg.minEthForGas) throw new Error(`Hot wallet has ${eth} ETH, need at least MIN_ETH_FOR_GAS=${cfg.minEthForGas}`);
-   155	    const usdt = Number(acc.balances.find((b) => b.asset === 'USDT')?.free ?? 0);
-   156	    log.info(`wallet ${chain.address}: ${eth.toFixed(4)} ETH | MEXC USDT ${usdt.toFixed(2)}`);
-   157	    if (usdt < cfg.minTradeUsd) log.warn(`MEXC USDT ${usdt} < MIN_TRADE_USD: MEXC buys are blocked until you deposit`);
-   158	    if (cfg.strategy === 'transfer') {
-   159	      await tg.send(
-   160	        `🔐 Reminder: STRATEGY=transfer uses MEXC withdrawals. Make sure the API key is IP-bound to this VPS and the MEXC ` +
-   161	          `withdrawal address whitelist contains ONLY ${chain.address}.`,
-   162	      );
-   163	    }
-   164	  }
-   165	
-   166	  if (cfg.mode === 'live') await recoverExecuting(db, risk, tg, mexc, (h) => chain.provider.getTransactionReceipt(h), () => chain.checkUnresolved());
-   167	  // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
-   168	  setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
-   169	
-   170	  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg);
-   171	
-   172	  const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
-   173	    only: cfg.watchlist,
-   174	    max: cfg.watchlistMax,
-   175	    minTvlUsd: cfg.minDexTvlUsd,
-   176	    minVolumeUsd: cfg.minMexcVolumeUsd,
-   177	  });
-   178	  if (tokens.length === 0) throw new Error('Watchlist is empty: no token passed the filters');
-   179	  log.info(`watchlist: ${tokens.map((t) => `${t.base}(${t.address.slice(0, 8)}…, tvl $${Math.round(t.dexTvlUsd / 1000)}k)`).join(', ')}`);
-   180	
-   181	  const stream = new MexcBookStream(['ETHUSDT', ...tokens.map((t) => t.symbol)]);
-   182	  stream.start();
-   183	  const book = async (symbol: string) => stream.get(symbol) ?? mexc.depth(symbol, 20);
-   184	  const balances =
-   185	    cfg.mode === 'live' ? (total?: boolean) => snapshot(chain, mexc, cfg.usdc, tokens, total) : async () => paperBalances(tokens);
-   186	
-   187	  const freshBook = (symbol: string) => mexc.depth(symbol, 20);
-   188	  const engine = new Engine({ cfg, mexc, chain, agg, db, risk, tg, book, freshBook, balances, tokens });
-   189	
-   190	  // --- Telegram commands ---
-   191	  const statusText = async () => {
-   192	    const t = risk.today();
-   193	    const lines = [
-   194	      `MODE=${cfg.mode} | ${risk.paused ? `⏸ PAUSED (${risk.pauseReason})` : '▶️ running'}`,
-   195	      `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
-   196	      `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, max gas ${cfg.maxGasGwei} gwei (now ${engine.lastGasGwei.toFixed(1)})`,
-   197	      `Fail streak: ${risk.consecutiveFails}/${cfg.maxConsecutiveFails}`,
-   198	    ];
-   199	    if (cfg.mode === 'live') {
-   200	      try {
-   201	        const b = await balances();
-   202	        lines.push(`Wallet: ${b.walletEth.toFixed(4)} ETH, ${usd(b.walletUsdc)} USDC | MEXC: ${usd(b.mexc.USDT ?? 0)} USDT`);
-   203	        for (const tk of tokens) {
-   204	          lines.push(`  ${tk.base}: wallet ${(b.walletToken[tk.base] ?? 0).toFixed(4)} | MEXC ${(b.mexc[tk.base] ?? 0).toFixed(4)}${tk.depositOk && tk.withdrawOk ? '' : ' (suspended)'}`);
-   205	        }
-   206	      } catch (e) {
-   207	        lines.push(`Inventory error: ${errMsg(e)}`);
-   208	      }
-   209	    }
-   210	    return lines.join('\n');
-   211	  };
-   212	  void tg.startPolling({
-   213	    '/stop': () => {
-   214	      risk.pause('Telegram /stop');
-   215	      return '🛑 Trading STOPPED. Send /start to resume.';
-   216	    },
-   217	    '/start': startHandler(risk, statusText, makeUnresolvedCheck(db, chain)),
-   218	    '/status': statusText,
-   219	  });
-   220	
-   221	  // --- Main loop: one scan per block ---
-   222	  let busy = false;
-   223	  let errors = 0;
-   224	  let lastTick = Date.now();
-   225	  let lastStallAlert = 0;
-   226	  const runTick = async () => {
-   227	    if (busy || rateLimited() || lifecycle.stopping) return;
-   228	    lastTick = Date.now();
-   229	    busy = lifecycle.busy = true;
-   230	    try {
-   231	      await engine.tick();
-   232	      errors = 0;
-   233	      rateLimitOk();
-   234	    } catch (e) {
-   235	      if (onScanError(e)) return;
-   236	      errors++;
-   237	      log.error(`tick: ${errMsg(e)}`);
-   238	      if (errors >= 5) await engine.alertThrottled('tick-errors', `❗ Bot errors (${errors} in a row): ${errMsg(e)}`, 3600_000);
-   239	    } finally {
-   240	      busy = lifecycle.busy = false;
-   241	    }
-   242	  };
-   243	  chain.provider.on('block', runTick);
-   244	  // Watchdog: if the RPC stops emitting blocks, still scan on a timer, and alert once per hour.
-   245	  setInterval(() => {
-   246	    const idle = Date.now() - lastTick;
-   247	    if (idle > 30_000) void runTick();
-   248	    if (idle > 3 * 60_000 && Date.now() - lastStallAlert > 3600_000) {
-   249	      lastStallAlert = Date.now();
-   250	      void tg.send(`⚠️ No new Ethereum block from RPC for ${Math.round(idle / 60_000)} min: scanning on a timer. Check RPC_URL.`);
-   251	    }
-   252	  }, 15_000);
-   253	
-   254	  // MEXC deposit/withdraw status every 10 minutes.
-   255	  setInterval(async () => {
-   256	    try {
-   257	      const changed = await refreshStatus(mexc, tokens);
-   258	      if (changed.length) await tg.send(`ℹ️ MEXC network status changed:\n${changed.join('\n')}`);
-   259	    } catch (e) {
-   260	      log.warn(`status refresh: ${errMsg(e)}`);
-   261	    }
-   262	  }, 10 * 60_000);
-   263	
-   264	  // Daily summary at 23:00 Bangladesh time.
-   265	  setInterval(async () => {
-   266	    const { hour } = dhakaHourMinute();
-   267	    const today = dhakaDay();
-   268	    if (hour === 23 && db.getState('last_summary_day') !== today) {
-   269	      db.setState('last_summary_day', today);
-   270	      await tg.send(formatReport(db, cfg.mode, 24, `📊 Daily summary ${today}`));
-   271	    }
-   272	  }, 30_000);
-   273	
-   274	  installProcessHandlers(tg, () => stream.stop());
-   275	
-   276	  await tg.send(
-   277	    `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} via ${agg.name}\nTokens: ${tokens.map((t) => t.base).join(', ')}\n` +
-   278	      (risk.paused ? `⏸ Still paused: ${risk.pauseReason} (send /start)` : '▶️ Trading enabled'),
-   279	  );
-   280	}
+    18	import { makeUnresolvedCheck, resolveTrade, startHandler, unresolvedLines } from './commands.js';
+    19	import { dhakaDay, dhakaHourMinute, usd } from './util.js';
+    20	
+    21	const cfg = validateConfig(loadConfig());
+    22	registerSecrets(secretsOf(cfg));
+    23	
+    24	/** Backoff after HTTP 429/418 from any API: skip scans for 1, 2, 4 ... up to 15 minutes. */
+    25	const rateLimit = { until: 0, level: 0 };
+    26	function onScanError(e: unknown): boolean {
+    27	  if (e instanceof RateLimitError || /\b(429|418)\b/.test(errMsg(e))) {
+    28	    const retryAfter = e instanceof RateLimitError ? e.retryAfterSec * 1000 : 0;
+    29	    const wait = Math.max(retryAfter, Math.min(15 * 60_000, 60_000 * 2 ** rateLimit.level++));
+    30	    rateLimit.until = Date.now() + wait;
+    31	    log.warn(`rate limited, pausing scans for ${wait / 60_000} min`);
+    32	    return true;
+    33	  }
+    34	  return false;
+    35	}
+    36	function rateLimited(): boolean {
+    37	  if (Date.now() < rateLimit.until) return true;
+    38	  return false;
+    39	}
+    40	function rateLimitOk() {
+    41	  rateLimit.level = 0;
+    42	}
+    43	
+    44	/** Set by shutdown: loops stop starting new ticks. */
+    45	export const lifecycle = { stopping: false, busy: false };
+    46	
+    47	/**
+    48	 * Crash handlers: exit (pm2 restarts) only on real crashes; a stray rejected promise is logged and alerted.
+    49	 * On SIGINT/SIGTERM/crash: stop new ticks and wait for a running trade to finish (up to TX_TIMEOUT_SEC*2+30s).
+    50	 */
+    51	function installProcessHandlers(tg: Telegram, cleanup: () => void) {
+    52	  let shuttingDown = false;
+    53	  const shutdown = async (why: string, code: number) => {
+    54	    if (shuttingDown) return;
+    55	    shuttingDown = true;
+    56	    lifecycle.stopping = true;
+    57	    // pm2 sends SIGKILL after kill_timeout (ecosystem.config.cjs: 240 s; pm2's default is only 1.6 s).
+    58	    // A running trade can need ~2x TX_TIMEOUT_SEC (swap + cancel) plus lookups and an unwind, so wait for
+    59	    // TX_TIMEOUT_SEC*2 + 60 s. validateConfig caps TX_TIMEOUT_SEC at 80, so this always stays below 240 s.
+    60	    const deadline = Date.now() + cfg.txTimeoutSec * 2 * 1000 + 60_000;
+    61	    if (lifecycle.busy) log.info('shutdown: waiting for the running trade to finish');
+    62	    while (lifecycle.busy && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
+    63	    await tg.send(`🔌 Bot stopped: ${why}${lifecycle.busy ? ' (a trade was still running: check /status after restart)' : ''}`);
+    64	    cleanup();
+    65	    tg.stop();
+    66	    process.exit(code);
+    67	  };
+    68	  let lastRejectAlert = 0;
+    69	  process.on('SIGINT', () => void shutdown('SIGINT', 0));
+    70	  process.on('SIGTERM', () => void shutdown('SIGTERM', 0));
+    71	  process.on('unhandledRejection', (e) => {
+    72	    log.error(`unhandled rejection: ${errMsg(e)}`);
+    73	    if (Date.now() - lastRejectAlert > 3600_000) {
+    74	      lastRejectAlert = Date.now();
+    75	      void tg.send(`❗ Unhandled error (bot keeps running): ${errMsg(e)}`);
+    76	    }
+    77	  });
+    78	  process.on('uncaughtException', (e) => void shutdown(`crashed: ${errMsg(e)}`, 1));
+    79	}
+    80	
+    81	/** Refuse to trade live if .env is readable by other users. */
+    82	function checkEnvPermissions(path: string) {
+    83	  if (!fs.existsSync(path)) return log.warn(`${path} not found; make sure secrets come from a protected place`);
+    84	  const mode = fs.statSync(path).mode & 0o777;
+    85	  if (mode & 0o077) throw new Error(`${path} has permissions ${mode.toString(8)}; run: chmod 600 ${path}`);
+    86	}
+    87	
+    88	async function main() {
+    89	  if (cfg.mode === 'live') checkEnvPermissions(cfg.envPath);
+    90	
+    91	  const db = new Db(cfg.dbPath);
+    92	  const risk = new Risk(db, cfg.mode, cfg);
+    93	  const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, {
+    94	    get: () => db.getState('telegram_offset'),
+    95	    set: (v) => db.setState('telegram_offset', v),
+    96	  });
+    97	  if (!tg.enabled) log.warn('Telegram not configured: alerts only go to the log and there is no /stop');
+    98	  const mexc = new MexcRest(cfg.mexcApiKey, cfg.mexcApiSecret);
+    99	  const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei, {
+   100	    get: () => db.getState('unresolved_tx') || undefined,
+   101	    set: (v) => db.setState('unresolved_tx', v ?? ''),
+   102	  });
+   103	  const agg: Aggregator = cfg.aggregator === '0x' ? new ZeroEx(cfg.zeroExApiKey) : new OneInch(cfg.oneInchApiKey);
+   104	
+   105	  // --- Pre-flight checks: fail at startup, not in the middle of the first trade ---
+   106	  const chainId = BigInt(await chain.provider.send('eth_chainId', []));
+   107	  if (chainId !== 1n) throw new Error(`RPC_URL is chain ${chainId}, expected Ethereum mainnet (1)`);
+   108	  if (!cfg.mexcApiKey || !cfg.mexcApiSecret) {
+   109	    // Coin/network info (contract addresses, deposit/withdraw status) is a signed MEXC endpoint.
+   110	    throw new Error('MEXC_API_KEY/SECRET are required even in paper mode (a read-only key is enough for paper)');
+   111	  }
+   112	  const skew = await mexc.syncTime();
+   113	  if (Math.abs(skew) > 1000) log.warn(`VPS clock is ${skew} ms off MEXC time; corrected, but enable NTP (timedatectl set-ntp true)`);
+   114	  // Aggregator key and route smoke test: quote 100 USDC -> WETH.
+   115	  await agg.price({
+   116	    sellToken: cfg.usdc,
+   117	    buyToken: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+   118	    sellAmount: 100_000_000n,
+   119	    taker: chain.wallet?.address ?? '0x000000000000000000000000000000000000dEaD',
+   120	    slippageBps: cfg.dexSlippageBps,
+   121	  });
+   122	  if (cfg.mode === 'live') {
+   123	    if (!tg.enabled) throw new Error('Live mode needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (kill switch)');
+   124	    if (!cfg.telegramAdminId) throw new Error('Live mode needs TELEGRAM_ADMIN_ID (only this user may send /stop /start)');
+   125	    const acc = await mexc.account();
+   126	    if (!acc.canTrade) throw new Error('MEXC API key cannot trade');
+   127	    const eth = Number(await chain.ethBalance()) / 1e18;
+   128	    if (eth < cfg.minEthForGas) throw new Error(`Hot wallet has ${eth} ETH, need at least MIN_ETH_FOR_GAS=${cfg.minEthForGas}`);
+   129	    const usdt = Number(acc.balances.find((b) => b.asset === 'USDT')?.free ?? 0);
+   130	    log.info(`wallet ${chain.address}: ${eth.toFixed(4)} ETH | MEXC USDT ${usdt.toFixed(2)}`);
+   131	    if (usdt < cfg.minTradeUsd) log.warn(`MEXC USDT ${usdt} < MIN_TRADE_USD: MEXC buys are blocked until you deposit`);
+   132	    if (cfg.strategy === 'transfer') {
+   133	      await tg.send(
+   134	        `🔐 Reminder: STRATEGY=transfer uses MEXC withdrawals. Make sure the API key is IP-bound to this VPS and the MEXC ` +
+   135	          `withdrawal address whitelist contains ONLY ${chain.address}.`,
+   136	      );
+   137	    }
+   138	  }
+   139	
+   140	  if (cfg.mode === 'live') {
+   141	    // Symbols to sweep for open bot orders: the inventory watchlist (transfer orders use persisted ids).
+   142	    const symbols = cfg.strategy === 'inventory' && cfg.watchlist.length ? cfg.watchlist.map((b) => `${b}USDT`) : [];
+   143	    await recoverExecuting(db, risk, tg, mexc, (h) => chain.provider.getTransactionReceipt(h), () => chain.checkUnresolved(), { symbols });
+   144	  }
+   145	  // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
+   146	  setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
+   147	
+   148	  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg);
+   149	
+   150	  const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
+   151	    only: cfg.watchlist,
+   152	    max: cfg.watchlistMax,
+   153	    minTvlUsd: cfg.minDexTvlUsd,
+   154	    minVolumeUsd: cfg.minMexcVolumeUsd,
+   155	  });
+   156	  if (tokens.length === 0) throw new Error('Watchlist is empty: no token passed the filters');
+   157	  log.info(`watchlist: ${tokens.map((t) => `${t.base}(${t.address.slice(0, 8)}…, tvl $${Math.round(t.dexTvlUsd / 1000)}k)`).join(', ')}`);
+   158	
+   159	  const stream = new MexcBookStream(['ETHUSDT', ...tokens.map((t) => t.symbol)]);
+   160	  stream.start();
+   161	  const book = async (symbol: string) => stream.get(symbol) ?? mexc.depth(symbol, 20);
+   162	  const balances =
+   163	    cfg.mode === 'live' ? (total?: boolean) => snapshot(chain, mexc, cfg.usdc, tokens, total) : async () => paperBalances(tokens);
+   164	
+   165	  const freshBook = (symbol: string) => mexc.depth(symbol, 20);
+   166	  const engine = new Engine({ cfg, mexc, chain, agg, db, risk, tg, book, freshBook, balances, tokens });
+   167	
+   168	  // --- Telegram commands ---
+   169	  const statusText = async () => {
+   170	    const t = risk.today();
+   171	    const lines = [
+   172	      `MODE=${cfg.mode} | ${risk.paused ? `⏸ PAUSED (${risk.pauseReason})` : '▶️ running'}`,
+   173	      `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
+   174	      `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, max gas ${cfg.maxGasGwei} gwei (now ${engine.lastGasGwei.toFixed(1)})`,
+   175	      `Fail streak: ${risk.consecutiveFails}/${cfg.maxConsecutiveFails}`,
+   176	      ...unresolvedLines(db, chain),
+   177	    ];
+   178	    if (cfg.mode === 'live') {
+   179	      try {
+   180	        const b = await balances();
+   181	        lines.push(`Wallet: ${b.walletEth.toFixed(4)} ETH, ${usd(b.walletUsdc)} USDC | MEXC: ${usd(b.mexc.USDT ?? 0)} USDT`);
+   182	        for (const tk of tokens) {
+   183	          lines.push(`  ${tk.base}: wallet ${(b.walletToken[tk.base] ?? 0).toFixed(4)} | MEXC ${(b.mexc[tk.base] ?? 0).toFixed(4)}${tk.depositOk && tk.withdrawOk ? '' : ' (suspended)'}`);
+   184	        }
+   185	      } catch (e) {
+   186	        lines.push(`Inventory error: ${errMsg(e)}`);
+   187	      }
+   188	    }
+   189	    return lines.join('\n');
+   190	  };
+   191	  void tg.startPolling({
+   192	    '/stop': () => {
+   193	      risk.pause('Telegram /stop');
+   194	      return '🛑 Trading STOPPED. Send /start to resume.';
+   195	    },
+   196	    '/start': startHandler(risk, statusText, makeUnresolvedCheck(db, chain)),
+   197	    '/status': statusText,
+   198	    '/cancelnonce': () => chain.cancelNonce(),
+   199	    '/resolve': ([id, pnl]) => resolveTrade(db, id, pnl),
+   200	  });
+   201	
+   202	  // --- Main loop: one scan per block ---
+   203	  let busy = false;
+   204	  let errors = 0;
+   205	  let lastTick = Date.now();
+   206	  let lastStallAlert = 0;
+   207	  const runTick = async () => {
+   208	    if (busy || rateLimited() || lifecycle.stopping) return;
+   209	    lastTick = Date.now();
+   210	    busy = lifecycle.busy = true;
+   211	    try {
+   212	      await engine.tick();
+   213	      errors = 0;
+   214	      rateLimitOk();
+   215	    } catch (e) {
+   216	      if (onScanError(e)) return;
+   217	      errors++;
+   218	      log.error(`tick: ${errMsg(e)}`);
+   219	      if (errors >= 5) await engine.alertThrottled('tick-errors', `❗ Bot errors (${errors} in a row): ${errMsg(e)}`, 3600_000);
+   220	    } finally {
+   221	      busy = lifecycle.busy = false;
+   222	    }
+   223	  };
+   224	  chain.provider.on('block', runTick);
+   225	  // Watchdog: if the RPC stops emitting blocks, still scan on a timer, and alert once per hour.
+   226	  setInterval(() => {
+   227	    const idle = Date.now() - lastTick;
+   228	    if (idle > 30_000) void runTick();
+   229	    if (idle > 3 * 60_000 && Date.now() - lastStallAlert > 3600_000) {
+   230	      lastStallAlert = Date.now();
+   231	      void tg.send(`⚠️ No new Ethereum block from RPC for ${Math.round(idle / 60_000)} min: scanning on a timer. Check RPC_URL.`);
+   232	    }
+   233	  }, 15_000);
+   234	
+   235	  // MEXC deposit/withdraw status every 10 minutes.
+   236	  setInterval(async () => {
+   237	    try {
+   238	      const changed = await refreshStatus(mexc, tokens);
+   239	      if (changed.length) await tg.send(`ℹ️ MEXC network status changed:\n${changed.join('\n')}`);
+   240	    } catch (e) {
+   241	      log.warn(`status refresh: ${errMsg(e)}`);
+   242	    }
+   243	  }, 10 * 60_000);
+   244	
+   245	  // Daily summary at 23:00 Bangladesh time.
+   246	  setInterval(async () => {
+   247	    const { hour } = dhakaHourMinute();
+   248	    const today = dhakaDay();
+   249	    if (hour === 23 && db.getState('last_summary_day') !== today) {
+   250	      db.setState('last_summary_day', today);
+   251	      await tg.send(formatReport(db, cfg.mode, 24, `📊 Daily summary ${today}`));
+   252	    }
+   253	  }, 30_000);
+   254	
+   255	  installProcessHandlers(tg, () => stream.stop());
+   256	
+   257	  await tg.send(
+   258	    `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} via ${agg.name}\nTokens: ${tokens.map((t) => t.base).join(', ')}\n` +
+   259	      (risk.paused ? `⏸ Still paused: ${risk.pauseReason} (send /start)` : '▶️ Trading enabled'),
+   260	  );
+   261	}
+   262	
+   263	/** TRANSFER strategy: scan every MEXC ERC20 token, buy on MEXC, withdraw, sell on DEX. */
+   264	async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator) {
+   265	  const engine = new TransferEngine({ cfg, mexc, chain, agg, db, risk, tg });
+   266	  await engine.refreshUniverse(true);
+   267	  if (engine.universe.length === 0) throw new Error('No MEXC ERC20 token passed the filters');
+   268	
+   269	  void tg.startPolling({
+   270	    '/stop': () => {
+   271	      risk.pause('Telegram /stop');
+   272	      return '🛑 New trades STOPPED. An open transfer still finishes (selling the tokens already bought is the safe exit). /start to resume.';
+   273	    },
+   274	    '/start': async (args: string[]) => startHandler(risk, transferStatus, makeUnresolvedCheck(db, chain))(args),
+   275	    '/status': async () => transferStatus(),
+   276	    '/cancelnonce': () => chain.cancelNonce(),
+   277	    '/resolve': ([id, pnl]: string[]) => resolveTrade(db, id, pnl),
+   278	    '/sell': ([id]: string[]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
+   279	    '/clear': ([id]: string[]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
+   280	  });
    281	
-   282	/** TRANSFER strategy: scan every MEXC ERC20 token, buy on MEXC, withdraw, sell on DEX. */
-   283	async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator) {
-   284	  const engine = new TransferEngine({ cfg, mexc, chain, agg, db, risk, tg });
-   285	  await engine.refreshUniverse(true);
-   286	  if (engine.universe.length === 0) throw new Error('No MEXC ERC20 token passed the filters');
-   287	
-   288	  void tg.startPolling({
-   289	    '/stop': () => {
-   290	      risk.pause('Telegram /stop');
-   291	      return '🛑 New trades STOPPED. An open transfer still finishes (selling the tokens already bought is the safe exit). /start to resume.';
-   292	    },
-   293	    '/start': async (args: string[]) => startHandler(risk, transferStatus, makeUnresolvedCheck(db, chain))(args),
-   294	    '/status': async () => transferStatus(),
-   295	    '/sell': ([id]: string[]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
-   296	    '/clear': ([id]: string[]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
-   297	  });
-   298	
-   299	  async function transferStatus() {
-   300	    const t = risk.today();
-   301	    const open = db.openTransfers();
-   302	    const lines = [
-   303	      `MODE=${cfg.mode} STRATEGY=transfer | ${risk.paused ? `⏸ PAUSED (${risk.pauseReason})` : '▶️ running'}`,
-   304	      `Scanning ${engine.universe.length} MEXC ERC20 tokens every ${cfg.scanIntervalSec}s`,
-   305	      `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
-   306	      `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, gas ${engine.lastGasGwei.toFixed(1)}/${cfg.maxGasGwei} gwei`,
-   307	      `Top gaps: ${engine.lastTopGaps.map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ') || 'none'}`,
-   308	      open.length ? `Open: ${open.map((o) => `#${o.id} ${o.base} ${o.status}`).join(', ')}` : 'Open transfers: none',
-   309	    ];
-   310	    const stuck = db.stuckTransfers();
-   311	    if (stuck.length) lines.push(`🚨 Needs you: ${stuck.map((o) => `#${o.id} ${o.base} (${o.note ?? 'stuck'})`).join('; ')} -> /sell <id> or /clear <id>`);
-   312	    if (cfg.mode === 'live') {
-   313	      try {
-   314	        const b = await mexc.balances();
-   315	        const eth = await chain.ethBalance();
-   316	        const usdc = await chain.tokenBalance(cfg.usdc);
-   317	        lines.push(`MEXC ${usd(b.USDT ?? 0)} USDT | wallet ${(Number(eth) / 1e18).toFixed(4)} ETH, ${usd(Number(usdc) / 1e6)} USDC`);
-   318	      } catch (e) {
-   319	        lines.push(`Balance error: ${errMsg(e)}`);
-   320	      }
-   321	    }
-   322	    return lines.join('\n');
-   323	  }
-   324	
-   325	  let busy = false;
-   326	  let errors = 0;
-   327	  let lastLow = 0;
-   328	  const loop = async () => {
-   329	    if (busy || rateLimited() || lifecycle.stopping) return;
-   330	    busy = lifecycle.busy = true;
-   331	    try {
-   332	      await engine.tick();
-   333	      errors = 0;
-   334	      rateLimitOk();
-   335	      // MEXC USDT is spent by buys and comes back only when you move USDC from the wallet to MEXC.
-   336	      if (cfg.mode === 'live' && Date.now() - lastLow > 6 * 3600_000) {
-   337	        const usdt = (await mexc.balances()).USDT ?? 0;
-   338	        const eth = Number(await chain.ethBalance()) / 1e18;
-   339	        if (usdt < cfg.minTradeUsd || eth < cfg.minEthForGas) {
-   340	          lastLow = Date.now();
-   341	          await tg.send(`📦 Rebalance needed: MEXC USDT ${usd(usdt)}, wallet ETH ${eth.toFixed(4)}. Move USDC profits from the wallet back to MEXC.`);
-   342	        }
-   343	      }
-   344	    } catch (e) {
-   345	      if (onScanError(e)) return;
-   346	      errors++;
-   347	      log.error(`scan: ${errMsg(e)}`);
-   348	      if (errors === 5) await tg.send(`❗ Bot errors (5 in a row): ${errMsg(e)}`);
-   349	    } finally {
-   350	      busy = lifecycle.busy = false;
-   351	    }
-   352	  };
-   353	  setInterval(loop, cfg.scanIntervalSec * 1000);
-   354	  void loop();
-   355	
-   356	  setInterval(async () => {
-   357	    const today = dhakaDay();
-   358	    if (dhakaHourMinute().hour === 23 && db.getState('last_summary_day') !== today) {
-   359	      db.setState('last_summary_day', today);
-   360	      await tg.send(formatReport(db, cfg.mode, 24, `📊 Daily summary ${today}`));
-   361	    }
-   362	  }, 30_000);
-   363	
-   364	  installProcessHandlers(tg, () => {});
-   365	
-   366	  const open = db.openTransfers();
-   367	  await tg.send(
-   368	    `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} STRATEGY=transfer via ${agg.name}\n` +
-   369	      `Scanning ${engine.universe.length} MEXC ERC20 tokens (buy MEXC -> withdraw -> sell DEX)\n` +
-   370	      (open.length ? `Resuming ${open.length} open transfer(s)\n` : '') +
-   371	      (risk.paused ? `⏸ Still paused: ${risk.pauseReason} (send /start)` : '▶️ Trading enabled'),
-   372	  );
-   373	}
-   374	
-   375	main().catch(async (e) => {
-   376	  log.error(`startup failed: ${errMsg(e)}`);
-   377	  await new Telegram(cfg.telegramToken, cfg.telegramChatId).send(`❗ Bot failed to start: ${errMsg(e)}`);
-   378	  process.exit(1);
-   379	});
+   282	  async function transferStatus() {
+   283	    const t = risk.today();
+   284	    const open = db.openTransfers();
+   285	    const lines = [
+   286	      `MODE=${cfg.mode} STRATEGY=transfer | ${risk.paused ? `⏸ PAUSED (${risk.pauseReason})` : '▶️ running'}`,
+   287	      `Scanning ${engine.universe.length} MEXC ERC20 tokens every ${cfg.scanIntervalSec}s`,
+   288	      `Today (${dhakaDay()}): ${t.trades}/${cfg.maxTradesPerDay} trades, PnL ${usd(t.pnl)}, gas ${usd(t.gas)}, failed ${t.failed}`,
+   289	      `Limits: max trade ${usd(cfg.maxTradeUsd)}, daily loss ${usd(cfg.dailyLossLimitUsd)}, gas ${engine.lastGasGwei.toFixed(1)}/${cfg.maxGasGwei} gwei`,
+   290	      `Top gaps: ${engine.lastTopGaps.map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ') || 'none'}`,
+   291	      open.length ? `Open: ${open.map((o) => `#${o.id} ${o.base} ${o.status}`).join(', ')}` : 'Open transfers: none',
+   292	      ...unresolvedLines(db, chain),
+   293	    ];
+   294	    const stuck = db.stuckTransfers();
+   295	    if (stuck.length) lines.push(`🚨 Needs you: ${stuck.map((o) => `#${o.id} ${o.base} (${o.note ?? 'stuck'})`).join('; ')} -> /sell <id> or /clear <id>`);
+   296	    if (cfg.mode === 'live') {
+   297	      try {
+   298	        const b = await mexc.balances();
+   299	        const eth = await chain.ethBalance();
+   300	        const usdc = await chain.tokenBalance(cfg.usdc);
+   301	        lines.push(`MEXC ${usd(b.USDT ?? 0)} USDT | wallet ${(Number(eth) / 1e18).toFixed(4)} ETH, ${usd(Number(usdc) / 1e6)} USDC`);
+   302	      } catch (e) {
+   303	        lines.push(`Balance error: ${errMsg(e)}`);
+   304	      }
+   305	    }
+   306	    return lines.join('\n');
+   307	  }
+   308	
+   309	  let busy = false;
+   310	  let errors = 0;
+   311	  let lastLow = 0;
+   312	  const loop = async () => {
+   313	    if (busy || rateLimited() || lifecycle.stopping) return;
+   314	    busy = lifecycle.busy = true;
+   315	    try {
+   316	      await engine.tick();
+   317	      errors = 0;
+   318	      rateLimitOk();
+   319	      // MEXC USDT is spent by buys and comes back only when you move USDC from the wallet to MEXC.
+   320	      if (cfg.mode === 'live' && Date.now() - lastLow > 6 * 3600_000) {
+   321	        const usdt = (await mexc.balances()).USDT ?? 0;
+   322	        const eth = Number(await chain.ethBalance()) / 1e18;
+   323	        if (usdt < cfg.minTradeUsd || eth < cfg.minEthForGas) {
+   324	          lastLow = Date.now();
+   325	          await tg.send(`📦 Rebalance needed: MEXC USDT ${usd(usdt)}, wallet ETH ${eth.toFixed(4)}. Move USDC profits from the wallet back to MEXC.`);
+   326	        }
+   327	      }
+   328	    } catch (e) {
+   329	      if (onScanError(e)) return;
+   330	      errors++;
+   331	      log.error(`scan: ${errMsg(e)}`);
+   332	      if (errors === 5) await tg.send(`❗ Bot errors (5 in a row): ${errMsg(e)}`);
+   333	    } finally {
+   334	      busy = lifecycle.busy = false;
+   335	    }
+   336	  };
+   337	  setInterval(loop, cfg.scanIntervalSec * 1000);
+   338	  void loop();
+   339	
+   340	  setInterval(async () => {
+   341	    const today = dhakaDay();
+   342	    if (dhakaHourMinute().hour === 23 && db.getState('last_summary_day') !== today) {
+   343	      db.setState('last_summary_day', today);
+   344	      await tg.send(formatReport(db, cfg.mode, 24, `📊 Daily summary ${today}`));
+   345	    }
+   346	  }, 30_000);
+   347	
+   348	  installProcessHandlers(tg, () => {});
+   349	
+   350	  const open = db.openTransfers();
+   351	  await tg.send(
+   352	    `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} STRATEGY=transfer via ${agg.name}\n` +
+   353	      `Scanning ${engine.universe.length} MEXC ERC20 tokens (buy MEXC -> withdraw -> sell DEX)\n` +
+   354	      (open.length ? `Resuming ${open.length} open transfer(s)\n` : '') +
+   355	      (risk.paused ? `⏸ Still paused: ${risk.pauseReason} (send /start)` : '▶️ Trading enabled'),
+   356	  );
+   357	}
+   358	
+   359	main().catch(async (e) => {
+   360	  log.error(`startup failed: ${errMsg(e)}`);
+   361	  await new Telegram(cfg.telegramToken, cfg.telegramChatId).send(`❗ Bot failed to start: ${errMsg(e)}`);
+   362	  process.exit(1);
+   363	});
 ```
 
 ## `src/pricing.ts`
@@ -1916,72 +2111,122 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
      1	// Startup recovery after a crash/restart in the middle of a trade.
      2	import type { Db } from './db.js';
      3	import type { Risk } from './risk.js';
-     4	import type { MexcRest } from './mexc/rest.js';
+     4	import type { Order } from './mexc/rest.js';
      5	import type { Notifier } from './engine.js';
-     6	import { errMsg } from './log.js';
-     7	
-     8	/**
-     9	 * Startup recovery:
-    10	 *  - a trade row still 'executing' means the bot died mid-trade: look up the MEXC order (by our client id)
-    11	 *    and the DEX receipt. Both legs complete -> 'ok' (PnL could not be measured). Anything else -> 'one_sided'
-    12	 *    and a CRITICAL pause until a human sends /start confirm.
-    13	 *  - an unresolved DEX tx from before the restart (persisted) also keeps the bot in a critical pause.
-    14	 */
-    15	export async function recoverExecuting(
-    16	  db: Db,
-    17	  risk: Risk,
-    18	  tg: Notifier,
-    19	  mexc: Pick<MexcRest, 'getOrderByClientId'>,
-    20	  receipt: (hash: string) => Promise<{ status: number | null } | null>,
-    21	  checkUnresolved?: () => Promise<{ state: 'clear' | 'pending' }>,
-    22	) {
-    23	  const lines: string[] = [];
-    24	  let incomplete = 0;
-    25	
-    26	  for (const r of db.executingTrades()) {
-    27	    const cid = /client order id (\S+?)(;|$)/.exec(r.note ?? '')?.[1];
-    28	    let cex = 'MEXC order: unknown';
-    29	    let cexDone = false;
-    30	    if (cid) {
-    31	      try {
-    32	        const o = await mexc.getOrderByClientId(`${r.symbol}USDT`, cid);
-    33	        cex = o ? `MEXC order ${o.orderId}: ${o.status}, filled ${o.executedQty}` : 'MEXC order: never placed';
-    34	        cexDone = Boolean(o && Number(o.executedQty) >= r.qty * 0.999 && o.status === 'FILLED');
-    35	      } catch (e) {
-    36	        cex = `MEXC lookup failed: ${errMsg(e)}`;
-    37	      }
-    38	    }
-    39	    let dex = 'DEX tx: none signed';
-    40	    let dexDone = false;
-    41	    if (r.dex_tx) {
-    42	      const rc = await receipt(r.dex_tx).catch(() => null);
-    43	      dex = rc ? `DEX tx ${r.dex_tx}: ${rc.status === 1 ? 'SUCCESS' : 'REVERTED'}` : `DEX tx ${r.dex_tx}: NOT MINED (may still be pending)`;
-    44	      dexDone = rc?.status === 1;
-    45	    }
-    46	    const complete = cexDone && dexDone;
-    47	    if (!complete) incomplete++;
-    48	    db.updateTrade(r.id, {
-    49	      status: complete ? 'ok' : 'one_sided',
-    50	      note: `${r.note ?? ''}; recovered at startup: ${cex}; ${dex}${complete ? '; both legs done, PnL not measured' : ''}`,
-    51	    });
-    52	    lines.push(`${complete ? '✅' : '⚠️'} #${r.id} ${r.symbol} ${r.direction} qty ${r.qty}\n  ${cex}\n  ${dex}`);
-    53	  }
-    54	
-    55	  const pendingTx = checkUnresolved ? (await checkUnresolved().catch(() => ({ state: 'pending' as const }))).state === 'pending' : false;
-    56	  if (pendingTx) {
-    57	    incomplete++;
-    58	    lines.push('⚠️ A DEX tx sent before the restart is still unresolved (pending, not mined).');
-    59	  }
-    60	  if (!lines.length) return;
-    61	
-    62	  if (incomplete) risk.pause('bot restarted during a trade', true);
-    63	  await tg.send(
-    64	    `${incomplete ? '🚨' : 'ℹ️'} Bot restarted while trade(s) were running:\n${lines.join('\n')}\n` +
-    65	      (incomplete
-    66	        ? `Trading PAUSED. Check balances (/status), fix any open position by hand, then /start confirm.`
-    67	        : `All legs completed; no action needed (PnL of these trades was not measured).`),
-    68	  );
-    69	}
+     6	import { cancelAndConfirm } from './engine.js';
+     7	import { errMsg } from './log.js';
+     8	
+     9	const OPEN = new Set(['NEW', 'PARTIALLY_FILLED']);
+    10	const BOT_PREFIX = 'arb';
+    11	
+    12	export interface RecoveryMexc {
+    13	  getOrderByClientId(symbol: string, cid: string): Promise<Order | null>;
+    14	  getOrder?(symbol: string, orderId: string): Promise<Order>;
+    15	  cancelOrder?(symbol: string, orderId: string): Promise<Order>;
+    16	  openOrders?(symbol: string): Promise<(Order & { clientOrderId?: string })[]>;
+    17	}
+    18	
+    19	/**
+    20	 * Startup recovery (live mode, before anything trades):
+    21	 *  - every trade row still 'executing' (the bot died mid-trade): look up EVERY MEXC client id recorded on it
+    22	 *    (entry + closes). Orders still open are cancelled and settled. Both legs complete -> 'ok'
+    23	 *    (PnL not measured); anything else -> 'one_sided' with "pnl unknown" (book it later with /resolve).
+    24	 *  - open orders with the bot's client-id prefix on the watched symbols are cancelled and reported.
+    25	 *  - an unresolved DEX tx from before the restart (persisted) keeps the bot paused.
+    26	 * Anything not cleanly complete -> CRITICAL pause until a human sends /start confirm.
+    27	 */
+    28	export async function recoverExecuting(
+    29	  db: Db,
+    30	  risk: Risk,
+    31	  tg: Notifier,
+    32	  mexc: RecoveryMexc,
+    33	  receipt: (hash: string) => Promise<{ status: number | null } | null>,
+    34	  checkUnresolved?: () => Promise<{ state: 'clear' | 'pending' }>,
+    35	  opts: { symbols?: string[]; sleep?: (ms: number) => Promise<void> } = {},
+    36	) {
+    37	  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    38	  const lines: string[] = [];
+    39	  let incomplete = 0;
+    40	
+    41	  const settle = async (symbol: string, o: Order): Promise<string> => {
+    42	    if (!OPEN.has(o.status) || !mexc.getOrder || !mexc.cancelOrder) return `${o.status}, filled ${o.executedQty}`;
+    43	    try {
+    44	      const f = await cancelAndConfirm({ getOrder: mexc.getOrder, cancelOrder: mexc.cancelOrder }, symbol, o.orderId, sleep);
+    45	      return `was open -> cancelled: ${f.status}, filled ${f.executedQty}`;
+    46	    } catch (e) {
+    47	      incomplete++;
+    48	      return `STILL OPEN (${errMsg(e)}): cancel it on MEXC by hand`;
+    49	    }
+    50	  };
+    51	
+    52	  for (const r of db.executingTrades()) {
+    53	    const symbol = `${r.symbol}USDT`;
+    54	    const noteCid = /client order id (\S+?)(;|$)/.exec(r.note ?? '')?.[1];
+    55	    const cids = [...new Set([...(noteCid ? [noteCid] : []), ...db.cidsOf(r.id)])];
+    56	    const cexLines: string[] = [];
+    57	    let entryDone = false;
+    58	    for (const [i, cid] of cids.entries()) {
+    59	      try {
+    60	        const o = await mexc.getOrderByClientId(symbol, cid);
+    61	        if (!o) {
+    62	          cexLines.push(`MEXC ${cid}: never placed`);
+    63	          continue;
+    64	        }
+    65	        const state = await settle(symbol, o);
+    66	        cexLines.push(`MEXC ${cid} (order ${o.orderId}): ${state}`);
+    67	        if (i === 0) entryDone = o.status === 'FILLED' && Number(o.executedQty) >= r.qty * 0.999;
+    68	      } catch (e) {
+    69	        cexLines.push(`MEXC ${cid}: lookup failed (${errMsg(e)})`);
+    70	      }
+    71	    }
+    72	    let dex = 'DEX tx: none signed';
+    73	    let dexDone = false;
+    74	    if (r.dex_tx) {
+    75	      const rc = await receipt(r.dex_tx).catch(() => null);
+    76	      dex = rc ? `DEX tx ${r.dex_tx}: ${rc.status === 1 ? 'SUCCESS' : 'REVERTED'}` : `DEX tx ${r.dex_tx}: NOT MINED (may still be pending)`;
+    77	      dexDone = rc?.status === 1;
+    78	    }
+    79	    // Clean only if the entry filled, the swap succeeded and NO close/unwind order was involved.
+    80	    const complete = entryDone && dexDone && cids.length === 1;
+    81	    if (!complete) incomplete++;
+    82	    db.updateTrade(r.id, {
+    83	      status: complete ? 'ok' : 'one_sided',
+    84	      note: `${r.note ?? ''}; recovered at startup: ${cexLines.join(' | ')}; ${dex}; ${complete ? 'both legs done, PnL not measured' : 'pnl unknown'}`,
+    85	    });
+    86	    lines.push(`${complete ? '✅' : '⚠️'} #${r.id} ${r.symbol} ${r.direction} qty ${r.qty}\n  ${cexLines.join('\n  ') || 'MEXC: no client id recorded'}\n  ${dex}`);
+    87	  }
+    88	
+    89	  // Orders the bot placed that are still resting on MEXC (e.g. a close placed right before a crash).
+    90	  if (mexc.openOrders && opts.symbols?.length) {
+    91	    for (const symbol of opts.symbols) {
+    92	      try {
+    93	        for (const o of await mexc.openOrders(symbol)) {
+    94	          if (!o.clientOrderId?.startsWith(BOT_PREFIX)) continue;
+    95	          lines.push(`⚠️ open bot order ${symbol} ${o.side} ${o.origQty} (cid ${o.clientOrderId}): ${await settle(symbol, o)}`);
+    96	          incomplete++;
+    97	        }
+    98	      } catch (e) {
+    99	        lines.push(`⚠️ could not list open orders for ${symbol}: ${errMsg(e)}`);
+   100	        incomplete++;
+   101	      }
+   102	    }
+   103	  }
+   104	
+   105	  const pendingTx = checkUnresolved ? (await checkUnresolved().catch(() => ({ state: 'pending' as const }))).state === 'pending' : false;
+   106	  if (pendingTx) {
+   107	    incomplete++;
+   108	    lines.push('⚠️ A DEX tx sent before the restart is still unresolved (pending, not mined). Do NOT hedge by hand until it resolves.');
+   109	  }
+   110	  if (!lines.length) return;
+   111	
+   112	  if (incomplete) risk.pause('bot restarted during a trade', true);
+   113	  await tg.send(
+   114	    `${incomplete ? '🚨' : 'ℹ️'} Bot restarted while trade(s) were running:\n${lines.join('\n')}\n` +
+   115	      (incomplete
+   116	        ? `Trading PAUSED. Check balances (/status), fix any open position by hand, book its PnL with /resolve <id> <pnl>, then /start confirm.`
+   117	        : `All legs completed; no action needed (PnL of these trades was not measured).`),
+   118	  );
+   119	}
 ```
 
 ## `src/report.ts`
@@ -2369,7 +2614,7 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     21	import type { Risk } from './risk.js';
     22	import type { Notifier } from './engine.js';
     23	import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine.js';
-    24	import { orderProblem } from './mexc/rules.js';
+    24	import { closePrice, orderProblem } from './mexc/rules.js';
     25	import { type Gap, type ScanToken, dexPrices, findGaps, loadUniverse } from './scanner.js';
     26	import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
     27	import { log, errMsg } from './log.js';
@@ -2942,86 +3187,95 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
    594	  private async sellOnMexc(row: TransferRow, qty: string): Promise<number> {
    595	    const rules = this.universe.find((t) => t.base === row.base)?.rules;
    596	    const px = row.cost_usd / (row.buy_qty || 1);
-   597	    const problem = rules && orderProblem(rules, 'SELL', Number(qty), px, 'MARKET');
-   598	    if (problem) {
-   599	      this.d.risk.pause(`cannot sell ${row.base} on MEXC: ${problem}`, true);
-   600	      await this.d.tg.send(`🚨 ${row.base}: cannot market-sell ${qty} on MEXC (${problem}). Trading PAUSED: sell it by hand, then /start confirm.`);
-   601	      return 0;
-   602	    }
-   603	    try {
-   604	      const usdtBefore = (await this.d.mexc.balances()).USDT ?? 0;
-   605	      const cid = clientId(`${row.id}s`);
-   606	      const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, () => this.d.mexc.marketSell(row.symbol, qty, cid), this.sleep);
-   607	      await this.sleep(1000);
-   608	      const o = await this.d.mexc.getOrder(row.symbol, orderId);
-   609	      const filled = Number(o.executedQty);
-   610	      if (filled < Number(qty) * 0.999) {
-   611	        this.d.risk.pause(`MEXC sell of ${row.base} only partly filled`, true);
-   612	        await this.d.tg.send(
-   613	          `🚨 ${row.base}: MEXC market sell filled only ${filled}/${qty}. The rest is still on MEXC. Trading PAUSED: sell it by hand, then /start.`,
-   614	        );
-   615	      }
-   616	      await this.sleep(1500);
-   617	      const received = ((await this.d.mexc.balances()).USDT ?? 0) - usdtBefore;
-   618	      // Fallback only if the balance read is clearly off (e.g. a concurrent deposit/withdrawal).
-   619	      return received > 0 ? received : Number(o.cummulativeQuoteQty) * (1 - this.cfg.mexcTakerFee);
-   620	    } catch (e) {
-   621	      this.d.risk.pause(`could not close ${row.base} on MEXC`, true);
-   622	      await this.d.tg.send(`🚨 ${row.base}: MEXC market sell of ${qty} FAILED (${errMsg(e)}). Trading PAUSED. Close it manually, then /start.`);
-   623	      return 0;
-   624	    }
-   625	  }
-   626	
-   627	  private async fail(row: TransferRow, why: string, pnl: number, countAsFailure = true) {
-   628	    this.d.db.updateTransfer(row.id!, { status: 'failed', pnl, note: why });
-   629	    log.warn(`transfer #${row.id} ${row.base} failed: ${why}`);
-   630	    if (!countAsFailure) return; // e.g. buy simply did not fill: no money moved
-   631	    this.recordTrade(row, 'one_sided', pnl, row.gas_usd, undefined, why);
-   632	    await this.d.tg.send(`⚠️ TRANSFER #${row.id} ${row.base} failed: ${why}\nPnL ${usd(pnl)}`);
-   633	    this.afterRisk('one_sided');
+   597	    // Some symbols have no MARKET order type: use an aggressive LIMIT inside the price band instead.
+   598	    const useLimit = Boolean(rules && !rules.orderTypes.includes('MARKET'));
+   599	    const problem = rules && orderProblem(rules, 'SELL', Number(qty), px, useLimit ? 'LIMIT' : 'MARKET');
+   600	    if (problem) {
+   601	      this.d.risk.pause(`cannot sell ${row.base} on MEXC: ${problem}`, true);
+   602	      await this.d.tg.send(`🚨 ${row.base}: cannot market-sell ${qty} on MEXC (${problem}). Trading PAUSED: sell it by hand, then /start confirm.`);
+   603	      return 0;
+   604	    }
+   605	    try {
+   606	      const usdtBefore = (await this.d.mexc.balances()).USDT ?? 0;
+   607	      const cid = clientId(`${row.id}s`);
+   608	      let place = () => this.d.mexc.marketSell(row.symbol, qty, cid);
+   609	      if (useLimit && rules) {
+   610	        const b = await this.d.mexc.depth(row.symbol, 5);
+   611	        const limit = closePrice(rules, 'SELL', { bid: b.bids[0][0], ask: b.asks[0][0] }).toFixed(rules.priceDecimals);
+   612	        place = () => this.d.mexc.limitOrder(row.symbol, 'SELL', qty, limit, cid);
+   613	      }
+   614	      const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, place, this.sleep);
+   615	      await this.sleep(1000);
+   616	      let o = await this.d.mexc.getOrder(row.symbol, orderId);
+   617	      if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, row.symbol, orderId, this.sleep);
+   618	      const filled = Number(o.executedQty);
+   619	      if (filled < Number(qty) * 0.999) {
+   620	        this.d.risk.pause(`MEXC sell of ${row.base} only partly filled`, true);
+   621	        await this.d.tg.send(
+   622	          `🚨 ${row.base}: MEXC market sell filled only ${filled}/${qty}. The rest is still on MEXC. Trading PAUSED: sell it by hand, then /start.`,
+   623	        );
+   624	      }
+   625	      await this.sleep(1500);
+   626	      const received = ((await this.d.mexc.balances()).USDT ?? 0) - usdtBefore;
+   627	      // Fallback only if the balance read is clearly off (e.g. a concurrent deposit/withdrawal).
+   628	      return received > 0 ? received : Number(o.cummulativeQuoteQty) * (1 - this.cfg.mexcTakerFee);
+   629	    } catch (e) {
+   630	      this.d.risk.pause(`could not close ${row.base} on MEXC`, true);
+   631	      await this.d.tg.send(`🚨 ${row.base}: MEXC market sell of ${qty} FAILED (${errMsg(e)}). Trading PAUSED. Close it manually, then /start.`);
+   632	      return 0;
+   633	    }
    634	  }
    635	
-   636	  /** Telegram /sell <id>: retry a stuck or held sale now (even below the loss floor). */
-   637	  forceSell(id: number): string {
-   638	    const t = this.d.db.getTransfer(id);
-   639	    if (!t) return `No transfer #${id}`;
-   640	    if (!t.received) return `Transfer #${id} has no tokens in the wallet yet (status ${t.status})`;
-   641	    if (t.status !== 'stuck' && t.status !== 'selling') return `Transfer #${id} is ${t.status}`;
-   642	    this.d.db.updateTransfer(id, { status: 'selling', force_sell: 1, next_try: 0, sell_attempts: 0 });
-   643	    return `Transfer #${id}: selling on the next scan (loss floor ignored).`;
-   644	  }
-   645	
-   646	  /** Telegram /clear <id>: you resolved it by hand; close the record. */
-   647	  clear(id: number): string {
-   648	    const t = this.d.db.getTransfer(id);
-   649	    if (!t) return `No transfer #${id}`;
-   650	    if (t.status === 'done' || t.status === 'failed') return `Transfer #${id} is already ${t.status}`;
-   651	    this.d.db.updateTransfer(id, { status: 'failed', note: 'cleared manually via /clear' });
-   652	    // Gas already burned on this transfer is a real cost: book it so the daily loss limit sees it.
-   653	    if (t.gas_usd > 0) this.recordTrade(t, 'one_sided', -t.gas_usd, t.gas_usd, undefined, 'cleared manually; gas spent');
-   654	    return `Transfer #${id} closed manually. Gas spent (${usd(t.gas_usd)}) is booked; the token result is not, check balances yourself.`;
-   655	  }
-   656	
-   657	  private recordTrade(row: TransferRow, status: 'ok' | 'one_sided', pnl: number, gas: number, tx: string | undefined, note: string, sellPrice = 0) {
-   658	    const now = this.now();
-   659	    const buyPrice = row.cost_usd / (row.buy_qty || 1);
-   660	    this.d.db.insertTrade({
-   661	      ts: now, day: dhakaDay(now), mode: this.cfg.mode, symbol: row.base, direction: 'TRANSFER',
-   662	      size_usd: row.cost_usd, qty: row.buy_qty, buy_price: buyPrice, sell_price: sellPrice, expected_net: row.expected_net,
-   663	      // informational only: PnL is measured from real balances and already includes every fee
-   664	      cex_fee_usd: row.cost_usd * this.cfg.mexcTakerFee + row.withdraw_fee * buyPrice,
-   665	      gas_usd: gas, pnl_usd: pnl, status, dex_tx: tx ?? null, cex_order_id: row.buy_order_id, note,
-   666	    });
-   667	  }
-   668	
-   669	  private afterRisk(status: 'ok' | 'one_sided') {
-   670	    for (const e of this.d.risk.afterTrade(status)) {
-   671	      if (e.kind === 'loss_limit') void this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). New trades STOPPED. Send /start to resume.`);
-   672	      if (e.kind === 'fail_streak') void this.d.tg.send(`🛑 ${e.count} failed trades in a row. New trades PAUSED. /start to resume.`);
-   673	      if (e.kind === 'trade_limit') void this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}).`);
-   674	    }
-   675	  }
-   676	}
+   636	  private async fail(row: TransferRow, why: string, pnl: number, countAsFailure = true) {
+   637	    this.d.db.updateTransfer(row.id!, { status: 'failed', pnl, note: why });
+   638	    log.warn(`transfer #${row.id} ${row.base} failed: ${why}`);
+   639	    if (!countAsFailure) return; // e.g. buy simply did not fill: no money moved
+   640	    this.recordTrade(row, 'one_sided', pnl, row.gas_usd, undefined, why);
+   641	    await this.d.tg.send(`⚠️ TRANSFER #${row.id} ${row.base} failed: ${why}\nPnL ${usd(pnl)}`);
+   642	    this.afterRisk('one_sided');
+   643	  }
+   644	
+   645	  /** Telegram /sell <id>: retry a stuck or held sale now (even below the loss floor). */
+   646	  forceSell(id: number): string {
+   647	    const t = this.d.db.getTransfer(id);
+   648	    if (!t) return `No transfer #${id}`;
+   649	    if (!t.received) return `Transfer #${id} has no tokens in the wallet yet (status ${t.status})`;
+   650	    if (t.status !== 'stuck' && t.status !== 'selling') return `Transfer #${id} is ${t.status}`;
+   651	    this.d.db.updateTransfer(id, { status: 'selling', force_sell: 1, next_try: 0, sell_attempts: 0 });
+   652	    return `Transfer #${id}: selling on the next scan (loss floor ignored).`;
+   653	  }
+   654	
+   655	  /** Telegram /clear <id>: you resolved it by hand; close the record. */
+   656	  clear(id: number): string {
+   657	    const t = this.d.db.getTransfer(id);
+   658	    if (!t) return `No transfer #${id}`;
+   659	    if (t.status === 'done' || t.status === 'failed') return `Transfer #${id} is already ${t.status}`;
+   660	    this.d.db.updateTransfer(id, { status: 'failed', note: 'cleared manually via /clear' });
+   661	    // Gas already burned on this transfer is a real cost: book it so the daily loss limit sees it.
+   662	    if (t.gas_usd > 0) this.recordTrade(t, 'one_sided', -t.gas_usd, t.gas_usd, undefined, 'cleared manually; gas spent');
+   663	    return `Transfer #${id} closed manually. Gas spent (${usd(t.gas_usd)}) is booked; the token result is not, check balances yourself.`;
+   664	  }
+   665	
+   666	  private recordTrade(row: TransferRow, status: 'ok' | 'one_sided', pnl: number, gas: number, tx: string | undefined, note: string, sellPrice = 0) {
+   667	    const now = this.now();
+   668	    const buyPrice = row.cost_usd / (row.buy_qty || 1);
+   669	    this.d.db.insertTrade({
+   670	      ts: now, day: dhakaDay(now), mode: this.cfg.mode, symbol: row.base, direction: 'TRANSFER',
+   671	      size_usd: row.cost_usd, qty: row.buy_qty, buy_price: buyPrice, sell_price: sellPrice, expected_net: row.expected_net,
+   672	      // informational only: PnL is measured from real balances and already includes every fee
+   673	      cex_fee_usd: row.cost_usd * this.cfg.mexcTakerFee + row.withdraw_fee * buyPrice,
+   674	      gas_usd: gas, pnl_usd: pnl, status, dex_tx: tx ?? null, cex_order_id: row.buy_order_id, note,
+   675	    });
+   676	  }
+   677	
+   678	  private afterRisk(status: 'ok' | 'one_sided') {
+   679	    for (const e of this.d.risk.afterTrade(status)) {
+   680	      if (e.kind === 'loss_limit') void this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). New trades STOPPED. Send /start to resume.`);
+   681	      if (e.kind === 'fail_streak') void this.d.tg.send(`🛑 ${e.count} failed trades in a row. New trades PAUSED. /start to resume.`);
+   682	      if (e.kind === 'trade_limit') void this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}).`);
+   683	    }
+   684	  }
+   685	}
 ```
 
 ## `src/util.ts`
@@ -3346,200 +3600,209 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     53	
     54	type FetchFn = typeof fetch;
     55	
-    56	/** HTTP 429/418 from any API: callers back off instead of hammering. */
-    57	export class RateLimitError extends Error {}
-    58	
-    59	/**
-    60	 * The request may or may not have reached MEXC (timeout / connection reset on a POST).
-    61	 * Never assume "not placed": look the order / withdrawal up by our own client id.
-    62	 */
-    63	export class AmbiguousRequestError extends Error {}
-    64	
-    65	/** MEXC answered with an error body; `code` is MEXC's error code when present (e.g. -2011 "Unknown order sent"). */
-    66	export class MexcApiError extends Error {
-    67	  constructor(msg: string, readonly status: number, readonly code?: number) {
-    68	    super(msg);
-    69	  }
-    70	}
-    71	
-    72	export interface WithdrawRecord {
-    73	  id: string;
-    74	  status: number;
-    75	  amount: string;
-    76	  /** Fee MEXC actually charged (withdraw history `transactionFee`). */
-    77	  transactionFee?: string;
-    78	  txId?: string;
-    79	  withdrawOrderId?: string;
-    80	}
-    81	
-    82	export class MexcRest {
-    83	  /** serverTime - localTime, so signed timestamps stay inside recvWindow even if the VPS clock drifts. */
-    84	  timeOffsetMs = 0;
+    56	/** HTTP 429/418 from any API: callers back off instead of hammering, at least `retryAfterSec`. */
+    57	export class RateLimitError extends Error {
+    58	  constructor(msg: string, readonly retryAfterSec = 0) {
+    59	    super(msg);
+    60	  }
+    61	}
+    62	
+    63	/**
+    64	 * The request may or may not have reached MEXC (timeout / connection reset on a POST).
+    65	 * Never assume "not placed": look the order / withdrawal up by our own client id.
+    66	 */
+    67	export class AmbiguousRequestError extends Error {}
+    68	
+    69	/** MEXC answered with an error body; `code` is MEXC's error code when present (e.g. -2011 "Unknown order sent"). */
+    70	export class MexcApiError extends Error {
+    71	  constructor(msg: string, readonly status: number, readonly code?: number) {
+    72	    super(msg);
+    73	  }
+    74	}
+    75	
+    76	export interface WithdrawRecord {
+    77	  id: string;
+    78	  status: number;
+    79	  amount: string;
+    80	  /** Fee MEXC actually charged (withdraw history `transactionFee`). */
+    81	  transactionFee?: string;
+    82	  txId?: string;
+    83	  withdrawOrderId?: string;
+    84	}
     85	
-    86	  constructor(
-    87	    private apiKey = '',
-    88	    private apiSecret = '',
-    89	    private baseUrl = 'https://api.mexc.com',
-    90	    private fetchFn: FetchFn = fetch,
-    91	  ) {}
-    92	
-    93	  sign(query: string): string {
-    94	    return crypto.createHmac('sha256', this.apiSecret).update(query).digest('hex');
-    95	  }
+    86	export class MexcRest {
+    87	  /** serverTime - localTime, so signed timestamps stay inside recvWindow even if the VPS clock drifts. */
+    88	  timeOffsetMs = 0;
+    89	
+    90	  constructor(
+    91	    private apiKey = '',
+    92	    private apiSecret = '',
+    93	    private baseUrl = 'https://api.mexc.com',
+    94	    private fetchFn: FetchFn = fetch,
+    95	  ) {}
     96	
-    97	  async request<T>(method: string, path: string, params: Record<string, string | number> = {}, signed = false): Promise<T> {
-    98	    const qs = new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)]));
-    99	    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-   100	    if (signed) {
-   101	      if (!this.apiKey || !this.apiSecret) throw new Error('MEXC API key/secret not configured');
-   102	      qs.set('timestamp', String(Date.now() + this.timeOffsetMs));
-   103	      qs.set('recvWindow', '5000');
-   104	      qs.set('signature', this.sign(qs.toString()));
-   105	      headers['X-MEXC-APIKEY'] = this.apiKey;
-   106	    }
-   107	    const q = qs.toString();
-   108	    let res: Response;
-   109	    let text: string;
-   110	    try {
-   111	      res = await this.fetchFn(`${this.baseUrl}${path}${q ? `?${q}` : ''}`, {
-   112	        method,
-   113	        headers,
-   114	        signal: AbortSignal.timeout(10_000),
-   115	      });
-   116	      text = await res.text();
-   117	    } catch (e) {
-   118	      const msg = redact(`MEXC ${method} ${path}: ${(e as Error).message}`);
-   119	      // A write that timed out may still have been executed by MEXC.
-   120	      if (method !== 'GET') throw new AmbiguousRequestError(msg);
-   121	      throw new Error(msg);
-   122	    }
-   123	    let body: unknown;
-   124	    try {
-   125	      body = JSON.parse(text);
-   126	    } catch {
-   127	      body = text;
-   128	    }
-   129	    const err = redact(`MEXC ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`);
-   130	    if (res.status === 429 || res.status === 418) throw new RateLimitError(err);
-   131	    if (res.status >= 500 && method !== 'GET') throw new AmbiguousRequestError(err);
-   132	    if (!res.ok) {
-   133	      const code = body && typeof body === 'object' && 'code' in body ? Number((body as { code: unknown }).code) : undefined;
-   134	      throw new MexcApiError(err, res.status, Number.isFinite(code) ? code : undefined);
-   135	    }
-   136	    return body as T;
-   137	  }
-   138	
-   139	  /** Measure clock skew against MEXC; returns the offset in ms. */
-   140	  async syncTime(): Promise<number> {
-   141	    const t0 = Date.now();
-   142	    const r = await this.request<{ serverTime: number }>('GET', '/api/v3/time');
-   143	    const t1 = Date.now();
-   144	    this.timeOffsetMs = Math.round(r.serverTime - (t0 + t1) / 2);
-   145	    return this.timeOffsetMs;
-   146	  }
-   147	
-   148	  async depth(symbol: string, limit = 20): Promise<Book> {
-   149	    const d = await this.request<{ bids: [string, string][]; asks: [string, string][] }>('GET', '/api/v3/depth', { symbol, limit });
-   150	    const conv = (l: [string, string][]): Level[] => l.map(([p, q]) => [Number(p), Number(q)]);
-   151	    return { bids: conv(d.bids), asks: conv(d.asks), ts: Date.now() };
-   152	  }
-   153	
-   154	  async exchangeInfo(): Promise<SymbolInfo[]> {
-   155	    const r = await this.request<{ symbols: SymbolInfo[] }>('GET', '/api/v3/exchangeInfo');
-   156	    return r.symbols;
+    97	  sign(query: string): string {
+    98	    return crypto.createHmac('sha256', this.apiSecret).update(query).digest('hex');
+    99	  }
+   100	
+   101	  async request<T>(method: string, path: string, params: Record<string, string | number> = {}, signed = false): Promise<T> {
+   102	    const qs = new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)]));
+   103	    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+   104	    if (signed) {
+   105	      if (!this.apiKey || !this.apiSecret) throw new Error('MEXC API key/secret not configured');
+   106	      qs.set('timestamp', String(Date.now() + this.timeOffsetMs));
+   107	      qs.set('recvWindow', '5000');
+   108	      qs.set('signature', this.sign(qs.toString()));
+   109	      headers['X-MEXC-APIKEY'] = this.apiKey;
+   110	    }
+   111	    const q = qs.toString();
+   112	    let res: Response;
+   113	    let text: string;
+   114	    try {
+   115	      res = await this.fetchFn(`${this.baseUrl}${path}${q ? `?${q}` : ''}`, {
+   116	        method,
+   117	        headers,
+   118	        signal: AbortSignal.timeout(10_000),
+   119	      });
+   120	      text = await res.text();
+   121	    } catch (e) {
+   122	      const msg = redact(`MEXC ${method} ${path}: ${(e as Error).message}`);
+   123	      // A write that timed out may still have been executed by MEXC.
+   124	      if (method !== 'GET') throw new AmbiguousRequestError(msg);
+   125	      throw new Error(msg);
+   126	    }
+   127	    let body: unknown;
+   128	    try {
+   129	      body = JSON.parse(text);
+   130	    } catch {
+   131	      body = text;
+   132	    }
+   133	    const err = redact(`MEXC ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`);
+   134	    // MEXC docs: "A Retry-After header is sent with a 418 or 429 responses".
+   135	    if (res.status === 429 || res.status === 418) throw new RateLimitError(err, Number(res.headers.get('retry-after')) || 0);
+   136	    if (res.status >= 500 && method !== 'GET') throw new AmbiguousRequestError(err);
+   137	    if (!res.ok) {
+   138	      const code = body && typeof body === 'object' && 'code' in body ? Number((body as { code: unknown }).code) : undefined;
+   139	      throw new MexcApiError(err, res.status, Number.isFinite(code) ? code : undefined);
+   140	    }
+   141	    return body as T;
+   142	  }
+   143	
+   144	  /** Measure clock skew against MEXC; returns the offset in ms. */
+   145	  async syncTime(): Promise<number> {
+   146	    const t0 = Date.now();
+   147	    const r = await this.request<{ serverTime: number }>('GET', '/api/v3/time');
+   148	    const t1 = Date.now();
+   149	    this.timeOffsetMs = Math.round(r.serverTime - (t0 + t1) / 2);
+   150	    return this.timeOffsetMs;
+   151	  }
+   152	
+   153	  async depth(symbol: string, limit = 20): Promise<Book> {
+   154	    const d = await this.request<{ bids: [string, string][]; asks: [string, string][] }>('GET', '/api/v3/depth', { symbol, limit });
+   155	    const conv = (l: [string, string][]): Level[] => l.map(([p, q]) => [Number(p), Number(q)]);
+   156	    return { bids: conv(d.bids), asks: conv(d.asks), ts: Date.now() };
    157	  }
    158	
-   159	  async tickers24h(): Promise<{ symbol: string; quoteVolume: string; lastPrice: string }[]> {
-   160	    return this.request('GET', '/api/v3/ticker/24hr');
-   161	  }
-   162	
-   163	  async price(symbol: string): Promise<number> {
-   164	    const r = await this.request<{ price: string }>('GET', '/api/v3/ticker/price', { symbol });
-   165	    return Number(r.price);
+   159	  async exchangeInfo(): Promise<SymbolInfo[]> {
+   160	    const r = await this.request<{ symbols: SymbolInfo[] }>('GET', '/api/v3/exchangeInfo');
+   161	    return r.symbols;
+   162	  }
+   163	
+   164	  async tickers24h(): Promise<{ symbol: string; quoteVolume: string; lastPrice: string }[]> {
+   165	    return this.request('GET', '/api/v3/ticker/24hr');
    166	  }
    167	
-   168	  /** Deposit/withdraw status and contract address per network (signed). */
-   169	  async coinConfigs(): Promise<CoinConfig[]> {
-   170	    return this.request('GET', '/api/v3/capital/config/getall', {}, true);
+   168	  async price(symbol: string): Promise<number> {
+   169	    const r = await this.request<{ price: string }>('GET', '/api/v3/ticker/price', { symbol });
+   170	    return Number(r.price);
    171	  }
    172	
-   173	  async account(): Promise<{ canTrade: boolean; balances: { asset: string; free: string; locked: string }[] }> {
-   174	    return this.request('GET', '/api/v3/account', {}, true);
-   175	  }
-   176	
-   177	  /** Free balances (what can be traded now); includeLocked adds funds held in open orders. */
-   178	  async balances(includeLocked = false): Promise<Record<string, number>> {
-   179	    const a = await this.account();
-   180	    return Object.fromEntries(a.balances.map((b) => [b.asset, Number(b.free) + (includeLocked ? Number(b.locked) : 0)]));
-   181	  }
-   182	
-   183	  /** Best bid/ask for every symbol in one call. */
-   184	  async bookTickers(): Promise<Map<string, { bid: number; ask: number }>> {
-   185	    const r = await this.request<{ symbol: string; bidPrice: string; askPrice: string }[]>('GET', '/api/v3/ticker/bookTicker');
-   186	    return new Map(r.map((t) => [t.symbol, { bid: Number(t.bidPrice), ask: Number(t.askPrice) }]));
-   187	  }
-   188	
-   189	  /** Withdraw (new endpoint). Requires an API key with withdraw permission. Returns the withdraw id. */
-   190	  async withdraw(p: { coin: string; netWork: string; address: string; amount: string; contractAddress?: string; withdrawOrderId?: string }): Promise<string> {
-   191	    const params: Record<string, string> = { coin: p.coin, netWork: p.netWork, address: p.address, amount: p.amount };
-   192	    if (p.contractAddress) params.contractAddress = p.contractAddress;
-   193	    if (p.withdrawOrderId) params.withdrawOrderId = p.withdrawOrderId;
-   194	    const r = await this.request<{ id: string }>('POST', '/api/v3/capital/withdraw', params, true);
-   195	    return r.id;
-   196	  }
-   197	
-   198	  /** Recent withdrawals of a coin (status: 1 APPLY .. 6 WAIT_CONFIRM, 7 SUCCESS, 8 FAILED, 9 CANCEL, 10 MANUAL). */
-   199	  async withdrawHistory(coin: string, sinceTs: number): Promise<WithdrawRecord[]> {
-   200	    const r = await this.request<{ id: string; status: number | string; amount: string; transactionFee?: string; txId?: string; withdrawOrderId?: string }[]>(
-   201	      'GET',
-   202	      '/api/v3/capital/withdraw/history',
-   203	      { coin, startTime: Math.max(0, Math.floor(sinceTs)), limit: 1000 },
-   204	      true,
-   205	    );
-   206	    return r.map((w) => ({ id: w.id, status: Number(w.status), amount: w.amount, transactionFee: w.transactionFee, txId: w.txId, withdrawOrderId: w.withdrawOrderId }));
-   207	  }
-   208	
-   209	  /** Find a withdrawal by MEXC id or by our own withdrawOrderId. null = not in history. */
-   210	  async findWithdraw(coin: string, sinceTs: number, ref: { id?: string | null; withdrawOrderId?: string }): Promise<WithdrawRecord | null> {
-   211	    const h = await this.withdrawHistory(coin, sinceTs);
-   212	    return h.find((w) => (ref.id && w.id === ref.id) || (ref.withdrawOrderId && w.withdrawOrderId === ref.withdrawOrderId)) ?? null;
-   213	  }
-   214	
-   215	  /** `clientOrderId` makes the order findable even if this request times out. */
-   216	  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }> {
-   217	    const p: Record<string, string> = { symbol, side, type: 'LIMIT', quantity, price };
-   218	    if (clientOrderId) p.newClientOrderId = clientOrderId;
-   219	    return this.request('POST', '/api/v3/order', p, true);
-   220	  }
-   221	
-   222	  /** Look an order up by our own client id; null if MEXC has no such order. */
-   223	  async getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null> {
-   224	    try {
-   225	      return await this.request<Order>('GET', '/api/v3/order', { symbol, origClientOrderId: clientOrderId }, true);
-   226	    } catch (e) {
-   227	      // MEXC documents -2011 "Unknown order sent". Prefer the parsed code; the text match is a fallback
-   228	      // because MEXC does not document its error body shape. Anything else is a real error (caller retries).
-   229	      if (e instanceof MexcApiError && e.code === -2011) return null;
-   230	      if (/-2011|unknown order/i.test((e as Error).message)) return null;
-   231	      throw e;
-   232	    }
-   233	  }
-   234	
-   235	  /** MARKET SELL by base quantity (documented). For buys use an aggressive LIMIT instead. */
-   236	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }> {
-   237	    const p: Record<string, string> = { symbol, side: 'SELL', type: 'MARKET', quantity };
-   238	    if (clientOrderId) p.newClientOrderId = clientOrderId;
-   239	    return this.request('POST', '/api/v3/order', p, true);
-   240	  }
-   241	
-   242	  getOrder(symbol: string, orderId: string): Promise<Order> {
-   243	    return this.request('GET', '/api/v3/order', { symbol, orderId }, true);
-   244	  }
-   245	
-   246	  cancelOrder(symbol: string, orderId: string): Promise<Order> {
-   247	    return this.request('DELETE', '/api/v3/order', { symbol, orderId }, true);
-   248	  }
-   249	}
+   173	  /** Deposit/withdraw status and contract address per network (signed). */
+   174	  async coinConfigs(): Promise<CoinConfig[]> {
+   175	    return this.request('GET', '/api/v3/capital/config/getall', {}, true);
+   176	  }
+   177	
+   178	  async account(): Promise<{ canTrade: boolean; balances: { asset: string; free: string; locked: string }[] }> {
+   179	    return this.request('GET', '/api/v3/account', {}, true);
+   180	  }
+   181	
+   182	  /** Free balances (what can be traded now); includeLocked adds funds held in open orders. */
+   183	  async balances(includeLocked = false): Promise<Record<string, number>> {
+   184	    const a = await this.account();
+   185	    return Object.fromEntries(a.balances.map((b) => [b.asset, Number(b.free) + (includeLocked ? Number(b.locked) : 0)]));
+   186	  }
+   187	
+   188	  /** Best bid/ask for every symbol in one call. */
+   189	  async bookTickers(): Promise<Map<string, { bid: number; ask: number }>> {
+   190	    const r = await this.request<{ symbol: string; bidPrice: string; askPrice: string }[]>('GET', '/api/v3/ticker/bookTicker');
+   191	    return new Map(r.map((t) => [t.symbol, { bid: Number(t.bidPrice), ask: Number(t.askPrice) }]));
+   192	  }
+   193	
+   194	  /** Withdraw (new endpoint). Requires an API key with withdraw permission. Returns the withdraw id. */
+   195	  async withdraw(p: { coin: string; netWork: string; address: string; amount: string; contractAddress?: string; withdrawOrderId?: string }): Promise<string> {
+   196	    const params: Record<string, string> = { coin: p.coin, netWork: p.netWork, address: p.address, amount: p.amount };
+   197	    if (p.contractAddress) params.contractAddress = p.contractAddress;
+   198	    if (p.withdrawOrderId) params.withdrawOrderId = p.withdrawOrderId;
+   199	    const r = await this.request<{ id: string }>('POST', '/api/v3/capital/withdraw', params, true);
+   200	    return r.id;
+   201	  }
+   202	
+   203	  /** Recent withdrawals of a coin (status: 1 APPLY .. 6 WAIT_CONFIRM, 7 SUCCESS, 8 FAILED, 9 CANCEL, 10 MANUAL). */
+   204	  async withdrawHistory(coin: string, sinceTs: number): Promise<WithdrawRecord[]> {
+   205	    const r = await this.request<{ id: string; status: number | string; amount: string; transactionFee?: string; txId?: string; withdrawOrderId?: string }[]>(
+   206	      'GET',
+   207	      '/api/v3/capital/withdraw/history',
+   208	      { coin, startTime: Math.max(0, Math.floor(sinceTs)), limit: 1000 },
+   209	      true,
+   210	    );
+   211	    return r.map((w) => ({ id: w.id, status: Number(w.status), amount: w.amount, transactionFee: w.transactionFee, txId: w.txId, withdrawOrderId: w.withdrawOrderId }));
+   212	  }
+   213	
+   214	  /** Find a withdrawal by MEXC id or by our own withdrawOrderId. null = not in history. */
+   215	  async findWithdraw(coin: string, sinceTs: number, ref: { id?: string | null; withdrawOrderId?: string }): Promise<WithdrawRecord | null> {
+   216	    const h = await this.withdrawHistory(coin, sinceTs);
+   217	    return h.find((w) => (ref.id && w.id === ref.id) || (ref.withdrawOrderId && w.withdrawOrderId === ref.withdrawOrderId)) ?? null;
+   218	  }
+   219	
+   220	  /** `clientOrderId` makes the order findable even if this request times out. */
+   221	  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }> {
+   222	    const p: Record<string, string> = { symbol, side, type: 'LIMIT', quantity, price };
+   223	    if (clientOrderId) p.newClientOrderId = clientOrderId;
+   224	    return this.request('POST', '/api/v3/order', p, true);
+   225	  }
+   226	
+   227	  /** Look an order up by our own client id; null if MEXC has no such order. */
+   228	  async getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null> {
+   229	    try {
+   230	      return await this.request<Order>('GET', '/api/v3/order', { symbol, origClientOrderId: clientOrderId }, true);
+   231	    } catch (e) {
+   232	      // ONLY MEXC's documented -2011 "Unknown order sent" means "no such order". Any other error
+   233	      // (e.g. 10232 "currency does not exist", rate limits, 5xx) is rethrown: never guess "not placed".
+   234	      if (e instanceof MexcApiError && e.code === -2011) return null;
+   235	      throw e;
+   236	    }
+   237	  }
+   238	
+   239	  /** MARKET SELL by base quantity (documented). For buys use an aggressive LIMIT instead. */
+   240	  /** Open orders of one symbol (GET /api/v3/openOrders). */
+   241	  openOrders(symbol: string): Promise<(Order & { clientOrderId?: string })[]> {
+   242	    return this.request('GET', '/api/v3/openOrders', { symbol }, true);
+   243	  }
+   244	
+   245	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }> {
+   246	    const p: Record<string, string> = { symbol, side: 'SELL', type: 'MARKET', quantity };
+   247	    if (clientOrderId) p.newClientOrderId = clientOrderId;
+   248	    return this.request('POST', '/api/v3/order', p, true);
+   249	  }
+   250	
+   251	  getOrder(symbol: string, orderId: string): Promise<Order> {
+   252	    return this.request('GET', '/api/v3/order', { symbol, orderId }, true);
+   253	  }
+   254	
+   255	  cancelOrder(symbol: string, orderId: string): Promise<Order> {
+   256	    return this.request('DELETE', '/api/v3/order', { symbol, orderId }, true);
+   257	  }
+   258	}
 ```
 
 ## `src/mexc/rules.ts`
@@ -3581,45 +3844,69 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     34	  return r.priceBand ? Math.min(0.02, r.priceBand * 0.5) : 0.02;
     35	}
     36	
-    37	export function rulesFrom(s: SymbolInfo): SymbolRules {
-    38	  const qtyDecimals = s.baseAssetPrecision ?? Math.max(0, Math.round(-Math.log10(Number(s.baseSizePrecision) || 1)));
-    39	  return {
-    40	    qtyStep: 1 / 10 ** qtyDecimals, // exact (10 ** -5 is 0.000009999…)
-    41	    priceDecimals: s.quotePrecision,
-    42	    minQty: Number(s.baseSizePrecision) || 0,
-    43	    minNotional: Number(s.quoteAmountPrecision) || 0,
-    44	    maxNotional: Number(s.maxQuoteAmount) || Number.POSITIVE_INFINITY,
-    45	    orderTypes: s.orderTypes ?? ['LIMIT'],
-    46	    tradeSideType: Number(s.tradeSideType ?? 1),
-    47	    minNotionalMarket: s.quoteAmountPrecisionMarket !== undefined ? Number(s.quoteAmountPrecisionMarket) : undefined,
-    48	    maxNotionalMarket: s.maxQuoteAmountMarket !== undefined ? Number(s.maxQuoteAmountMarket) : undefined,
-    49	    priceBand: band(s),
-    50	  };
+    37	/** Band used when exchangeInfo has no PERCENT_PRICE_BY_SIDE filter. */
+    38	export const DEFAULT_BAND = 0.2;
+    39	
+    40	/**
+    41	 * Aggressive close price: 2% through the book, clamped to 80% of the symbol's band around the reference
+    42	 * (mid of a fresh book), rounded to the price step in the safe direction.
+    43	 */
+    44	export function closePrice(r: SymbolRules, side: Side, book: { bid: number; ask: number }): number {
+    45	  const f = 10 ** r.priceDecimals;
+    46	  const ref = (book.bid + book.ask) / 2;
+    47	  const band = r.priceBand ?? DEFAULT_BAND;
+    48	  // Small epsilon: 100.1 * 1.02 is 102.10199999... in floating point and must still round to 102.102.
+    49	  if (side === 'BUY') return Math.floor(Math.min(book.ask * 1.02, ref * (1 + 0.8 * band)) * f + 1e-6) / f;
+    50	  return Math.ceil(Math.max(book.bid * 0.98, ref * (1 - 0.8 * band)) * f - 1e-6) / f;
     51	}
     52	
-    53	function band(s: SymbolInfo): number | undefined {
-    54	  const f = s.filters?.find((x) => x.filterType === 'PERCENT_PRICE_BY_SIDE');
-    55	  if (!f) return undefined;
-    56	  const v = [Number(f.bidMultiplierUp), Number(f.askMultiplierDown)].filter((x) => Number.isFinite(x) && x > 0);
-    57	  return v.length ? Math.min(...v) : undefined;
-    58	}
-    59	
-    60	/** null = the order is allowed; otherwise why MEXC would reject it. */
-    61	export function orderProblem(r: SymbolRules, side: Side, qty: number, price: number, type = 'LIMIT'): string | null {
-    62	  if (!r.orderTypes.includes(type)) return `order type ${type} not allowed (${r.orderTypes.join(',')})`;
-    63	  if (r.tradeSideType === 4) return 'symbol is close-only';
-    64	  if (r.tradeSideType === 2 && side === 'SELL') return 'symbol is buy-only';
-    65	  if (r.tradeSideType === 3 && side === 'BUY') return 'symbol is sell-only';
-    66	  if (!(qty > 0)) return 'quantity is zero';
-    67	  if (qty < r.minQty) return `quantity ${qty} < minimum ${r.minQty}`;
-    68	  const notional = qty * price;
-    69	  // MARKET orders have their own limits in exchangeInfo.
-    70	  const min = type === 'MARKET' ? (r.minNotionalMarket ?? r.minNotional) : r.minNotional;
-    71	  const max = type === 'MARKET' ? (r.maxNotionalMarket ?? r.maxNotional) : r.maxNotional;
-    72	  if (notional < min) return `order value ${notional.toFixed(4)} < minimum ${min} USDT`;
-    73	  if (notional > max) return `order value ${notional.toFixed(2)} > maximum ${max} USDT`;
-    74	  return null;
+    53	/** Is a limit price inside the symbol's band around the reference price? */
+    54	export function bandProblem(r: SymbolRules, side: Side, price: number, ref: number): string | null {
+    55	  const band = r.priceBand ?? DEFAULT_BAND;
+    56	  if (side === 'BUY' && price > ref * (1 + band)) return `buy price ${price} above the ${band * 100}% band around ${ref}`;
+    57	  if (side === 'SELL' && price < ref * (1 - band)) return `sell price ${price} below the ${band * 100}% band around ${ref}`;
+    58	  return null;
+    59	}
+    60	
+    61	export function rulesFrom(s: SymbolInfo): SymbolRules {
+    62	  const qtyDecimals = s.baseAssetPrecision ?? Math.max(0, Math.round(-Math.log10(Number(s.baseSizePrecision) || 1)));
+    63	  return {
+    64	    qtyStep: 1 / 10 ** qtyDecimals, // exact (10 ** -5 is 0.000009999…)
+    65	    priceDecimals: s.quotePrecision,
+    66	    minQty: Number(s.baseSizePrecision) || 0,
+    67	    minNotional: Number(s.quoteAmountPrecision) || 0,
+    68	    maxNotional: Number(s.maxQuoteAmount) || Number.POSITIVE_INFINITY,
+    69	    orderTypes: s.orderTypes ?? ['LIMIT'],
+    70	    tradeSideType: Number(s.tradeSideType ?? 1),
+    71	    minNotionalMarket: s.quoteAmountPrecisionMarket !== undefined ? Number(s.quoteAmountPrecisionMarket) : undefined,
+    72	    maxNotionalMarket: s.maxQuoteAmountMarket !== undefined ? Number(s.maxQuoteAmountMarket) : undefined,
+    73	    priceBand: band(s),
+    74	  };
     75	}
+    76	
+    77	function band(s: SymbolInfo): number | undefined {
+    78	  const f = s.filters?.find((x) => x.filterType === 'PERCENT_PRICE_BY_SIDE');
+    79	  if (!f) return undefined;
+    80	  const v = [Number(f.bidMultiplierUp), Number(f.askMultiplierDown)].filter((x) => Number.isFinite(x) && x > 0);
+    81	  return v.length ? Math.min(...v) : undefined;
+    82	}
+    83	
+    84	/** null = the order is allowed; otherwise why MEXC would reject it. */
+    85	export function orderProblem(r: SymbolRules, side: Side, qty: number, price: number, type = 'LIMIT'): string | null {
+    86	  if (!r.orderTypes.includes(type)) return `order type ${type} not allowed (${r.orderTypes.join(',')})`;
+    87	  if (r.tradeSideType === 4) return 'symbol is close-only';
+    88	  if (r.tradeSideType === 2 && side === 'SELL') return 'symbol is buy-only';
+    89	  if (r.tradeSideType === 3 && side === 'BUY') return 'symbol is sell-only';
+    90	  if (!(qty > 0)) return 'quantity is zero';
+    91	  if (qty < r.minQty) return `quantity ${qty} < minimum ${r.minQty}`;
+    92	  const notional = qty * price;
+    93	  // MARKET orders have their own limits in exchangeInfo.
+    94	  const min = type === 'MARKET' ? (r.minNotionalMarket ?? r.minNotional) : r.minNotional;
+    95	  const max = type === 'MARKET' ? (r.maxNotionalMarket ?? r.maxNotional) : r.maxNotional;
+    96	  if (notional < min) return `order value ${notional.toFixed(4)} < minimum ${min} USDT`;
+    97	  if (notional > max) return `order value ${notional.toFixed(2)} > maximum ${max} USDT`;
+    98	  return null;
+    99	}
 ```
 
 ## `src/mexc/ws.ts`
@@ -3938,104 +4225,116 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     44	        broadcast: async (raw) => {
     45	          await this.sendProvider.send('eth_sendRawTransaction', [raw]);
     46	        },
-    47	        gas: () => this.gas(),
-    48	      },
-    49	      unresolvedStore,
-    50	    );
-    51	  }
-    52	
-    53	  get unresolved() {
-    54	    return this.tx.unresolved;
-    55	  }
-    56	  checkUnresolved() {
-    57	    return this.tx.checkUnresolved();
+    47	        broadcastPublic: async (raw) => {
+    48	          await this.provider.send('eth_sendRawTransaction', [raw]);
+    49	        },
+    50	        gas: () => this.gas(),
+    51	      },
+    52	      unresolvedStore,
+    53	    );
+    54	  }
+    55	
+    56	  get unresolved() {
+    57	    return this.tx.unresolved;
     58	  }
-    59	  receipt(hash: string) {
-    60	    return this.provider.getTransactionReceipt(hash);
+    59	  checkUnresolved() {
+    60	    return this.tx.checkUnresolved();
     61	  }
-    62	  send(
-    63	    tx: { to: string; data: string; value?: bigint },
-    64	    gasLimit: bigint,
-    65	    gas: GasInfo,
-    66	    timeoutSec: number,
-    67	    onSigned?: (hash: string, nonce: number) => void,
-    68	  ): Promise<TxResult> {
-    69	    return this.tx.send(tx, gasLimit, gas, timeoutSec, onSigned);
+    62	  receipt(hash: string) {
+    63	    return this.provider.getTransactionReceipt(hash);
+    64	  }
+    65	  readyToSend() {
+    66	    return this.tx.readyToSend();
+    67	  }
+    68	  cancelNonce() {
+    69	    return this.tx.cancelNonce();
     70	  }
-    71	
-    72	  get address(): string {
-    73	    if (!this.wallet) throw new Error('PRIVATE_KEY not set');
-    74	    return this.wallet.address;
-    75	  }
-    76	
-    77	  erc20(token: string) {
-    78	    return new ethers.Contract(token, ERC20_ABI, this.wallet ?? this.provider);
-    79	  }
-    80	
-    81	  async decimals(token: string): Promise<number> {
-    82	    const key = token.toLowerCase();
-    83	    if (!this.decimalsCache.has(key)) this.decimalsCache.set(key, Number(await this.erc20(token).decimals()));
-    84	    return this.decimalsCache.get(key)!;
-    85	  }
-    86	
-    87	  async tokenBalance(token: string, owner = this.address): Promise<bigint> {
-    88	    return this.erc20(token).balanceOf(owner);
-    89	  }
-    90	
-    91	  async ethBalance(owner = this.address): Promise<bigint> {
-    92	    return this.provider.getBalance(owner);
-    93	  }
-    94	
-    95	  async gas(): Promise<GasInfo> {
-    96	    const block = await this.provider.getBlock('latest');
-    97	    const baseFee = block?.baseFeePerGas ?? 0n;
-    98	    const tip = ethers.parseUnits(String(this.priorityFeeGwei), 'gwei');
-    99	    return { baseFee, tip, effective: baseFee + tip, maxFee: baseFee * 2n + tip };
-   100	  }
-   101	
-   102	  /** Gas units needed for an approval before the swap (0 if allowance already covers it). */
-   103	  async approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint> {
-   104	    if (!this.wallet) return 0n;
-   105	    const allowance: bigint = await this.erc20(token).allowance(this.address, spender);
-   106	    if (allowance >= amount) return 0n;
-   107	    return allowance > 0n ? APPROVE_GAS * 2n : APPROVE_GAS; // USDT-style tokens need approve(0) first
-   108	  }
-   109	
-   110	  /** Approve exactly `amount` (never unlimited). Sent through the private RPC. */
-   111	  async approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult> {
-   112	    const c = this.erc20(token);
-   113	    let cost = 0n;
-   114	    const current: bigint = await c.allowance(this.address, spender);
-   115	    if (current >= amount) return { ok: true, gasCostWei: 0n };
-   116	    if (current > 0n) {
-   117	      const data0 = c.interface.encodeFunctionData('approve', [spender, 0n]);
-   118	      const r = await this.send({ to: token, data: data0 }, await this.approveGasLimit(token, data0), gas, 60);
-   119	      cost += r.gasCostWei;
-   120	      if (!r.ok) return { ...r, gasCostWei: cost };
-   121	    }
-   122	    const data = c.interface.encodeFunctionData('approve', [spender, amount]);
-   123	    const r = await this.send({ to: token, data }, await this.approveGasLimit(token, data), gas, 60);
-   124	    return { ...r, gasCostWei: cost + r.gasCostWei };
-   125	  }
-   126	
-   127	  /** Some tokens need more than 60k gas for approve: estimate, +30%, never below 60k. */
-   128	  private async approveGasLimit(token: string, data: string): Promise<bigint> {
-   129	    try {
-   130	      const est = await this.provider.estimateGas({ from: this.address, to: token, data });
-   131	      const limit = (est * 13n) / 10n;
-   132	      return limit > APPROVE_GAS ? limit : APPROVE_GAS;
-   133	    } catch {
-   134	      return APPROVE_GAS * 2n;
-   135	    }
-   136	  }
-   137	
-   138	  /** eth_call + estimateGas. Returns the gas estimate, or throws with the revert reason. */
-   139	  async simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint> {
-   140	    const req = { from: this.address, to: tx.to, data: tx.data, value: tx.value };
-   141	    await this.provider.call(req);
-   142	    return this.provider.estimateGas(req);
-   143	  }
-   144	}
+    71	  resetNonce() {
+    72	    this.tx.resetNonce();
+    73	  }
+    74	  send(
+    75	    tx: { to: string; data: string; value?: bigint },
+    76	    gasLimit: bigint,
+    77	    gas: GasInfo,
+    78	    timeoutSec: number,
+    79	    onSigned?: (hash: string, nonce: number) => void,
+    80	  ): Promise<TxResult> {
+    81	    return this.tx.send(tx, gasLimit, gas, timeoutSec, onSigned);
+    82	  }
+    83	
+    84	  get address(): string {
+    85	    if (!this.wallet) throw new Error('PRIVATE_KEY not set');
+    86	    return this.wallet.address;
+    87	  }
+    88	
+    89	  erc20(token: string) {
+    90	    return new ethers.Contract(token, ERC20_ABI, this.wallet ?? this.provider);
+    91	  }
+    92	
+    93	  async decimals(token: string): Promise<number> {
+    94	    const key = token.toLowerCase();
+    95	    if (!this.decimalsCache.has(key)) this.decimalsCache.set(key, Number(await this.erc20(token).decimals()));
+    96	    return this.decimalsCache.get(key)!;
+    97	  }
+    98	
+    99	  async tokenBalance(token: string, owner = this.address): Promise<bigint> {
+   100	    return this.erc20(token).balanceOf(owner);
+   101	  }
+   102	
+   103	  async ethBalance(owner = this.address): Promise<bigint> {
+   104	    return this.provider.getBalance(owner);
+   105	  }
+   106	
+   107	  async gas(): Promise<GasInfo> {
+   108	    const block = await this.provider.getBlock('latest');
+   109	    const baseFee = block?.baseFeePerGas ?? 0n;
+   110	    const tip = ethers.parseUnits(String(this.priorityFeeGwei), 'gwei');
+   111	    return { baseFee, tip, effective: baseFee + tip, maxFee: baseFee * 2n + tip };
+   112	  }
+   113	
+   114	  /** Gas units needed for an approval before the swap (0 if allowance already covers it). */
+   115	  async approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint> {
+   116	    if (!this.wallet) return 0n;
+   117	    const allowance: bigint = await this.erc20(token).allowance(this.address, spender);
+   118	    if (allowance >= amount) return 0n;
+   119	    return allowance > 0n ? APPROVE_GAS * 2n : APPROVE_GAS; // USDT-style tokens need approve(0) first
+   120	  }
+   121	
+   122	  /** Approve exactly `amount` (never unlimited). Sent through the private RPC. */
+   123	  async approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult> {
+   124	    const c = this.erc20(token);
+   125	    let cost = 0n;
+   126	    const current: bigint = await c.allowance(this.address, spender);
+   127	    if (current >= amount) return { ok: true, gasCostWei: 0n };
+   128	    if (current > 0n) {
+   129	      const data0 = c.interface.encodeFunctionData('approve', [spender, 0n]);
+   130	      const r = await this.send({ to: token, data: data0 }, await this.approveGasLimit(token, data0), gas, 60);
+   131	      cost += r.gasCostWei;
+   132	      if (!r.ok) return { ...r, gasCostWei: cost };
+   133	    }
+   134	    const data = c.interface.encodeFunctionData('approve', [spender, amount]);
+   135	    const r = await this.send({ to: token, data }, await this.approveGasLimit(token, data), gas, 60);
+   136	    return { ...r, gasCostWei: cost + r.gasCostWei };
+   137	  }
+   138	
+   139	  /** Some tokens need more than 60k gas for approve: estimate, +30%, never below 60k. */
+   140	  private async approveGasLimit(token: string, data: string): Promise<bigint> {
+   141	    try {
+   142	      const est = await this.provider.estimateGas({ from: this.address, to: token, data });
+   143	      const limit = (est * 13n) / 10n;
+   144	      return limit > APPROVE_GAS ? limit : APPROVE_GAS;
+   145	    } catch {
+   146	      return APPROVE_GAS * 2n;
+   147	    }
+   148	  }
+   149	
+   150	  /** eth_call + estimateGas. Returns the gas estimate, or throws with the revert reason. */
+   151	  async simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint> {
+   152	    const req = { from: this.address, to: tx.to, data: tx.data, value: tx.value };
+   153	    await this.provider.call(req);
+   154	    return this.provider.estimateGas(req);
+   155	  }
+   156	}
 ```
 
 ## `src/dex/txsender.ts`
@@ -4080,183 +4379,267 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     37	  nonce: number;
     38	  hashes: string[];
     39	  since: number;
-    40	}
-    41	
-    42	export interface TxBackend {
-    43	  address: string;
-    44	  confirmedNonce(): Promise<number>;
-    45	  receipt(hash: string): Promise<{ status: number | null; gasUsed: bigint; gasPrice: bigint } | null>;
-    46	  /** true if the public or the private RPC still knows this tx (pending or mined). */
-    47	  knowsTx(hash: string): Promise<boolean>;
-    48	  sign(tx: { nonce: number; to: string; data: string; value: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Promise<{ raw: string; hash: string }>;
-    49	  broadcast(raw: string): Promise<void>;
-    50	  gas(): Promise<GasInfo>;
-    51	}
-    52	
-    53	export interface KeyValue {
-    54	  get(): string | undefined;
-    55	  set(v: string | null): void;
-    56	}
-    57	
-    58	export const DROP_AFTER_MS = 10 * 60_000;
+    40	  /** Highest maxFeePerGas / tip used at this nonce (a replacement must outbid them). */
+    41	  maxFee?: string;
+    42	  tip?: string;
+    43	  /** false while we are still waiting normally (in flight); true once the outcome is unknown. */
+    44	  unknown?: boolean;
+    45	}
+    46	
+    47	export interface TxBackend {
+    48	  address: string;
+    49	  confirmedNonce(): Promise<number>;
+    50	  receipt(hash: string): Promise<{ status: number | null; gasUsed: bigint; gasPrice: bigint } | null>;
+    51	  /** true if the public or the private RPC still knows this tx (pending or mined). */
+    52	  knowsTx(hash: string): Promise<boolean>;
+    53	  sign(tx: { nonce: number; to: string; data: string; value: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Promise<{ raw: string; hash: string }>;
+    54	  broadcast(raw: string): Promise<void>;
+    55	  /** Optional second route (public RPC) for /cancelnonce. */
+    56	  broadcastPublic?(raw: string): Promise<void>;
+    57	  gas(): Promise<GasInfo>;
+    58	}
     59	
-    60	/** What a broadcast error means. */
-    61	export function classifySendError(e: unknown): 'accepted' | 'rejected' | 'ambiguous' {
-    62	  const o = (e ?? {}) as { code?: unknown; error?: { code?: unknown }; info?: { error?: { code?: unknown } } };
-    63	  const msg = errMsg(e);
-    64	  if (/already known|known transaction|already imported|already in mempool/i.test(msg)) return 'accepted';
-    65	  if (['INSUFFICIENT_FUNDS', 'NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(String(o.code))) return 'rejected';
-    66	  if (/nonce too low|insufficient funds|underpriced|intrinsic gas too low|exceeds block gas limit|invalid sender|max fee per gas less than/i.test(msg)) {
-    67	    return 'rejected';
-    68	  }
-    69	  // The server answered with a JSON-RPC error object: it explicitly refused the tx.
-    70	  if (typeof o.error?.code === 'number' || typeof o.info?.error?.code === 'number') return 'rejected';
-    71	  return 'ambiguous'; // timeout, connection reset, 5xx, no answer: it may have been accepted
-    72	}
-    73	
-    74	export class TxSender {
-    75	  private nextNonce: number | null = null;
-    76	
-    77	  constructor(
-    78	    private b: TxBackend,
-    79	    private store?: KeyValue,
-    80	    private now: () => number = Date.now,
-    81	    private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
-    82	  ) {}
+    60	export interface KeyValue {
+    61	  get(): string | undefined;
+    62	  set(v: string | null): void;
+    63	}
+    64	
+    65	export const DROP_AFTER_MS = 10 * 60_000;
+    66	
+    67	/** What a broadcast error means. */
+    68	export function classifySendError(e: unknown): 'accepted' | 'rejected' | 'ambiguous' {
+    69	  const o = (e ?? {}) as { code?: unknown; error?: { code?: unknown }; info?: { error?: { code?: unknown } } };
+    70	  const msg = errMsg(e);
+    71	  if (/already known|known transaction|already imported|already in mempool/i.test(msg)) return 'accepted';
+    72	  if (['INSUFFICIENT_FUNDS', 'NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(String(o.code))) return 'rejected';
+    73	  if (/nonce too low|insufficient funds|underpriced|intrinsic gas too low|exceeds block gas limit|invalid sender|max fee per gas less than/i.test(msg)) {
+    74	    return 'rejected';
+    75	  }
+    76	  // The server answered with a JSON-RPC error object: it explicitly refused the tx.
+    77	  if (typeof o.error?.code === 'number' || typeof o.info?.error?.code === 'number') return 'rejected';
+    78	  return 'ambiguous'; // timeout, connection reset, 5xx, no answer: it may have been accepted
+    79	}
+    80	
+    81	export class TxSender {
+    82	  private nextNonce: number | null = null;
     83	
-    84	  get unresolved(): Unresolved | null {
-    85	    const v = this.store?.get() ?? this.mem;
-    86	    return v ? (JSON.parse(v) as Unresolved) : null;
-    87	  }
-    88	  private mem: string | undefined;
-    89	  private setUnresolved(u: Unresolved | null) {
-    90	    const v = u ? JSON.stringify(u) : null;
-    91	    if (this.store) this.store.set(v);
-    92	    else this.mem = v ?? undefined;
-    93	  }
-    94	
-    95	  private async takeNonce(): Promise<number> {
-    96	    const confirmed = await this.b.confirmedNonce();
-    97	    if (this.nextNonce === null || this.nextNonce < confirmed) this.nextNonce = confirmed;
-    98	    return this.nextNonce;
-    99	  }
-   100	
-   101	  /**
-   102	   * Re-check an unresolved tx. 'clear' once its nonce is consumed on-chain (by it or its cancel),
-   103	   * or once no RPC knows it any more after DROP_AFTER_MS (`dropped`). 'pending' otherwise.
-   104	   */
-   105	  async checkUnresolved(): Promise<{ state: 'clear' | 'pending'; executedHash?: string; ok?: boolean; dropped?: boolean }> {
-   106	    const u = this.unresolved;
-   107	    if (!u) return { state: 'clear' };
-   108	    for (const h of u.hashes) {
-   109	      const r = await this.b.receipt(h).catch(() => null);
-   110	      if (r) {
-   111	        this.setUnresolved(null);
-   112	        this.nextNonce = Math.max(this.nextNonce ?? 0, u.nonce + 1);
-   113	        return { state: 'clear', executedHash: h, ok: r.status === 1 };
-   114	      }
-   115	    }
-   116	    const confirmed = await this.b.confirmedNonce().catch(() => -1);
-   117	    if (confirmed > u.nonce) {
-   118	      // Nonce consumed by something we have no receipt for yet (RPC lag).
-   119	      this.setUnresolved(null);
-   120	      this.nextNonce = Math.max(this.nextNonce ?? 0, confirmed);
-   121	      return { state: 'clear' };
+    84	  constructor(
+    85	    private b: TxBackend,
+    86	    private store?: KeyValue,
+    87	    private now: () => number = Date.now,
+    88	    private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+    89	  ) {}
+    90	
+    91	  get unresolved(): Unresolved | null {
+    92	    const v = this.store?.get() ?? this.mem;
+    93	    return v ? (JSON.parse(v) as Unresolved) : null;
+    94	  }
+    95	  private mem: string | undefined;
+    96	  private setUnresolved(u: Unresolved | null) {
+    97	    const v = u ? JSON.stringify(u) : null;
+    98	    if (this.store) this.store.set(v);
+    99	    else this.mem = v ?? undefined;
+   100	  }
+   101	
+   102	  private async takeNonce(): Promise<number> {
+   103	    const confirmed = await this.b.confirmedNonce();
+   104	    if (this.nextNonce === null || this.nextNonce < confirmed) this.nextNonce = confirmed;
+   105	    return this.nextNonce;
+   106	  }
+   107	
+   108	  /**
+   109	   * Re-check an unresolved tx. 'clear' once its nonce is consumed on-chain (by it or its cancel),
+   110	   * or once no RPC knows it any more after DROP_AFTER_MS (`dropped`). 'pending' otherwise.
+   111	   */
+   112	  async checkUnresolved(): Promise<{ state: 'clear' | 'pending'; executedHash?: string; ok?: boolean; dropped?: boolean }> {
+   113	    const u = this.unresolved;
+   114	    if (!u) return { state: 'clear' };
+   115	    for (const h of u.hashes) {
+   116	      const r = await this.b.receipt(h).catch(() => null);
+   117	      if (r) {
+   118	        this.setUnresolved(null);
+   119	        this.nextNonce = Math.max(this.nextNonce ?? 0, u.nonce + 1);
+   120	        return { state: 'clear', executedHash: h, ok: r.status === 1 };
+   121	      }
    122	    }
-   123	    if (this.now() - u.since > DROP_AFTER_MS) {
-   124	      const known = await Promise.all(u.hashes.map((h) => this.b.knowsTx(h).catch(() => true)));
-   125	      if (!known.some(Boolean)) {
-   126	        // Never accepted or dropped by every mempool: the nonce is free again.
-   127	        this.setUnresolved(null);
-   128	        this.nextNonce = null;
-   129	        return { state: 'clear', dropped: true };
-   130	      }
-   131	    }
-   132	    return { state: 'pending' };
-   133	  }
-   134	
-   135	  /** Human override after checking the wallet by hand (/start confirm only does this if checkUnresolved agrees). */
-   136	  forget(): void {
-   137	    this.setUnresolved(null);
-   138	    this.nextNonce = null;
-   139	  }
-   140	
-   141	  async send(
-   142	    tx: { to: string; data: string; value?: bigint },
-   143	    gasLimit: bigint,
-   144	    gas: GasInfo,
-   145	    timeoutSec: number,
-   146	    onSigned?: (hash: string, nonce: number) => void,
-   147	  ): Promise<TxResult> {
-   148	    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
-   149	      return { ok: false, refused: true, gasCostWei: 0n, reason: `earlier tx ${this.unresolved!.hashes[0]} still unresolved` };
-   150	    }
-   151	    const nonce = await this.takeNonce();
-   152	    const { raw, hash } = await this.b.sign({
-   153	      nonce, to: tx.to, data: tx.data, value: tx.value ?? 0n, gasLimit, maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.tip,
-   154	    });
-   155	    this.nextNonce = nonce + 1;
-   156	    onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
-   157	    try {
-   158	      await this.b.broadcast(raw);
-   159	    } catch (e) {
-   160	      const kind = classifySendError(e);
-   161	      if (kind === 'rejected') {
-   162	        this.nextNonce = nonce; // nothing was broadcast: reuse the nonce
-   163	        return { ok: false, rejected: true, hash, gasCostWei: 0n, reason: `RPC rejected the tx: ${errMsg(e)}` };
-   164	      }
-   165	      if (kind === 'ambiguous') {
-   166	        this.setUnresolved({ nonce, hashes: [hash], since: this.now() });
-   167	        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `send error, outcome unknown: ${errMsg(e)}` };
-   168	      }
-   169	      // 'accepted': already in the mempool, just wait for it below.
-   170	    }
-   171	    log.info(`tx sent ${hash} (nonce ${nonce})`);
-   172	
-   173	    let receipt = await this.waitReceipt(hash, timeoutSec);
-   174	    if (receipt) return this.result(hash, receipt);
-   175	
-   176	    log.warn(`tx ${hash} not mined in ${timeoutSec}s, sending cancel`);
-   177	    // Re-read gas: if the base fee spiked while we waited, a cancel priced from the old fee would not mine either.
-   178	    const fresh = await this.b.gas().catch(() => gas);
-   179	    const bump = (x: bigint) => (x * 13n) / 10n; // +30% to replace
-   180	    const maxFee = [bump(gas.maxFee), bump(fresh.maxFee)].reduce((a, c) => (c > a ? c : a));
-   181	    const tip = [bump(gas.tip), bump(fresh.tip)].reduce((a, c) => (c > a ? c : a));
-   182	    const cancel = await this.b.sign({ nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
-   183	    this.setUnresolved({ nonce, hashes: [hash, cancel.hash], since: this.now() }); // before broadcasting the cancel
-   184	    await this.b.broadcast(cancel.raw).catch((e) => log.warn(`cancel send failed: ${errMsg(e)}`));
-   185	    const deadline = this.now() + timeoutSec * 1000;
-   186	    while (this.now() < deadline) {
-   187	      receipt = await this.b.receipt(hash).catch(() => null);
-   188	      if (receipt) {
-   189	        this.setUnresolved(null);
-   190	        return this.result(hash, receipt);
-   191	      }
-   192	      const c = await this.b.receipt(cancel.hash).catch(() => null);
-   193	      if (c) {
-   194	        this.setUnresolved(null);
-   195	        return { ok: false, hash, gasCostWei: c.gasUsed * c.gasPrice, reason: 'not mined, cancelled' };
-   196	      }
-   197	      await this.sleep(3000);
-   198	    }
-   199	    return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancel.hash} not confirmed: outcome UNKNOWN` };
-   200	  }
-   201	
-   202	  private result(hash: string, r: { status: number | null; gasUsed: bigint; gasPrice: bigint }): TxResult {
-   203	    const cost = r.gasUsed * r.gasPrice;
-   204	    return r.status === 1 ? { ok: true, hash, gasCostWei: cost } : { ok: false, hash, gasCostWei: cost, reason: 'reverted' };
-   205	  }
-   206	
-   207	  private async waitReceipt(hash: string, timeoutSec: number) {
-   208	    const deadline = this.now() + timeoutSec * 1000;
-   209	    while (this.now() < deadline) {
-   210	      const r = await this.b.receipt(hash).catch(() => null);
-   211	      if (r) return r;
-   212	      await this.sleep(2000);
-   213	    }
-   214	    return null;
-   215	  }
-   216	}
+   123	    const confirmed = await this.b.confirmedNonce().catch(() => -1);
+   124	    if (confirmed > u.nonce) {
+   125	      // Nonce consumed by something we have no receipt for yet (RPC lag).
+   126	      this.setUnresolved(null);
+   127	      this.nextNonce = Math.max(this.nextNonce ?? 0, confirmed);
+   128	      return { state: 'clear' };
+   129	    }
+   130	    if (this.now() - u.since > DROP_AFTER_MS) {
+   131	      const known = await Promise.all(u.hashes.map((h) => this.b.knowsTx(h).catch(() => true)));
+   132	      if (!known.some(Boolean)) {
+   133	        // Never accepted or dropped by every mempool: the nonce is free again.
+   134	        this.setUnresolved(null);
+   135	        this.nextNonce = null;
+   136	        return { state: 'clear', dropped: true };
+   137	      }
+   138	    }
+   139	    return { state: 'pending' };
+   140	  }
+   141	
+   142	  /** Re-read the nonce from the chain on the next send (after /start confirm). */
+   143	  resetNonce(): void {
+   144	    this.nextNonce = null;
+   145	  }
+   146	
+   147	  /**
+   148	   * Safe to send now? Only if nothing is unresolved AND our next nonce is exactly the chain's next nonce
+   149	   * (a gap would make the tx unminable, so the MEXC leg must not fire).
+   150	   */
+   151	  async readyToSend(): Promise<{ ok: boolean; reason?: string }> {
+   152	    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
+   153	      const u = this.unresolved!;
+   154	      return { ok: false, reason: `tx at nonce ${u.nonce} unresolved (${u.hashes.join(', ')})` };
+   155	    }
+   156	    const latest = await this.b.confirmedNonce();
+   157	    if (this.nextNonce !== null && this.nextNonce !== latest) {
+   158	      log.warn(`nonce gap: local ${this.nextNonce}, chain ${latest}; resetting to the chain value`);
+   159	      this.nextNonce = latest;
+   160	    }
+   161	    return { ok: true };
+   162	  }
+   163	
+   164	  /**
+   165	   * /cancelnonce: replace the unresolved tx with a 0-value self-transfer at the same nonce, at least 2x the
+   166	   * highest fee used so far, through the private AND the public RPC. Waits up to `timeoutMs` for the nonce to be used.
+   167	   */
+   168	  async cancelNonce(timeoutMs = 10 * 60_000): Promise<string> {
+   169	    const u = this.unresolved;
+   170	    if (!u) return 'Nothing unresolved.';
+   171	    const g = await this.b.gas();
+   172	    const twice = (x: bigint | undefined) => (x ?? 0n) * 2n;
+   173	    const max = (...xs: bigint[]) => xs.reduce((a, c) => (c > a ? c : a));
+   174	    const maxFee = max(twice(u.maxFee ? BigInt(u.maxFee) : undefined), g.maxFee * 2n);
+   175	    const tip = max(twice(u.tip ? BigInt(u.tip) : undefined), g.tip * 2n);
+   176	    const c = await this.b.sign({ nonce: u.nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
+   177	    this.setUnresolved({ ...u, hashes: [...u.hashes, c.hash], maxFee: maxFee.toString(), tip: tip.toString() });
+   178	    await Promise.allSettled([this.b.broadcast(c.raw), this.b.broadcastPublic?.(c.raw)]);
+   179	    const deadline = this.now() + timeoutMs;
+   180	    while (this.now() < deadline) {
+   181	      const r = await this.checkUnresolved();
+   182	      if (r.state === 'clear') {
+   183	        if (r.executedHash) return `Nonce ${u.nonce} used by ${r.executedHash} (${r.executedHash === c.hash ? 'the cancel' : 'an earlier tx'}, ${r.ok ? 'success' : 'reverted'}).`;
+   184	        return `Nonce ${u.nonce} is used${r.dropped ? ' (all txs were dropped)' : ''}, but no receipt was found for our hashes: check etherscan.`;
+   185	      }
+   186	      await this.sleep(5000);
+   187	    }
+   188	    return `Nonce ${u.nonce} still not used after ${Math.round(timeoutMs / 60_000)} min (cancel ${c.hash}). Try /cancelnonce again later.`;
+   189	  }
+   190	
+   191	  async send(
+   192	    tx: { to: string; data: string; value?: bigint },
+   193	    gasLimit: bigint,
+   194	    gas: GasInfo,
+   195	    timeoutSec: number,
+   196	    onSigned?: (hash: string, nonce: number) => void,
+   197	  ): Promise<TxResult> {
+   198	    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
+   199	      return { ok: false, refused: true, gasCostWei: 0n, reason: `earlier tx ${this.unresolved!.hashes[0]} still unresolved` };
+   200	    }
+   201	    const nonce = await this.takeNonce();
+   202	    const { raw, hash } = await this.b.sign({
+   203	      nonce, to: tx.to, data: tx.data, value: tx.value ?? 0n, gasLimit, maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.tip,
+   204	    });
+   205	    this.nextNonce = nonce + 1;
+   206	    onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
+   207	    // In flight from now on, and PERSISTED: if the bot dies while waiting, a restart still knows this nonce is taken.
+   208	    const fees = { maxFee: gas.maxFee.toString(), tip: gas.tip.toString() };
+   209	    this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: false });
+   210	    try {
+   211	      await this.b.broadcast(raw);
+   212	    } catch (e) {
+   213	      const kind = classifySendError(e);
+   214	      if (kind === 'rejected') {
+   215	        this.nextNonce = nonce; // nothing was broadcast: reuse the nonce
+   216	        this.setUnresolved(null);
+   217	        return { ok: false, rejected: true, hash, gasCostWei: 0n, reason: `RPC rejected the tx: ${errMsg(e)}` };
+   218	      }
+   219	      if (kind === 'ambiguous') {
+   220	        this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: true });
+   221	        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `send error, outcome unknown: ${errMsg(e)}` };
+   222	      }
+   223	      // 'accepted': already in the mempool, just wait for it below.
+   224	    }
+   225	    log.info(`tx sent ${hash} (nonce ${nonce})`);
+   226	
+   227	    let receipt = await this.waitReceipt(hash, timeoutSec);
+   228	    if (receipt) {
+   229	      this.setUnresolved(null);
+   230	      return this.result(hash, receipt);
+   231	    }
+   232	
+   233	    log.warn(`tx ${hash} not mined in ${timeoutSec}s, sending cancel`);
+   234	    // Re-read gas: if the base fee spiked while we waited, a cancel priced from the old fee would not mine either.
+   235	    const fresh = await this.b.gas().catch(() => gas);
+   236	    const bump = (x: bigint) => (x * 13n) / 10n; // +30% to replace
+   237	    const maxFee = [bump(gas.maxFee), bump(fresh.maxFee)].reduce((a, c) => (c > a ? c : a));
+   238	    const tip = [bump(gas.tip), bump(fresh.tip)].reduce((a, c) => (c > a ? c : a));
+   239	    const cancel = await this.b.sign({ nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
+   240	    this.setUnresolved({ nonce, hashes: [hash, cancel.hash], since: this.now(), maxFee: maxFee.toString(), tip: tip.toString(), unknown: false }); // before broadcasting the cancel
+   241	    await this.b.broadcast(cancel.raw).catch((e) => log.warn(`cancel send failed: ${errMsg(e)}`));
+   242	    const deadline = this.now() + timeoutSec * 1000;
+   243	    while (this.now() < deadline) {
+   244	      receipt = await this.b.receipt(hash).catch(() => null);
+   245	      if (receipt) {
+   246	        this.setUnresolved(null);
+   247	        return this.result(hash, receipt);
+   248	      }
+   249	      const c = await this.b.receipt(cancel.hash).catch(() => null);
+   250	      if (c) {
+   251	        this.setUnresolved(null);
+   252	        return { ok: false, hash, gasCostWei: c.gasUsed * c.gasPrice, reason: 'not mined, cancelled' };
+   253	      }
+   254	      await this.sleep(3000);
+   255	    }
+   256	    this.setUnresolved({ ...this.unresolved!, unknown: true });
+   257	    return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancel.hash} not confirmed: outcome UNKNOWN` };
+   258	  }
+   259	
+   260	  private result(hash: string, r: { status: number | null; gasUsed: bigint; gasPrice: bigint }): TxResult {
+   261	    const cost = r.gasUsed * r.gasPrice;
+   262	    return r.status === 1 ? { ok: true, hash, gasCostWei: cost } : { ok: false, hash, gasCostWei: cost, reason: 'reverted' };
+   263	  }
+   264	
+   265	  private async waitReceipt(hash: string, timeoutSec: number) {
+   266	    const deadline = this.now() + timeoutSec * 1000;
+   267	    while (this.now() < deadline) {
+   268	      const r = await this.b.receipt(hash).catch(() => null);
+   269	      if (r) return r;
+   270	      await this.sleep(2000);
+   271	    }
+   272	    return null;
+   273	  }
+   274	}
+```
+
+## `scripts/check-0x-quote.ts`
+
+```ts
+     1	// One read-only firm 0x quote, to confirm before going live that transaction.to is the AllowanceHolder.
+     2	// It NEVER signs or sends anything, and prints only transaction.to, allowanceTarget and issues.
+     3	// Usage: npx tsx scripts/check-0x-quote.ts   (reads ZEROX_API_KEY and PRIVATE_KEY -> address from .env)
+     4	import 'dotenv/config';
+     5	import { ethers } from 'ethers';
+     6	
+     7	const AH = '0x0000000000001fF3684f28c67538d4D072C22734';
+     8	const USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
+     9	const WETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+    10	
+    11	const key = process.env.ZEROX_API_KEY;
+    12	const pk = process.env.PRIVATE_KEY;
+    13	if (!key || !pk) throw new Error('ZEROX_API_KEY and PRIVATE_KEY are needed in .env (the key is only used to derive the address)');
+    14	const taker = new ethers.Wallet(pk).address;
+    15	
+    16	const q = new URLSearchParams({ chainId: '1', sellToken: USDC, buyToken: WETH, sellAmount: '10000000', taker, slippagePpm: '3000' });
+    17	const res = await fetch(`https://api.0x.org/swap/allowance-holder/quote?${q}`, { headers: { '0x-api-key': key, '0x-version': 'v2' } });
+    18	const d = (await res.json()) as { transaction?: { to?: string }; allowanceTarget?: string; issues?: unknown };
+    19	console.log(JSON.stringify({ http: res.status, transactionTo: d.transaction?.to, allowanceTarget: d.allowanceTarget, issues: d.issues }, null, 2));
+    20	const ok = d.transaction?.to?.toLowerCase() === AH.toLowerCase();
+    21	console.log(ok ? `OK: transaction.to is the AllowanceHolder ${AH}` : `MISMATCH: expected ${AH}. The bot would reject every quote; do not go live.`);
 ```
 
 ## `test/engine.test.ts`
@@ -4296,333 +4679,507 @@ MEXC <-> Ethereum DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, S
     32	  placeAmbiguous?: boolean;
     33	  minNotional?: number;
     34	  unresolved?: boolean;
-    35	}) {
-    36	  process.env.MODE = opts.mode ?? 'live';
-    37	  process.env.RPC_URL = 'http://localhost';
-    38	  process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
-    39	  process.env.MIN_PROFIT_USD = '15';
-    40	  process.env.PRIVATE_KEY = '0x' + '11'.repeat(32);
-    41	  process.env.MEXC_API_KEY = 'k'.repeat(10);
-    42	  process.env.MEXC_API_SECRET = 's'.repeat(10);
-    43	  const cfg = loadConfig();
-    44	  const db = new Db(':memory:');
-    45	  const risk = new Risk(db, cfg.mode, cfg);
-    46	  const alerts: string[] = [];
-    47	  const calls: string[] = [];
-    48	
-    49	  const fee = cfg.mexcTakerFee;
-    50	  const bid = opts.bid ?? 11.2;
-    51	  // Real-ish balances that the fakes update, so PnL is computed from balance changes.
-    52	  const bal: Balances = { walletEth: 1, walletUsdc: 1000, walletToken: { LINK: 100 }, mexc: { USDT: 1000, LINK: 100 } };
-    53	  const ethUsd = 2000;
-    54	
-    55	  const books: Record<string, Book> = {
-    56	    ETHUSDT: { bids: [[ethUsd, 100]], asks: [[ethUsd, 100]], ts: Date.now() },
-    57	    LINKUSDT: { bids: [[bid, 1000]], asks: [[bid + 0.01, 1000]], ts: Date.now() },
-    58	  };
-    59	
-    60	  // DEX price = 10 USDC per LINK, 0.1% minOut buffer.
-    61	  const dexQuote = (r: QuoteRequest, firm: boolean): Quote => {
-    62	    const buyingToken = r.sellToken === USDC;
-    63	    const out = buyingToken ? (r.sellAmount * 10n ** 12n) / 10n : (r.sellAmount * 10n) / 10n ** 12n;
-    64	    return {
-    65	      buyAmount: out,
-    66	      minBuyAmount: (out * 999n) / 1000n,
-    67	      gas: 150_000n,
-    68	      spender: '0xspender',
-    69	      tx: firm ? { to: '0xrouter', data: '0xdead', value: 0n } : undefined,
-    70	    };
-    71	  };
-    72	  let lastFirm: QuoteRequest | null = null;
-    73	
-    74	  const orders = new Map<string, Order>();
-    75	  const byCid = new Map<string, string>();
-    76	  let nextId = 1;
-    77	  const fill = (side: 'BUY' | 'SELL', qty: number, price: number) => {
-    78	    if (side === 'SELL') {
-    79	      bal.mexc.LINK -= qty;
-    80	      bal.mexc.USDT += qty * price * (1 - fee);
-    81	    } else {
-    82	      bal.mexc.LINK += qty * (1 - fee);
-    83	      bal.mexc.USDT -= qty * price;
-    84	    }
-    85	  };
-    86	
-    87	  const token = { ...LINK, rules: { ...LINK.rules, minNotional: opts.minNotional ?? 1 } };
-    88	  const engine = new Engine({
-    89	    cfg,
-    90	    db,
-    91	    risk,
-    92	    tokens: [token],
-    93	    sleep: async () => {},
-    94	    tg: { send: async (t) => void alerts.push(t) },
-    95	    book: async (s) => books[s],
-    96	    balances: async () => structuredClone(bal),
-    97	    agg: {
-    98	      name: '0x',
-    99	      price: async (r) => dexQuote(r, false),
-   100	      quote: async (r) => ((lastFirm = r), dexQuote(r, true)),
-   101	    },
-   102	    chain: {
-   103	      address: '0xme',
-   104	      gas: async () => {
-   105	        const base = (opts.gasGwei ?? 9n) * GWEI;
-   106	        return { baseFee: base, tip: GWEI, effective: base + GWEI, maxFee: base * 2n + GWEI };
-   107	      },
-   108	      approvalGasNeeded: async () => (opts.approvalNeeded ? 60_000n : 0n),
-   109	      approveExact: async (_t, _s, amount) => {
-   110	        calls.push(`approve ${amount}`);
-   111	        bal.walletEth -= 0.0006;
-   112	        return { ok: true, gasCostWei: 600_000n * GWEI };
-   113	      },
-   114	      checkUnresolved: async () => ({ state: opts.unresolved ? 'pending' : 'clear' }),
-   115	      simulate: async () => {
-   116	        calls.push('simulate');
-   117	        if (opts.simulateThrows) throw new Error('execution reverted');
-   118	        return 150_000n;
-   119	      },
-   120	      send: async (): Promise<TxResult> => {
-   121	        calls.push('send');
-   122	        const gasWei = 150_000n * 10n * GWEI;
-   123	        bal.walletEth -= 0.0015;
-   124	        if (opts.dexUnknown) return { ok: false, unknown: true, hash: '0xtx', gasCostWei: 0n, reason: 'unknown' };
-   125	        if (opts.dexOk === false) return { ok: false, hash: '0xtx', gasCostWei: gasWei, reason: 'reverted' };
-   126	        const r = lastFirm!;
-   127	        if (r.sellToken === USDC) {
-   128	          bal.walletUsdc -= Number(r.sellAmount) / 1e6;
-   129	          bal.walletToken.LINK += (Number(r.sellAmount) / 1e6) / 10;
-   130	        } else {
-   131	          const tokens = Number(r.sellAmount) / 1e18;
-   132	          bal.walletToken.LINK -= tokens;
-   133	          bal.walletUsdc += tokens * 10;
-   134	        }
-   135	        return { ok: true, hash: '0xtx', gasCostWei: gasWei };
-   136	      },
-   137	    },
-   138	    mexc: {
-   139	      limitOrder: async (_s, side, q, p, cid) => {
-   140	        calls.push(`limit ${side} ${q} @ ${p}`);
-   141	        const id = String(nextId++);
-   142	        const first = id === '1';
-   143	        const filled = Number(q) * ((first ? opts.mexcFillRatio : opts.closeFillRatio) ?? 1);
-   144	        fill(side, filled, Number(p));
-   145	        orders.set(id, { orderId: id, status: filled === Number(q) ? 'FILLED' : 'PARTIALLY_FILLED', executedQty: String(filled), cummulativeQuoteQty: '0', origQty: q, price: p, side });
-   146	        if (cid) byCid.set(cid, id);
-   147	        // MEXC executed it, but our HTTP request timed out / got a 5xx:
-   148	        if (first && opts.placeAmbiguous) throw new AmbiguousRequestError('MEXC POST /api/v3/order -> 503');
-   149	        return { orderId: id };
-   150	      },
-   151	      marketSell: async (_s, q) => {
-   152	        calls.push(`market SELL ${q}`);
-   153	        const filled = Number(q) * (opts.marketFillRatio ?? 1);
-   154	        fill('SELL', filled, bid);
-   155	        orders.set('m', { orderId: 'm', status: 'FILLED', executedQty: String(filled), cummulativeQuoteQty: String(filled * bid), origQty: q, price: '0', side: 'SELL' });
-   156	        return { orderId: 'm' };
-   157	      },
-   158	      getOrderByClientId: async (_s, cid) => (byCid.has(cid) ? orders.get(byCid.get(cid)!)! : null),
-   159	      getOrder: async (_s, id) => orders.get(id)!,
-   160	      cancelOrder: async (_s, id) => {
-   161	        calls.push(`cancel ${id}`);
-   162	        const o = orders.get(id)!;
-   163	        o.status = 'PARTIALLY_CANCELED';
-   164	        return o;
-   165	      },
-   166	    },
-   167	  });
-   168	  return { engine, db, risk, alerts, calls, bal, cfg };
-   169	}
-   170	
-   171	const trades = (db: Db) => db.statsSince(0);
+    35	  notReady?: boolean;
+    36	}) {
+    37	  process.env.MODE = opts.mode ?? 'live';
+    38	  process.env.RPC_URL = 'http://localhost';
+    39	  process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
+    40	  process.env.MIN_PROFIT_USD = '15';
+    41	  process.env.PRIVATE_KEY = '0x' + '11'.repeat(32);
+    42	  process.env.MEXC_API_KEY = 'k'.repeat(10);
+    43	  process.env.MEXC_API_SECRET = 's'.repeat(10);
+    44	  const cfg = loadConfig();
+    45	  const db = new Db(':memory:');
+    46	  const risk = new Risk(db, cfg.mode, cfg);
+    47	  const alerts: string[] = [];
+    48	  const calls: string[] = [];
+    49	
+    50	  const fee = cfg.mexcTakerFee;
+    51	  const bid = opts.bid ?? 11.2;
+    52	  // Real-ish balances that the fakes update, so PnL is computed from balance changes.
+    53	  const bal: Balances = { walletEth: 1, walletUsdc: 1000, walletToken: { LINK: 100 }, mexc: { USDT: 1000, LINK: 100 } };
+    54	  const ethUsd = 2000;
+    55	
+    56	  const books: Record<string, Book> = {
+    57	    ETHUSDT: { bids: [[ethUsd, 100]], asks: [[ethUsd, 100]], ts: Date.now() },
+    58	    LINKUSDT: { bids: [[bid, 1000]], asks: [[bid + 0.01, 1000]], ts: Date.now() },
+    59	  };
+    60	
+    61	  // DEX price = 10 USDC per LINK, 0.1% minOut buffer.
+    62	  const dexQuote = (r: QuoteRequest, firm: boolean): Quote => {
+    63	    const buyingToken = r.sellToken === USDC;
+    64	    const out = buyingToken ? (r.sellAmount * 10n ** 12n) / 10n : (r.sellAmount * 10n) / 10n ** 12n;
+    65	    return {
+    66	      buyAmount: out,
+    67	      minBuyAmount: (out * 999n) / 1000n,
+    68	      gas: 150_000n,
+    69	      spender: '0xspender',
+    70	      tx: firm ? { to: '0xrouter', data: '0xdead', value: 0n } : undefined,
+    71	    };
+    72	  };
+    73	  let lastFirm: QuoteRequest | null = null;
+    74	
+    75	  const orders = new Map<string, Order>();
+    76	  const byCid = new Map<string, string>();
+    77	  let nextId = 1;
+    78	  const fill = (side: 'BUY' | 'SELL', qty: number, price: number) => {
+    79	    if (side === 'SELL') {
+    80	      bal.mexc.LINK -= qty;
+    81	      bal.mexc.USDT += qty * price * (1 - fee);
+    82	    } else {
+    83	      bal.mexc.LINK += qty * (1 - fee);
+    84	      bal.mexc.USDT -= qty * price;
+    85	    }
+    86	  };
+    87	
+    88	  const token = { ...LINK, rules: { ...LINK.rules, minNotional: opts.minNotional ?? 1 } };
+    89	  const engine = new Engine({
+    90	    cfg,
+    91	    db,
+    92	    risk,
+    93	    tokens: [token],
+    94	    sleep: async () => {},
+    95	    tg: { send: async (t) => void alerts.push(t) },
+    96	    book: async (s) => books[s],
+    97	    balances: async () => structuredClone(bal),
+    98	    agg: {
+    99	      name: '0x',
+   100	      price: async (r) => dexQuote(r, false),
+   101	      quote: async (r) => ((lastFirm = r), dexQuote(r, true)),
+   102	    },
+   103	    chain: {
+   104	      address: '0xme',
+   105	      gas: async () => {
+   106	        const base = (opts.gasGwei ?? 9n) * GWEI;
+   107	        return { baseFee: base, tip: GWEI, effective: base + GWEI, maxFee: base * 2n + GWEI };
+   108	      },
+   109	      approvalGasNeeded: async () => (opts.approvalNeeded ? 60_000n : 0n),
+   110	      approveExact: async (_t, _s, amount) => {
+   111	        calls.push(`approve ${amount}`);
+   112	        bal.walletEth -= 0.0006;
+   113	        return { ok: true, gasCostWei: 600_000n * GWEI };
+   114	      },
+   115	      checkUnresolved: async () => ({ state: opts.unresolved ? 'pending' : 'clear' }),
+   116	      readyToSend: async () => (opts.notReady ? { ok: false, reason: 'nonce gap' } : { ok: true }),
+   117	      simulate: async () => {
+   118	        calls.push('simulate');
+   119	        if (opts.simulateThrows) throw new Error('execution reverted');
+   120	        return 150_000n;
+   121	      },
+   122	      send: async (): Promise<TxResult> => {
+   123	        calls.push('send');
+   124	        const gasWei = 150_000n * 10n * GWEI;
+   125	        bal.walletEth -= 0.0015;
+   126	        if (opts.dexUnknown) return { ok: false, unknown: true, hash: '0xtx', gasCostWei: 0n, reason: 'unknown' };
+   127	        if (opts.dexOk === false) return { ok: false, hash: '0xtx', gasCostWei: gasWei, reason: 'reverted' };
+   128	        const r = lastFirm!;
+   129	        if (r.sellToken === USDC) {
+   130	          bal.walletUsdc -= Number(r.sellAmount) / 1e6;
+   131	          bal.walletToken.LINK += (Number(r.sellAmount) / 1e6) / 10;
+   132	        } else {
+   133	          const tokens = Number(r.sellAmount) / 1e18;
+   134	          bal.walletToken.LINK -= tokens;
+   135	          bal.walletUsdc += tokens * 10;
+   136	        }
+   137	        return { ok: true, hash: '0xtx', gasCostWei: gasWei };
+   138	      },
+   139	    },
+   140	    mexc: {
+   141	      limitOrder: async (_s, side, q, p, cid) => {
+   142	        calls.push(`limit ${side} ${q} @ ${p}`);
+   143	        const id = String(nextId++);
+   144	        const first = id === '1';
+   145	        const filled = Number(q) * ((first ? opts.mexcFillRatio : opts.closeFillRatio) ?? 1);
+   146	        fill(side, filled, Number(p));
+   147	        orders.set(id, { orderId: id, status: filled === Number(q) ? 'FILLED' : 'PARTIALLY_FILLED', executedQty: String(filled), cummulativeQuoteQty: '0', origQty: q, price: p, side });
+   148	        if (cid) byCid.set(cid, id);
+   149	        // MEXC executed it, but our HTTP request timed out / got a 5xx:
+   150	        if (first && opts.placeAmbiguous) throw new AmbiguousRequestError('MEXC POST /api/v3/order -> 503');
+   151	        return { orderId: id };
+   152	      },
+   153	      marketSell: async (_s, q) => {
+   154	        calls.push(`market SELL ${q}`);
+   155	        const filled = Number(q) * (opts.marketFillRatio ?? 1);
+   156	        fill('SELL', filled, bid);
+   157	        orders.set('m', { orderId: 'm', status: 'FILLED', executedQty: String(filled), cummulativeQuoteQty: String(filled * bid), origQty: q, price: '0', side: 'SELL' });
+   158	        return { orderId: 'm' };
+   159	      },
+   160	      getOrderByClientId: async (_s, cid) => (byCid.has(cid) ? orders.get(byCid.get(cid)!)! : null),
+   161	      getOrder: async (_s, id) => orders.get(id)!,
+   162	      cancelOrder: async (_s, id) => {
+   163	        calls.push(`cancel ${id}`);
+   164	        const o = orders.get(id)!;
+   165	        o.status = 'PARTIALLY_CANCELED';
+   166	        return o;
+   167	      },
+   168	    },
+   169	  });
+   170	  return { engine, db, risk, alerts, calls, bal, cfg };
+   171	}
    172	
-   173	test('profitable gap: both legs trade, PnL comes from real balance changes', async () => {
-   174	  const { engine, db, alerts, calls } = setup({});
-   175	  await engine.tick();
-   176	  // MEXC sell 20 LINK (bought 20 on DEX for $200), limit = 11.2 * (1 - 0.2%) rounded down.
-   177	  // MEXC sells what the DEX guarantees (minBuyAmount 19.98), not the expected 20.
-   178	  assert.deepEqual(calls, ['simulate', 'limit SELL 19.98 @ 11.177', 'send']);
-   179	  const s = trades(db);
-   180	  assert.equal(s.total.trades, 1);
-   181	  assert.equal(s.total.failed, 0);
-   182	  // +20 LINK in wallet, -19.98 on MEXC (0.02 kept, valued at mid 11.205); -$200 USDC; USDT in; -0.0015 ETH gas
-   183	  const expected = -200 + 19.98 * 11.177 * 0.9995 + 0.02 * 11.205 - 0.0015 * 2000;
-   184	  assert.ok(Math.abs(s.total.pnl - expected) < 1e-6, `${s.total.pnl} vs ${expected}`);
-   185	  assert.ok(Math.abs(s.total.gas - 3) < 1e-9);
-   186	  assert.ok(alerts.some((a) => a.includes('✅ LIVE LINK DEX_BUY [ok]') && a.includes('Net PnL')));
-   187	});
-   188	
-   189	test('no trade when the gap is below max($15, 0.5%)', async () => {
-   190	  const { engine, db, calls } = setup({ bid: 10.9 });
-   191	  await engine.tick();
-   192	  assert.deepEqual(calls, []);
-   193	  assert.equal(trades(db).total.trades, 0);
-   194	});
-   195	
-   196	test('DEX leg fails after MEXC sold: buys back at market, alerts one-sided', async () => {
-   197	  const { engine, db, alerts, calls, bal } = setup({ dexOk: false });
-   198	  await engine.tick();
-   199	  assert.ok(calls.includes('limit BUY 19.98 @ 11.435')); // close: aggressive limit 2% over ask 11.21
-   200	  const row = trades(db);
-   201	  assert.equal(row.total.failed, 1);
-   202	  assert.ok(alerts.some((a) => a.startsWith('⚠️ ONE-SIDED FILL LINK')));
-   203	  assert.ok(Math.abs(bal.walletToken.LINK - 100) < 1e-9); // wallet untouched
-   204	  assert.ok(Math.abs(bal.mexc.LINK - 100 + 19.98 * 0.0005) < 1e-9); // flat again except the fee
-   205	});
-   206	
-   207	test('MEXC partial fill: rest is cancelled and closed at market', async () => {
-   208	  const { engine, calls } = setup({ mexcFillRatio: 0.5 });
-   209	  await engine.tick();
-   210	  assert.ok(calls.includes('cancel 1'));
-   211	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976')); // rest closed with an aggressive limit 2% under the bid
-   212	});
-   213	
-   214	test('simulation failure: nothing is sent, approval gas is still booked', async () => {
-   215	  const { engine, db, calls } = setup({ simulateThrows: true, approvalNeeded: true });
-   216	  await engine.tick();
-   217	  assert.ok(calls[0].startsWith('approve 200000000')); // exact amount: 200 USDC, never MaxUint256
-   218	  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
-   219	  const s = trades(db);
-   220	  assert.equal(s.total.trades, 0); // approval rows are not trades
-   221	  assert.ok(s.total.pnl < 0 && s.total.gas > 0);
-   222	});
-   223	
-   224	test('gas above MAX_GAS_GWEI: no quotes at all', async () => {
-   225	  const { engine, calls } = setup({ gasGwei: 50n });
-   226	  await engine.tick();
-   227	  assert.deepEqual(calls, []);
-   228	});
-   229	
-   230	test('kill switch: paused bot does nothing', async () => {
-   231	  const { engine, risk, calls } = setup({});
-   232	  risk.pause('Telegram /stop');
-   233	  await engine.tick();
-   234	  assert.deepEqual(calls, []);
-   235	});
-   236	
-   237	test('3 failed trades in a row pause trading', async () => {
-   238	  const { engine, risk, alerts } = setup({ dexOk: false });
-   239	  await engine.tick();
-   240	  await engine.tick();
-   241	  await engine.tick();
-   242	  assert.equal(risk.paused, true);
-   243	  assert.ok(alerts.some((a) => a.includes('3 failed trades in a row')));
-   244	  const before = alerts.length;
-   245	  await engine.tick();
-   246	  assert.equal(alerts.length, before); // stays stopped
-   247	});
-   248	
-   249	test('paper mode: records the trade, sends nothing real', async () => {
-   250	  const { engine, db, calls, alerts } = setup({ mode: 'paper' });
-   251	  await engine.tick();
-   252	  assert.deepEqual(calls, []);
-   253	  assert.equal(db.statsSince(0, 'paper').total.trades, 1);
-   254	  assert.ok(alerts.some((a) => a.startsWith('📝 PAPER LINK')));
-   255	});
-   256	
-   257	test('DEX outcome unknown: NO automatic unwind, trading paused', async () => {
-   258	  const { engine, risk, calls, alerts } = setup({ dexUnknown: true });
-   259	  await engine.tick();
-   260	  assert.ok(!calls.some((c) => c.startsWith('market') || c.startsWith('limit BUY')));
-   261	  assert.equal(risk.paused, true);
-   262	  assert.ok(alerts.some((a) => a.includes('outcome UNKNOWN')));
-   263	});
-   264	
-   265	test('unwind SELL that only partly fills is detected (not assumed flat)', async () => {
-   266	  const { engine, risk, calls, alerts } = setup({ mexcFillRatio: 0.5, closeFillRatio: 0.5 });
-   267	  await engine.tick();
-   268	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976'));
-   269	  assert.equal(risk.paused, true);
-   270	  assert.equal(risk.critical, true);
-   271	  // reports what is REALLY still open (half of 9.99), not the full quantity
-   272	  assert.ok(alerts.some((a) => a.includes('market close FAILED') && a.includes('Still open: MEXC SELL 5 LINK')));
-   273	});
-   274	
-   275	test('MEXC 5xx on order placement: found by clientOrderId, no double sell', async () => {
-   276	  const { engine, db, calls } = setup({ placeAmbiguous: true });
-   277	  await engine.tick();
-   278	  assert.equal(calls.filter((c) => c.startsWith('limit SELL')).length, 1); // never re-sent, never "unwound"
-   279	  assert.ok(!calls.some((c) => c.startsWith('limit BUY')));
-   280	  assert.equal(trades(db).total.failed, 0);
-   281	});
-   282	
-   283	test('order below MEXC minNotional: rejected BEFORE any DEX tx', async () => {
-   284	  const { engine, calls } = setup({ minNotional: 1000 });
-   285	  await engine.tick();
-   286	  assert.deepEqual(calls, []); // no simulate, no send, no MEXC order
-   287	});
-   288	
-   289	test('unresolved earlier DEX tx: no new trades', async () => {
-   290	  const { engine, calls } = setup({ unresolved: true });
-   291	  await engine.tick();
-   292	  assert.deepEqual(calls, []);
-   293	});
-   294	
-   295	test('critical pause needs /start confirm; soft pause does not', () => {
-   296	  const { risk } = setup({});
-   297	  risk.pause('Telegram /stop');
-   298	  assert.equal(risk.resume(), true);
-   299	  risk.pause('DEX tx unknown 0xabc', true);
-   300	  risk.pause('Telegram /stop'); // a later soft pause must not downgrade it
-   301	  assert.equal(risk.critical, true);
-   302	  assert.equal(risk.resume(), false);
-   303	  assert.equal(risk.paused, true);
-   304	  assert.equal(risk.resume(true), true);
-   305	  assert.equal(risk.paused, false);
-   306	});
-   307	
-   308	test('worst case beyond the remaining daily loss budget: skipped before any order', async () => {
-   309	  const { engine, db, calls } = setup({});
-   310	  db.insertTrade({ ts: Date.now(), day: (await import('../src/util.js')).dhakaDay(), mode: 'live', symbol: 'X', direction: 'DEX_BUY', size_usd: 1, qty: 1, buy_price: 1, sell_price: 1, expected_net: 0, cex_fee_usd: 0, gas_usd: 0, pnl_usd: -25, status: 'ok', dex_tx: null, cex_order_id: null, note: null });
-   311	  await engine.tick(); // budget left $5 < 5% of $200 + gas
-   312	  assert.deepEqual(calls, []);
-   313	});
-   314	
-   315	test('restart with an executing row: looked up, reported, paused until /start confirm', async () => {
-   316	  const { db, risk } = setup({});
-   317	  const { recoverExecuting } = await import('../src/recovery.js');
-   318	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xpending', cex_order_id: 'cidX', note: 'client order id cidX; nonce 7' });
-   319	  const alerts: string[] = [];
-   320	  await recoverExecuting(
-   321	    db, risk, { send: async (t) => void alerts.push(t) },
-   322	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
-   323	    async () => null,
-   324	  );
-   325	  assert.equal(risk.paused, true);
-   326	  assert.equal(risk.critical, true);
-   327	  assert.equal(risk.resume(), false);
-   328	  assert.equal(db.executingTrades().length, 0);
-   329	  assert.ok(alerts[0].includes('MEXC order 9: FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
-   330	});
-   331	
-   332	test('recovery: both legs done -> trade marked ok, no critical pause', async () => {
-   333	  const { db, risk } = setup({});
-   334	  const { recoverExecuting } = await import('../src/recovery.js');
-   335	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xdone', cex_order_id: 'cidY', note: 'client order id cidY; nonce 8' });
-   336	  const alerts: string[] = [];
-   337	  await recoverExecuting(
-   338	    db, risk, { send: async (t) => void alerts.push(t) },
-   339	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
-   340	    async () => ({ status: 1 }),
-   341	    async () => ({ state: 'clear' }),
-   342	  );
-   343	  assert.equal(risk.paused, false);
-   344	  assert.equal(db.statsSince(0, 'live').total.failed, 0);
-   345	  assert.ok(alerts[0].includes('All legs completed'));
-   346	});
-   347	
-   348	test('recovery: a pending DEX tx from before the restart keeps the bot critically paused', async () => {
-   349	  const { db, risk } = setup({});
-   350	  const { recoverExecuting } = await import('../src/recovery.js');
-   351	  await recoverExecuting(db, risk, { send: async () => {} }, { getOrderByClientId: async () => null }, async () => null, async () => ({ state: 'pending' }));
-   352	  assert.equal(risk.critical, true);
-   353	});
-   354	
-   355	test('critical resume does not reset the failure streak', () => {
-   356	  const { risk, db } = setup({});
-   357	  db.setState('consecutive_fails', '2');
-   358	  risk.pause('DEX tx unknown', true);
-   359	  risk.resume(true);
-   360	  assert.equal(risk.consecutiveFails, 2);
-   361	});
+   173	const trades = (db: Db) => db.statsSince(0);
+   174	
+   175	test('profitable gap: both legs trade, PnL comes from real balance changes', async () => {
+   176	  const { engine, db, alerts, calls } = setup({});
+   177	  await engine.tick();
+   178	  // MEXC sell 20 LINK (bought 20 on DEX for $200), limit = 11.2 * (1 - 0.2%) rounded down.
+   179	  // MEXC sells what the DEX guarantees (minBuyAmount 19.98), not the expected 20.
+   180	  assert.deepEqual(calls, ['simulate', 'limit SELL 19.98 @ 11.177', 'send']);
+   181	  const s = trades(db);
+   182	  assert.equal(s.total.trades, 1);
+   183	  assert.equal(s.total.failed, 0);
+   184	  // +20 LINK in wallet, -19.98 on MEXC (0.02 kept, valued at mid 11.205); -$200 USDC; USDT in; -0.0015 ETH gas
+   185	  const expected = -200 + 19.98 * 11.177 * 0.9995 + 0.02 * 11.205 - 0.0015 * 2000;
+   186	  assert.ok(Math.abs(s.total.pnl - expected) < 1e-6, `${s.total.pnl} vs ${expected}`);
+   187	  assert.ok(Math.abs(s.total.gas - 3) < 1e-9);
+   188	  assert.ok(alerts.some((a) => a.includes('✅ LIVE LINK DEX_BUY [ok]') && a.includes('Net PnL')));
+   189	});
+   190	
+   191	test('no trade when the gap is below max($15, 0.5%)', async () => {
+   192	  const { engine, db, calls } = setup({ bid: 10.9 });
+   193	  await engine.tick();
+   194	  assert.deepEqual(calls, []);
+   195	  assert.equal(trades(db).total.trades, 0);
+   196	});
+   197	
+   198	test('DEX leg fails after MEXC sold: buys back at market, alerts one-sided', async () => {
+   199	  const { engine, db, alerts, calls, bal } = setup({ dexOk: false });
+   200	  await engine.tick();
+   201	  // close: 2% over ask 11.21 = 11.4342, rounded DOWN (stays inside the price band)
+   202	  assert.ok(calls.includes('limit BUY 19.98 @ 11.434'));
+   203	  const row = trades(db);
+   204	  assert.equal(row.total.failed, 1);
+   205	  assert.ok(alerts.some((a) => a.startsWith('⚠️ ONE-SIDED FILL LINK')));
+   206	  assert.ok(Math.abs(bal.walletToken.LINK - 100) < 1e-9); // wallet untouched
+   207	  assert.ok(Math.abs(bal.mexc.LINK - 100 + 19.98 * 0.0005) < 1e-9); // flat again except the fee
+   208	});
+   209	
+   210	test('MEXC partial fill: rest is cancelled and closed at market', async () => {
+   211	  const { engine, calls } = setup({ mexcFillRatio: 0.5 });
+   212	  await engine.tick();
+   213	  assert.ok(calls.includes('cancel 1'));
+   214	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976')); // rest closed with an aggressive limit 2% under the bid
+   215	});
+   216	
+   217	test('simulation failure: nothing is sent, approval gas is still booked', async () => {
+   218	  const { engine, db, calls } = setup({ simulateThrows: true, approvalNeeded: true });
+   219	  await engine.tick();
+   220	  assert.ok(calls[0].startsWith('approve 200000000')); // exact amount: 200 USDC, never MaxUint256
+   221	  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
+   222	  const s = trades(db);
+   223	  assert.equal(s.total.trades, 0); // approval rows are not trades
+   224	  assert.ok(s.total.pnl < 0 && s.total.gas > 0);
+   225	});
+   226	
+   227	test('gas above MAX_GAS_GWEI: no quotes at all', async () => {
+   228	  const { engine, calls } = setup({ gasGwei: 50n });
+   229	  await engine.tick();
+   230	  assert.deepEqual(calls, []);
+   231	});
+   232	
+   233	test('kill switch: paused bot does nothing', async () => {
+   234	  const { engine, risk, calls } = setup({});
+   235	  risk.pause('Telegram /stop');
+   236	  await engine.tick();
+   237	  assert.deepEqual(calls, []);
+   238	});
+   239	
+   240	test('3 failed trades in a row pause trading', async () => {
+   241	  const { engine, risk, alerts } = setup({ dexOk: false });
+   242	  await engine.tick();
+   243	  await engine.tick();
+   244	  await engine.tick();
+   245	  assert.equal(risk.paused, true);
+   246	  assert.ok(alerts.some((a) => a.includes('3 failed trades in a row')));
+   247	  const before = alerts.length;
+   248	  await engine.tick();
+   249	  assert.equal(alerts.length, before); // stays stopped
+   250	});
+   251	
+   252	test('paper mode: records the trade, sends nothing real', async () => {
+   253	  const { engine, db, calls, alerts } = setup({ mode: 'paper' });
+   254	  await engine.tick();
+   255	  assert.deepEqual(calls, []);
+   256	  assert.equal(db.statsSince(0, 'paper').total.trades, 1);
+   257	  assert.ok(alerts.some((a) => a.startsWith('📝 PAPER LINK')));
+   258	});
+   259	
+   260	test('DEX outcome unknown: NO automatic unwind, trading paused', async () => {
+   261	  const { engine, risk, calls, alerts } = setup({ dexUnknown: true });
+   262	  await engine.tick();
+   263	  assert.ok(!calls.some((c) => c.startsWith('market') || c.startsWith('limit BUY')));
+   264	  assert.equal(risk.paused, true);
+   265	  assert.ok(alerts.some((a) => a.includes('outcome UNKNOWN')));
+   266	});
+   267	
+   268	test('unwind SELL that only partly fills is detected (not assumed flat)', async () => {
+   269	  const { engine, risk, calls, alerts } = setup({ mexcFillRatio: 0.5, closeFillRatio: 0.5 });
+   270	  await engine.tick();
+   271	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976'));
+   272	  assert.equal(risk.paused, true);
+   273	  assert.equal(risk.critical, true);
+   274	  // reports what is REALLY still open (half of 9.99), not the full quantity
+   275	  assert.ok(alerts.some((a) => a.includes('market close FAILED') && a.includes('Still open: MEXC SELL 5 LINK')));
+   276	});
+   277	
+   278	test('MEXC 5xx on order placement: found by clientOrderId, no double sell', async () => {
+   279	  const { engine, db, calls } = setup({ placeAmbiguous: true });
+   280	  await engine.tick();
+   281	  assert.equal(calls.filter((c) => c.startsWith('limit SELL')).length, 1); // never re-sent, never "unwound"
+   282	  assert.ok(!calls.some((c) => c.startsWith('limit BUY')));
+   283	  assert.equal(trades(db).total.failed, 0);
+   284	});
+   285	
+   286	test('order below MEXC minNotional: rejected BEFORE any DEX tx', async () => {
+   287	  const { engine, calls } = setup({ minNotional: 1000 });
+   288	  await engine.tick();
+   289	  assert.deepEqual(calls, []); // no simulate, no send, no MEXC order
+   290	});
+   291	
+   292	test('unresolved earlier DEX tx: no new trades', async () => {
+   293	  const { engine, calls } = setup({ unresolved: true });
+   294	  await engine.tick();
+   295	  assert.deepEqual(calls, []);
+   296	});
+   297	
+   298	test('critical pause needs /start confirm; soft pause does not', () => {
+   299	  const { risk } = setup({});
+   300	  risk.pause('Telegram /stop');
+   301	  assert.equal(risk.resume(), true);
+   302	  risk.pause('DEX tx unknown 0xabc', true);
+   303	  risk.pause('Telegram /stop'); // a later soft pause must not downgrade it
+   304	  assert.equal(risk.critical, true);
+   305	  assert.equal(risk.resume(), false);
+   306	  assert.equal(risk.paused, true);
+   307	  assert.equal(risk.resume(true), true);
+   308	  assert.equal(risk.paused, false);
+   309	});
+   310	
+   311	test('worst case beyond the remaining daily loss budget: skipped before any order', async () => {
+   312	  const { engine, db, calls } = setup({});
+   313	  db.insertTrade({ ts: Date.now(), day: (await import('../src/util.js')).dhakaDay(), mode: 'live', symbol: 'X', direction: 'DEX_BUY', size_usd: 1, qty: 1, buy_price: 1, sell_price: 1, expected_net: 0, cex_fee_usd: 0, gas_usd: 0, pnl_usd: -25, status: 'ok', dex_tx: null, cex_order_id: null, note: null });
+   314	  await engine.tick(); // budget left $5 < 5% of $200 + gas
+   315	  assert.deepEqual(calls, []);
+   316	});
+   317	
+   318	test('restart with an executing row: looked up, reported, paused until /start confirm', async () => {
+   319	  const { db, risk } = setup({});
+   320	  const { recoverExecuting } = await import('../src/recovery.js');
+   321	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xpending', cex_order_id: 'cidX', note: 'client order id cidX; nonce 7' });
+   322	  const alerts: string[] = [];
+   323	  await recoverExecuting(
+   324	    db, risk, { send: async (t) => void alerts.push(t) },
+   325	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
+   326	    async () => null,
+   327	  );
+   328	  assert.equal(risk.paused, true);
+   329	  assert.equal(risk.critical, true);
+   330	  assert.equal(risk.resume(), false);
+   331	  assert.equal(db.executingTrades().length, 0);
+   332	  assert.ok(alerts[0].includes('MEXC cidX (order 9): FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
+   333	});
+   334	
+   335	test('recovery: both legs done -> trade marked ok, no critical pause', async () => {
+   336	  const { db, risk } = setup({});
+   337	  const { recoverExecuting } = await import('../src/recovery.js');
+   338	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xdone', cex_order_id: 'cidY', note: 'client order id cidY; nonce 8' });
+   339	  const alerts: string[] = [];
+   340	  await recoverExecuting(
+   341	    db, risk, { send: async (t) => void alerts.push(t) },
+   342	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
+   343	    async () => ({ status: 1 }),
+   344	    async () => ({ state: 'clear' }),
+   345	  );
+   346	  assert.equal(risk.paused, false);
+   347	  assert.equal(db.statsSince(0, 'live').total.failed, 0);
+   348	  assert.ok(alerts[0].includes('All legs completed'));
+   349	});
+   350	
+   351	test('recovery: a pending DEX tx from before the restart keeps the bot critically paused', async () => {
+   352	  const { db, risk } = setup({});
+   353	  const { recoverExecuting } = await import('../src/recovery.js');
+   354	  await recoverExecuting(db, risk, { send: async () => {} }, { getOrderByClientId: async () => null }, async () => null, async () => ({ state: 'pending' }));
+   355	  assert.equal(risk.critical, true);
+   356	});
+   357	
+   358	test('critical resume does not reset the failure streak', () => {
+   359	  const { risk, db } = setup({});
+   360	  db.setState('consecutive_fails', '2');
+   361	  risk.pause('DEX tx unknown', true);
+   362	  risk.resume(true);
+   363	  assert.equal(risk.consecutiveFails, 2);
+   364	});
+   365	
+   366	test('nonce not ready (gap / unresolved): the MEXC leg never fires', async () => {
+   367	  const { engine, calls } = setup({ notReady: true });
+   368	  await engine.tick();
+   369	  assert.ok(calls.includes('simulate')); // got as far as the final checks
+   370	  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
+   371	});
+```
+
+## `test/grok-r2.test.ts`
+
+```ts
+     1	// Tests for Grok's round-2 fix prompt (items 1-10).
+     2	import { test } from 'node:test';
+     3	import assert from 'node:assert/strict';
+     4	import { TxSender, type TxBackend, type GasInfo } from '../src/dex/txsender.js';
+     5	import { Db } from '../src/db.js';
+     6	import { Risk } from '../src/risk.js';
+     7	import { makeUnresolvedCheck, resolveTrade, startHandler } from '../src/commands.js';
+     8	import { MexcApiError, MexcRest, AmbiguousRequestError } from '../src/mexc/rest.js';
+     9	import { placeSafely } from '../src/engine.js';
+    10	import { bandProblem, closePrice, rulesFrom } from '../src/mexc/rules.js';
+    11	import { recoverExecuting } from '../src/recovery.js';
+    12	
+    13	const gas: GasInfo = { baseFee: 10n, tip: 1n, effective: 11n, maxFee: 21n };
+    14	const limits = { maxTradesPerDay: 20, dailyLossLimitUsd: 30, maxConsecutiveFails: 3 };
+    15	
+    16	function backend(state: { confirmed: number; receipts: Map<string, number>; signed: number[]; store?: () => string | undefined; seenDuringBroadcast?: string }) {
+    17	  const b: TxBackend = {
+    18	    address: '0xme',
+    19	    confirmedNonce: async () => state.confirmed,
+    20	    receipt: async (h) => (state.receipts.has(h) ? { status: state.receipts.get(h)!, gasUsed: 1n, gasPrice: 1n } : null),
+    21	    knowsTx: async () => true,
+    22	    sign: async (t) => {
+    23	      state.signed.push(t.nonce);
+    24	      return { raw: `raw${state.signed.length}`, hash: `0xh${state.signed.length}` };
+    25	    },
+    26	    broadcast: async (raw) => {
+    27	      state.seenDuringBroadcast = state.store?.();
+    28	      state.receipts.set(`0xh${raw.slice(3)}`, 1);
+    29	    },
+    30	    gas: async () => gas,
+    31	  };
+    32	  return b;
+    33	}
+    34	const memStore = () => {
+    35	  let v: string | undefined;
+    36	  return { get: () => v, set: (x: string | null) => (v = x ?? undefined) };
+    37	};
+    38	
+    39	// ---- 1) nonce gap ----
+    40	test('1) readyToSend: resets a local nonce that ran ahead of the chain, refuses while a tx is unresolved', async () => {
+    41	  const st = { confirmed: 5, receipts: new Map<string, number>(), signed: [] as number[] };
+    42	  const s = new TxSender(backend(st), memStore(), Date.now, async () => {});
+    43	  await s.send({ to: '0xr', data: '0x' }, 1n, gas, 5); // nonce 5, mined -> local next = 6
+    44	  // ...but the chain says 5 (e.g. that tx was replaced / dropped): a send at 6 could never be mined.
+    45	  assert.deepEqual(await s.readyToSend(), { ok: true });
+    46	  await s.send({ to: '0xr', data: '0x' }, 1n, gas, 5);
+    47	  assert.deepEqual(st.signed, [5, 5]); // reset to the chain's nonce, no gap
+    48	
+    49	  const store = memStore();
+    50	  store.set(JSON.stringify({ nonce: 7, hashes: ['0xold'], since: Date.now(), unknown: true }));
+    51	  const s2 = new TxSender(backend({ confirmed: 7, receipts: new Map(), signed: [] }), store, Date.now, async () => {});
+    52	  const r = await s2.readyToSend();
+    53	  assert.equal(r.ok, false);
+    54	  assert.match(r.reason!, /nonce 7 unresolved/);
+    55	});
+    56	
+    57	// ---- 3) in-flight tx persisted before broadcast ----
+    58	test('3) a tx is recorded as in flight BEFORE broadcast, and cleared once mined', async () => {
+    59	  const store = memStore();
+    60	  const st = { confirmed: 3, receipts: new Map<string, number>(), signed: [] as number[], store: store.get };
+    61	  const s = new TxSender(backend(st), store, Date.now, async () => {});
+    62	  await s.send({ to: '0xr', data: '0x' }, 1n, gas, 5);
+    63	  assert.equal(JSON.parse(st.seenDuringBroadcast!).nonce, 3); // a crash during broadcast would leave this behind
+    64	  assert.equal(s.unresolved, null); // mined -> cleared
+    65	});
+    66	
+    67	// ---- 2) /start confirm ----
+    68	test('2) /start confirm is refused while a tx is pending; when clear it resets the nonce', async () => {
+    69	  const db = new Db(':memory:');
+    70	  const risk = new Risk(db, 'live', limits);
+    71	  let pending = true;
+    72	  let resets = 0;
+    73	  const chain = {
+    74	    get unresolved() {
+    75	      return pending ? { nonce: 9, hashes: ['0xa', '0xb'] } : null;
+    76	    },
+    77	    checkUnresolved: async () => ({ state: pending ? ('pending' as const) : ('clear' as const) }),
+    78	    resetNonce: () => void resets++,
+    79	  };
+    80	  const start = startHandler(risk, async () => 'status', makeUnresolvedCheck(db, chain));
+    81	  risk.pause('DEX tx unknown 0xa', true);
+    82	  assert.match(await start(['confirm']), /Not resuming.*nonce 9.*\/cancelnonce/s);
+    83	  assert.equal(risk.paused, true);
+    84	  pending = false;
+    85	  assert.match(await start(['confirm']), /resumed/i);
+    86	  assert.equal(risk.paused, false);
+    87	  assert.equal(resets, 1);
+    88	});
+    89	
+    90	// ---- 9) not-found logic ----
+    91	test('9) getOrderByClientId: only MEXC code -2011 means "no such order"; "currency does not exist" is rethrown', async () => {
+    92	  const mk = (status: number, body: object) =>
+    93	    new MexcRest('k', 's', 'https://x', (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch);
+    94	  assert.equal(await mk(400, { code: -2011, msg: 'Unknown order sent.' }).getOrderByClientId('X', 'c'), null);
+    95	  await assert.rejects(mk(400, { code: 10232, msg: 'currency does not exist' }).getOrderByClientId('X', 'c'), (e) => e instanceof MexcApiError && e.code === 10232);
+    96	});
+    97	
+    98	test('9) placeSafely: a 5xx followed by "not found" is UNKNOWN_ORDER_STATE, never "not placed"', async () => {
+    99	  const sleep = async () => {};
+   100	  await assert.rejects(
+   101	    placeSafely({ getOrderByClientId: async () => null }, 'X', 'cid', async () => { throw new AmbiguousRequestError('503'); }, sleep),
+   102	    /UNKNOWN_ORDER_STATE/,
+   103	  );
+   104	});
+   105	
+   106	// ---- 8) price band ----
+   107	const sym = (band: string) =>
+   108	  rulesFrom({ symbol: 'X', baseAsset: 'X', quoteAsset: 'USDT', status: '1', isSpotTradingAllowed: true, baseSizePrecision: '0', baseAssetPrecision: 2, quotePrecision: 4, orderTypes: ['LIMIT'], filters: [{ filterType: 'PERCENT_PRICE_BY_SIDE', bidMultiplierUp: band, askMultiplierDown: band }] });
+   109	
+   110	test('8) a 0.5% band clamps the close price; with a wide band the 2% close is used', () => {
+   111	  const book = { bid: 99.9, ask: 100.1 }; // ref 100
+   112	  assert.equal(closePrice(sym('0.005'), 'BUY', book), 100.4); // 100 * (1 + 0.8 * 0.005), not 102.1
+   113	  assert.equal(closePrice(sym('0.005'), 'SELL', book), 99.6);
+   114	  assert.equal(closePrice(sym('0.2'), 'BUY', book), 102.102); // ask * 1.02
+   115	});
+   116	
+   117	test('8) an entry limit outside the band is rejected', () => {
+   118	  assert.match(bandProblem(sym('0.02'), 'BUY', 103, 100)!, /above/);
+   119	  assert.equal(bandProblem(sym('0.02'), 'BUY', 101.5, 100), null);
+   120	  assert.match(bandProblem(sym('0.02'), 'SELL', 97, 100)!, /below/);
+   121	});
+   122	
+   123	// ---- 6) recovery: open orders and close orders ----
+   124	test('6) recovery cancels a close order that is still open and sweeps open bot orders', async () => {
+   125	  const db = new Db(':memory:');
+   126	  const risk = new Risk(db, 'live', limits);
+   127	  const id = db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 50, qty: 5, buy_price: 10, sell_price: 11, expected_net: 2, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: null, cex_order_id: 'arbt1', note: 'client order id arbt1' });
+   128	  db.appendCid(id, 'arbt1');
+   129	  db.appendCid(id, 'arbc2'); // an unwind close placed just before the crash
+   130	  const status: Record<string, string> = { '1': 'FILLED', '2': 'NEW', '3': 'NEW' };
+   131	  const cancelled: string[] = [];
+   132	  const alerts: string[] = [];
+   133	  await recoverExecuting(
+   134	    db, risk, { send: async (t) => void alerts.push(t) },
+   135	    {
+   136	      getOrderByClientId: async (_s, cid) => ({ orderId: cid === 'arbt1' ? '1' : '2', status: status[cid === 'arbt1' ? '1' : '2'], executedQty: cid === 'arbt1' ? '5' : '0' }) as never,
+   137	      getOrder: async (_s, oid) => ({ orderId: oid, status: status[oid], executedQty: '0' }) as never,
+   138	      cancelOrder: async (_s, oid) => ((cancelled.push(oid), (status[oid] = 'CANCELED')), {} as never),
+   139	      openOrders: async () => [{ orderId: '3', status: 'NEW', executedQty: '0', clientOrderId: 'arbc9', side: 'SELL', origQty: '1' }] as never,
+   140	    },
+   141	    async () => null,
+   142	    async () => ({ state: 'clear' }),
+   143	    { symbols: ['LINKUSDT'], sleep: async () => {} },
+   144	  );
+   145	  assert.deepEqual(cancelled.sort(), ['2', '3']);
+   146	  assert.equal(risk.critical, true);
+   147	  assert.ok(alerts[0].includes('was open -> cancelled'));
+   148	  assert.equal(db.unresolvedTrades().length, 1); // pnl unknown until /resolve
+   149	});
+   150	
+   151	// ---- 10e) /resolve ----
+   152	test('10e) /resolve books the PnL of a one-sided trade and removes it from the list', () => {
+   153	  const db = new Db(':memory:');
+   154	  const id = db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 50, qty: 5, buy_price: 10, sell_price: 11, expected_net: 2, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'one_sided', dex_tx: null, cex_order_id: null, note: 'x; pnl unknown' });
+   155	  assert.match(resolveTrade(db, undefined, undefined), /Usage/);
+   156	  assert.match(resolveTrade(db, String(id), '-3.2'), /booked/);
+   157	  assert.equal(db.unresolvedTrades().length, 0);
+   158	  assert.equal(db.statsSince(0, 'live').total.pnl, -3.2);
+   159	});
 ```
 
 ## `test/infra.test.ts`

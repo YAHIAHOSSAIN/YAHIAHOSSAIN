@@ -37,6 +37,11 @@ export interface Unresolved {
   nonce: number;
   hashes: string[];
   since: number;
+  /** Highest maxFeePerGas / tip used at this nonce (a replacement must outbid them). */
+  maxFee?: string;
+  tip?: string;
+  /** false while we are still waiting normally (in flight); true once the outcome is unknown. */
+  unknown?: boolean;
 }
 
 export interface TxBackend {
@@ -47,6 +52,8 @@ export interface TxBackend {
   knowsTx(hash: string): Promise<boolean>;
   sign(tx: { nonce: number; to: string; data: string; value: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Promise<{ raw: string; hash: string }>;
   broadcast(raw: string): Promise<void>;
+  /** Optional second route (public RPC) for /cancelnonce. */
+  broadcastPublic?(raw: string): Promise<void>;
   gas(): Promise<GasInfo>;
 }
 
@@ -132,10 +139,53 @@ export class TxSender {
     return { state: 'pending' };
   }
 
-  /** Human override after checking the wallet by hand (/start confirm only does this if checkUnresolved agrees). */
-  forget(): void {
-    this.setUnresolved(null);
+  /** Re-read the nonce from the chain on the next send (after /start confirm). */
+  resetNonce(): void {
     this.nextNonce = null;
+  }
+
+  /**
+   * Safe to send now? Only if nothing is unresolved AND our next nonce is exactly the chain's next nonce
+   * (a gap would make the tx unminable, so the MEXC leg must not fire).
+   */
+  async readyToSend(): Promise<{ ok: boolean; reason?: string }> {
+    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
+      const u = this.unresolved!;
+      return { ok: false, reason: `tx at nonce ${u.nonce} unresolved (${u.hashes.join(', ')})` };
+    }
+    const latest = await this.b.confirmedNonce();
+    if (this.nextNonce !== null && this.nextNonce !== latest) {
+      log.warn(`nonce gap: local ${this.nextNonce}, chain ${latest}; resetting to the chain value`);
+      this.nextNonce = latest;
+    }
+    return { ok: true };
+  }
+
+  /**
+   * /cancelnonce: replace the unresolved tx with a 0-value self-transfer at the same nonce, at least 2x the
+   * highest fee used so far, through the private AND the public RPC. Waits up to `timeoutMs` for the nonce to be used.
+   */
+  async cancelNonce(timeoutMs = 10 * 60_000): Promise<string> {
+    const u = this.unresolved;
+    if (!u) return 'Nothing unresolved.';
+    const g = await this.b.gas();
+    const twice = (x: bigint | undefined) => (x ?? 0n) * 2n;
+    const max = (...xs: bigint[]) => xs.reduce((a, c) => (c > a ? c : a));
+    const maxFee = max(twice(u.maxFee ? BigInt(u.maxFee) : undefined), g.maxFee * 2n);
+    const tip = max(twice(u.tip ? BigInt(u.tip) : undefined), g.tip * 2n);
+    const c = await this.b.sign({ nonce: u.nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
+    this.setUnresolved({ ...u, hashes: [...u.hashes, c.hash], maxFee: maxFee.toString(), tip: tip.toString() });
+    await Promise.allSettled([this.b.broadcast(c.raw), this.b.broadcastPublic?.(c.raw)]);
+    const deadline = this.now() + timeoutMs;
+    while (this.now() < deadline) {
+      const r = await this.checkUnresolved();
+      if (r.state === 'clear') {
+        if (r.executedHash) return `Nonce ${u.nonce} used by ${r.executedHash} (${r.executedHash === c.hash ? 'the cancel' : 'an earlier tx'}, ${r.ok ? 'success' : 'reverted'}).`;
+        return `Nonce ${u.nonce} is used${r.dropped ? ' (all txs were dropped)' : ''}, but no receipt was found for our hashes: check etherscan.`;
+      }
+      await this.sleep(5000);
+    }
+    return `Nonce ${u.nonce} still not used after ${Math.round(timeoutMs / 60_000)} min (cancel ${c.hash}). Try /cancelnonce again later.`;
   }
 
   async send(
@@ -154,16 +204,20 @@ export class TxSender {
     });
     this.nextNonce = nonce + 1;
     onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
+    // In flight from now on, and PERSISTED: if the bot dies while waiting, a restart still knows this nonce is taken.
+    const fees = { maxFee: gas.maxFee.toString(), tip: gas.tip.toString() };
+    this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: false });
     try {
       await this.b.broadcast(raw);
     } catch (e) {
       const kind = classifySendError(e);
       if (kind === 'rejected') {
         this.nextNonce = nonce; // nothing was broadcast: reuse the nonce
+        this.setUnresolved(null);
         return { ok: false, rejected: true, hash, gasCostWei: 0n, reason: `RPC rejected the tx: ${errMsg(e)}` };
       }
       if (kind === 'ambiguous') {
-        this.setUnresolved({ nonce, hashes: [hash], since: this.now() });
+        this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: true });
         return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `send error, outcome unknown: ${errMsg(e)}` };
       }
       // 'accepted': already in the mempool, just wait for it below.
@@ -171,7 +225,10 @@ export class TxSender {
     log.info(`tx sent ${hash} (nonce ${nonce})`);
 
     let receipt = await this.waitReceipt(hash, timeoutSec);
-    if (receipt) return this.result(hash, receipt);
+    if (receipt) {
+      this.setUnresolved(null);
+      return this.result(hash, receipt);
+    }
 
     log.warn(`tx ${hash} not mined in ${timeoutSec}s, sending cancel`);
     // Re-read gas: if the base fee spiked while we waited, a cancel priced from the old fee would not mine either.
@@ -180,7 +237,7 @@ export class TxSender {
     const maxFee = [bump(gas.maxFee), bump(fresh.maxFee)].reduce((a, c) => (c > a ? c : a));
     const tip = [bump(gas.tip), bump(fresh.tip)].reduce((a, c) => (c > a ? c : a));
     const cancel = await this.b.sign({ nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
-    this.setUnresolved({ nonce, hashes: [hash, cancel.hash], since: this.now() }); // before broadcasting the cancel
+    this.setUnresolved({ nonce, hashes: [hash, cancel.hash], since: this.now(), maxFee: maxFee.toString(), tip: tip.toString(), unknown: false }); // before broadcasting the cancel
     await this.b.broadcast(cancel.raw).catch((e) => log.warn(`cancel send failed: ${errMsg(e)}`));
     const deadline = this.now() + timeoutSec * 1000;
     while (this.now() < deadline) {
@@ -196,6 +253,7 @@ export class TxSender {
       }
       await this.sleep(3000);
     }
+    this.setUnresolved({ ...this.unresolved!, unknown: true });
     return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancel.hash} not confirmed: outcome UNKNOWN` };
   }
 

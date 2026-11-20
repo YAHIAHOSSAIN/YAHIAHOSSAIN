@@ -99,6 +99,9 @@ export class Db {
         sell_attempts INTEGER NOT NULL DEFAULT 0, alerted_timeout INTEGER NOT NULL DEFAULT 0, note TEXT
       );
     `);
+    // trades.cids: JSON array of every MEXC client order id used by the trade (entry, closes), written BEFORE placing.
+    const tcols = new Set((this.db.prepare('PRAGMA table_info(trades)').all() as { name: string }[]).map((c) => c.name));
+    if (!tcols.has('cids')) this.db.exec('ALTER TABLE trades ADD COLUMN cids TEXT');
     const cols = new Set((this.db.prepare('PRAGMA table_info(transfers)').all() as { name: string }[]).map((c) => c.name));
     for (const m of TRANSFER_MIGRATIONS) {
       const col = m.split(' ')[5];
@@ -121,6 +124,29 @@ export class Db {
     const cols = Object.keys(fields);
     if (!cols.length) return;
     this.db.prepare(`UPDATE trades SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...fields, id });
+  }
+
+  appendCid(tradeId: number, cid: string): void {
+    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
+    const list = row?.cids ? (JSON.parse(row.cids) as string[]) : [];
+    list.push(cid);
+    this.db.prepare('UPDATE trades SET cids = ? WHERE id = ?').run(JSON.stringify(list), tradeId);
+  }
+
+  cidsOf(tradeId: number): string[] {
+    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
+    return row?.cids ? (JSON.parse(row.cids) as string[]) : [];
+  }
+
+  /** Trades whose real PnL is unknown (one-sided / recovered) and not yet set with /resolve. */
+  unresolvedTrades(): (TradeRow & { id: number })[] {
+    return this.db
+      .prepare(`SELECT * FROM trades WHERE status = 'one_sided' AND (note IS NULL OR note NOT LIKE '%pnl resolved%') AND note LIKE '%pnl unknown%' ORDER BY id`)
+      .all() as (TradeRow & { id: number })[];
+  }
+
+  tradeByDexTx(hash: string): (TradeRow & { id: number }) | undefined {
+    return this.db.prepare('SELECT * FROM trades WHERE dex_tx = ? ORDER BY id DESC LIMIT 1').get(hash) as (TradeRow & { id: number }) | undefined;
   }
 
   /** Trades that were in flight when the bot stopped. */

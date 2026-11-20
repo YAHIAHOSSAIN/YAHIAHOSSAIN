@@ -122,7 +122,8 @@ export function validateConfig(c: Config): Config {
   range('WORST_CASE_LOSS_PCT', c.worstCaseLossPct, 0, 100);
   range('MAX_GAS_GWEI', c.maxGasGwei, 0.01, 1000);
   range('MAX_CONSECUTIVE_FAILS', c.maxConsecutiveFails, 1, 100);
-  range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 600);
+  // Upper bound keeps the graceful-shutdown wait (2x this + 60 s) below pm2's kill_timeout (240 s).
+  range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 80);
   range('SCAN_INTERVAL_SEC', c.scanIntervalSec, 5, 3600);
   range('SCAN_MIN_GAP_PCT', c.scanMinGapPct, 0, c.scanMaxGapPct);
   range('SCAN_MAX_GAP_PCT', c.scanMaxGapPct, c.scanMinGapPct, 100);

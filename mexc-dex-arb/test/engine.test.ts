@@ -32,6 +32,7 @@ function setup(opts: {
   placeAmbiguous?: boolean;
   minNotional?: number;
   unresolved?: boolean;
+  notReady?: boolean;
 }) {
   process.env.MODE = opts.mode ?? 'live';
   process.env.RPC_URL = 'http://localhost';
@@ -112,6 +113,7 @@ function setup(opts: {
         return { ok: true, gasCostWei: 600_000n * GWEI };
       },
       checkUnresolved: async () => ({ state: opts.unresolved ? 'pending' : 'clear' }),
+      readyToSend: async () => (opts.notReady ? { ok: false, reason: 'nonce gap' } : { ok: true }),
       simulate: async () => {
         calls.push('simulate');
         if (opts.simulateThrows) throw new Error('execution reverted');
@@ -196,7 +198,8 @@ test('no trade when the gap is below max($15, 0.5%)', async () => {
 test('DEX leg fails after MEXC sold: buys back at market, alerts one-sided', async () => {
   const { engine, db, alerts, calls, bal } = setup({ dexOk: false });
   await engine.tick();
-  assert.ok(calls.includes('limit BUY 19.98 @ 11.435')); // close: aggressive limit 2% over ask 11.21
+  // close: 2% over ask 11.21 = 11.4342, rounded DOWN (stays inside the price band)
+  assert.ok(calls.includes('limit BUY 19.98 @ 11.434'));
   const row = trades(db);
   assert.equal(row.total.failed, 1);
   assert.ok(alerts.some((a) => a.startsWith('⚠️ ONE-SIDED FILL LINK')));
@@ -326,7 +329,7 @@ test('restart with an executing row: looked up, reported, paused until /start co
   assert.equal(risk.critical, true);
   assert.equal(risk.resume(), false);
   assert.equal(db.executingTrades().length, 0);
-  assert.ok(alerts[0].includes('MEXC order 9: FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
+  assert.ok(alerts[0].includes('MEXC cidX (order 9): FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
 });
 
 test('recovery: both legs done -> trade marked ok, no critical pause', async () => {
@@ -358,4 +361,11 @@ test('critical resume does not reset the failure streak', () => {
   risk.pause('DEX tx unknown', true);
   risk.resume(true);
   assert.equal(risk.consecutiveFails, 2);
+});
+
+test('nonce not ready (gap / unresolved): the MEXC leg never fires', async () => {
+  const { engine, calls } = setup({ notReady: true });
+  await engine.tick();
+  assert.ok(calls.includes('simulate')); // got as far as the final checks
+  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
 });

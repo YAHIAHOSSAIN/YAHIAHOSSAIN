@@ -44,6 +44,9 @@ export class Chain {
         broadcast: async (raw) => {
           await this.sendProvider.send('eth_sendRawTransaction', [raw]);
         },
+        broadcastPublic: async (raw) => {
+          await this.provider.send('eth_sendRawTransaction', [raw]);
+        },
         gas: () => this.gas(),
       },
       unresolvedStore,
@@ -58,6 +61,15 @@ export class Chain {
   }
   receipt(hash: string) {
     return this.provider.getTransactionReceipt(hash);
+  }
+  readyToSend() {
+    return this.tx.readyToSend();
+  }
+  cancelNonce() {
+    return this.tx.cancelNonce();
+  }
+  resetNonce() {
+    this.tx.resetNonce();
   }
   send(
     tx: { to: string; data: string; value?: bigint },

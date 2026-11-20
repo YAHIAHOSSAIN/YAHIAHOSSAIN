@@ -21,7 +21,7 @@ import type { Db, TransferRow } from './db.js';
 import type { Risk } from './risk.js';
 import type { Notifier } from './engine.js';
 import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine.js';
-import { orderProblem } from './mexc/rules.js';
+import { closePrice, orderProblem } from './mexc/rules.js';
 import { type Gap, type ScanToken, dexPrices, findGaps, loadUniverse } from './scanner.js';
 import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
 import { log, errMsg } from './log.js';
@@ -594,7 +594,9 @@ export class TransferEngine {
   private async sellOnMexc(row: TransferRow, qty: string): Promise<number> {
     const rules = this.universe.find((t) => t.base === row.base)?.rules;
     const px = row.cost_usd / (row.buy_qty || 1);
-    const problem = rules && orderProblem(rules, 'SELL', Number(qty), px, 'MARKET');
+    // Some symbols have no MARKET order type: use an aggressive LIMIT inside the price band instead.
+    const useLimit = Boolean(rules && !rules.orderTypes.includes('MARKET'));
+    const problem = rules && orderProblem(rules, 'SELL', Number(qty), px, useLimit ? 'LIMIT' : 'MARKET');
     if (problem) {
       this.d.risk.pause(`cannot sell ${row.base} on MEXC: ${problem}`, true);
       await this.d.tg.send(`🚨 ${row.base}: cannot market-sell ${qty} on MEXC (${problem}). Trading PAUSED: sell it by hand, then /start confirm.`);
@@ -603,9 +605,16 @@ export class TransferEngine {
     try {
       const usdtBefore = (await this.d.mexc.balances()).USDT ?? 0;
       const cid = clientId(`${row.id}s`);
-      const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, () => this.d.mexc.marketSell(row.symbol, qty, cid), this.sleep);
+      let place = () => this.d.mexc.marketSell(row.symbol, qty, cid);
+      if (useLimit && rules) {
+        const b = await this.d.mexc.depth(row.symbol, 5);
+        const limit = closePrice(rules, 'SELL', { bid: b.bids[0][0], ask: b.asks[0][0] }).toFixed(rules.priceDecimals);
+        place = () => this.d.mexc.limitOrder(row.symbol, 'SELL', qty, limit, cid);
+      }
+      const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, place, this.sleep);
       await this.sleep(1000);
-      const o = await this.d.mexc.getOrder(row.symbol, orderId);
+      let o = await this.d.mexc.getOrder(row.symbol, orderId);
+      if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, row.symbol, orderId, this.sleep);
       const filled = Number(o.executedQty);
       if (filled < Number(qty) * 0.999) {
         this.d.risk.pause(`MEXC sell of ${row.base} only partly filled`, true);

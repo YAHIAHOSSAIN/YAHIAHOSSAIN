@@ -53,8 +53,12 @@ export interface Order {
 
 type FetchFn = typeof fetch;
 
-/** HTTP 429/418 from any API: callers back off instead of hammering. */
-export class RateLimitError extends Error {}
+/** HTTP 429/418 from any API: callers back off instead of hammering, at least `retryAfterSec`. */
+export class RateLimitError extends Error {
+  constructor(msg: string, readonly retryAfterSec = 0) {
+    super(msg);
+  }
+}
 
 /**
  * The request may or may not have reached MEXC (timeout / connection reset on a POST).
@@ -127,7 +131,8 @@ export class MexcRest {
       body = text;
     }
     const err = redact(`MEXC ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`);
-    if (res.status === 429 || res.status === 418) throw new RateLimitError(err);
+    // MEXC docs: "A Retry-After header is sent with a 418 or 429 responses".
+    if (res.status === 429 || res.status === 418) throw new RateLimitError(err, Number(res.headers.get('retry-after')) || 0);
     if (res.status >= 500 && method !== 'GET') throw new AmbiguousRequestError(err);
     if (!res.ok) {
       const code = body && typeof body === 'object' && 'code' in body ? Number((body as { code: unknown }).code) : undefined;
@@ -224,15 +229,19 @@ export class MexcRest {
     try {
       return await this.request<Order>('GET', '/api/v3/order', { symbol, origClientOrderId: clientOrderId }, true);
     } catch (e) {
-      // MEXC documents -2011 "Unknown order sent". Prefer the parsed code; the text match is a fallback
-      // because MEXC does not document its error body shape. Anything else is a real error (caller retries).
+      // ONLY MEXC's documented -2011 "Unknown order sent" means "no such order". Any other error
+      // (e.g. 10232 "currency does not exist", rate limits, 5xx) is rethrown: never guess "not placed".
       if (e instanceof MexcApiError && e.code === -2011) return null;
-      if (/-2011|unknown order/i.test((e as Error).message)) return null;
       throw e;
     }
   }
 
   /** MARKET SELL by base quantity (documented). For buys use an aggressive LIMIT instead. */
+  /** Open orders of one symbol (GET /api/v3/openOrders). */
+  openOrders(symbol: string): Promise<(Order & { clientOrderId?: string })[]> {
+    return this.request('GET', '/api/v3/openOrders', { symbol }, true);
+  }
+
   marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }> {
     const p: Record<string, string> = { symbol, side: 'SELL', type: 'MARKET', quantity };
     if (clientOrderId) p.newClientOrderId = clientOrderId;

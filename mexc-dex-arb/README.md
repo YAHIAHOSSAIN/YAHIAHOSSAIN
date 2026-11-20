@@ -86,6 +86,7 @@ Stack: Node 20+, TypeScript, ethers v6, MEXC Spot API v3 (REST + protobuf WebSoc
 
 **Telegram commands** (শুধু `TELEGRAM_ADMIN_ID`-এর user থেকে, আর বটের সাথে **private chat**-এ। group-এ অন্য কেউ দিলে উপেক্ষা করবে):
 `/stop` দিলে সাথে সাথে নতুন trade বন্ধ হয়, `/status` দেখায় PnL, inventory, limit আর আটকে থাকা transfer।
+`/cancelnonce` আটকে থাকা DEX tx-এর জায়গায় দ্বিগুণ fee দিয়ে একটা cancel পাঠায়। `/resolve <id> <pnl>` হাতে ঠিক করা trade-এর লাভ-ক্ষতি হিসাবে যোগ করে।
 `/start` শুধু সাধারণ pause খোলে, যেমন `/stop` বা পরপর fail-এর pause। **Critical pause**-এর ক্ষেত্রে বট আগে খোলা position আর balance দেখায়,
 তারপর **`/start confirm`** চায়। Critical pause হয় MEXC order বা DEX tx-এর ফল অজানা থাকলে, unwind fail করলে, বা trade চলার মাঝখানে restart হলে।
 Transfer strategy-তে আরও দুইটা command আছে: `/sell <id>` আটকে থাকা বা hold করা token এখনই বেচার চেষ্টা করে (loss floor উপেক্ষা করে), আর
@@ -170,6 +171,8 @@ npm run report -- 24 live
 - **Telegram:** update offset database-এ সংরক্ষিত থাকে। বট চালু হওয়ার আগে পাঠানো command উপেক্ষা করা হয়,
   তাই restart-এর পর পুরনো `/start confirm` আবার চলে না। Error হলে backoff করে।
 - **Block watchdog:** RPC থেকে block আসা বন্ধ হলেও বট timer দিয়ে scan চালিয়ে যায়, আর alert দেয়।
+
+**Live চালুর আগে একবার:** `npm run check:0x` চালান। এটা কিছুই sign বা পাঠায় না, শুধু দেখে 0x-এর `transaction.to` আসলেই AllowanceHolder কিনা। বিস্তারিত `CHANGES.md`-এ।
 
 ## জরুরি কথা
 

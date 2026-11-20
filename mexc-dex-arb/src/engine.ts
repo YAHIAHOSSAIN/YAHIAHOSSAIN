@@ -19,7 +19,7 @@ import {
 } from './pricing.js';
 import { log, errMsg } from './log.js';
 import { AmbiguousRequestError } from './mexc/rest.js';
-import { aggressiveOffset, orderProblem } from './mexc/rules.js';
+import { bandProblem, closePrice, orderProblem } from './mexc/rules.js';
 import crypto from 'node:crypto';
 
 /** A close/unwind that only partly filled: `remaining` is what is still open. */
@@ -81,18 +81,17 @@ export async function placeSafely(
     return await place();
   } catch (e) {
     if (!(e instanceof AmbiguousRequestError)) throw e; // clearly rejected: nothing was placed
-    // MEXC may take a few seconds to index a just-placed order: look for ~20s with backoff.
-    let notFound = 0;
-    for (const wait of [1000, 2000, 3000, 4000, 5000, 5000]) {
+    // MEXC may take a few seconds to index a just-placed order: look for ~10s (1, 2, 3, 4 s).
+    // MEXC docs: after a 5xx "the execution status is UNKNOWN". So if it is still not found, the state is
+    // UNKNOWN (critical pause, no unwind) - never "not placed", which could double the exposure.
+    for (const wait of [1000, 2000, 3000, 4000]) {
       await sleep(wait);
-      let o: Order | null;
       try {
-        o = await mexc.getOrderByClientId(symbol, cid);
+        const o = await mexc.getOrderByClientId(symbol, cid);
+        if (o) return { orderId: o.orderId }; // it WAS placed
       } catch {
-        continue; // lookup itself failed: try again
+        // lookup failed: try again
       }
-      if (o) return { orderId: o.orderId }; // it WAS placed
-      if (++notFound >= 4) throw e; // MEXC says four times (over ~10s+) that no such order exists
     }
     throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
   }
@@ -126,7 +125,10 @@ export interface ChainApi {
     onSigned?: (hash: string, nonce: number) => void,
   ): Promise<TxResult>;
   /** Unresolved earlier tx (outcome unknown): no new trades until it is 'clear'. */
-  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean }>;
+  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean; executedHash?: string; ok?: boolean }>;
+  /** ok only if nothing is unresolved and our next nonce equals the chain's (no gap). */
+  readyToSend?(): Promise<{ ok: boolean; reason?: string }>;
+  readonly unresolved?: { nonce: number; hashes: string[]; since: number; unknown?: boolean } | null;
 }
 export interface Notifier {
   send(text: string): Promise<void>;
@@ -161,6 +163,8 @@ export interface Candidate {
 const mid = (b: Book) => (b.bids[0][0] + b.asks[0][0]) / 2;
 
 export class Engine {
+  /** Trade row being executed: every MEXC client id is recorded on it before the order is placed. */
+  private currentTradeId: number | null = null;
   private lastNote = new Map<string, string>();
   private lastAlert = new Map<string, number>();
   private sleep: (ms: number) => Promise<void>;
@@ -208,10 +212,19 @@ export class Engine {
     this.note('block', 'trading enabled');
 
     if (this.d.chain.checkUnresolved) {
+      const pending = this.d.chain.unresolved;
       const u = await this.d.chain.checkUnresolved();
-      if (u.dropped) await this.d.tg.send('ℹ️ An unresolved DEX tx was dropped by every RPC (never mined); its nonce is free again.');
+      if (u.state === 'clear' && pending) await this.reportResolved(pending, u);
       if (u.state === 'pending') {
-        await this.alertThrottled('unresolved', '⏳ An earlier DEX tx is still unresolved: no new trades until it is mined or dropped. /status for details.', 3600_000);
+        const p = this.d.chain.unresolved;
+        if (p && Date.now() - p.since > 10 * 60_000) {
+          await this.alertThrottled(
+            'unresolved',
+            `⏳ DEX tx at nonce ${p.nonce} still unresolved after ${Math.round((Date.now() - p.since) / 60_000)} min (${p.hashes.join(', ')}). ` +
+              `No new trades. Send /cancelnonce to replace it with a cancel, or wait.`,
+            3600_000,
+          );
+        }
         return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or dropped');
       }
     }
@@ -265,6 +278,21 @@ export class Engine {
       }
     }
     if (best) await this.execute(best, gas, ethUsd);
+  }
+
+  /** An unresolved tx got its outcome: tell the human which tx won, and note it on the trade row. */
+  private async reportResolved(
+    p: { nonce: number; hashes: string[] },
+    u: { executedHash?: string; ok?: boolean; dropped?: boolean },
+  ) {
+    const what = u.executedHash
+      ? `${u.executedHash} was mined (${u.ok ? 'SUCCESS' : 'REVERTED'})${u.executedHash === p.hashes[0] ? ': the ORIGINAL tx executed' : ': the cancel won, the original did NOT execute'}`
+      : u.dropped
+        ? 'no RPC knows the tx any more: it was dropped and never executed'
+        : 'the nonce was used, but no receipt was found for our hashes: check etherscan';
+    await this.d.tg.send(`ℹ️ Nonce ${p.nonce} resolved: ${what}. You may now fix any position by hand, then /start confirm.`);
+    const row = this.d.db.tradeByDexTx(p.hashes[0]);
+    if (row) this.d.db.updateTrade(row.id, { note: `${row.note ?? ''}; dex resolved: ${what}` });
   }
 
   /** Indicative opportunities in both directions for one token. */
@@ -330,6 +358,7 @@ export class Engine {
   /** Re-check with a firm quote + simulation, then trade both legs at once. */
   async execute(c: Candidate, gas: GasInfo, ethUsd: number): Promise<void> {
     const { token: t } = c;
+    this.currentTradeId = null;
     if (!this.live) return this.recordPaper(c);
 
     let approvalCostWei = 0n;
@@ -354,6 +383,15 @@ export class Engine {
     if (c.approvalGas > 0n) {
       const r = await this.d.chain.approveExact(c.req.sellToken, c.spender, c.req.sellAmount, gas);
       approvalCostWei = r.gasCostWei;
+      if (r.unknown) {
+        const u = this.d.chain.unresolved;
+        await skip('approval outcome unknown');
+        await this.d.tg.send(
+          `⚠️ ${t.base}: approval outcome UNKNOWN (nonce ${u?.nonce ?? '?'}, ${u?.hashes.join(', ') ?? r.hash}). No trade was made. ` +
+            `New txs wait until it resolves; /cancelnonce replaces it.`,
+        );
+        return;
+      }
       if (!r.ok) {
         await skip(`approval failed (${r.reason})`);
         await this.d.tg.send(`⚠️ Approval failed for ${t.base}: ${r.reason} ${r.hash ?? ''}`);
@@ -403,12 +441,21 @@ export class Engine {
     const need = this.need(c.opp.sizeUsd);
     if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
     // MEXC symbol rules on the FINAL numbers, before anything is sent: a rejected MEXC leg after a sent DEX tx = one-sided.
-    const problem = orderProblem(t.rules, opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY', opp.cexQty, opp.cexLimitPrice);
+    const side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
+    const problem = orderProblem(t.rules, side, opp.cexQty, opp.cexLimitPrice) ?? bandProblem(t.rules, side, opp.cexLimitPrice, mid(b));
     if (problem) return skip(`MEXC would reject the order: ${problem}`);
+
+    // The CEX leg must never fire if the DEX tx cannot get the next valid nonce.
+    if (this.d.chain.readyToSend) {
+      const ready = await this.d.chain.readyToSend();
+      if (!ready.ok) return skip(`DEX side not ready to send: ${ready.reason}`);
+    }
 
     // 4) Persist the trade as 'executing' BEFORE anything is sent: if the bot dies now, startup sees it.
     const cid = clientId('t');
     const tradeId = this.record({ ...c, opp }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
+    this.currentTradeId = tradeId;
+    this.d.db.appendCid(tradeId, cid);
 
     // Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
     // the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
@@ -444,12 +491,13 @@ export class Engine {
       this.d.risk.pause(`DEX tx unknown ${dex.hash}`, true);
       await this.d.tg.send(
         `🚨 ${t.base}: DEX tx ${dex.hash} outcome UNKNOWN (not mined, cancel not confirmed). MEXC filled ${cexFilled}/${opp.cexQty}.\n` +
-          `NOT unwinding automatically. Trading PAUSED. Check the wallet on etherscan, fix by hand, then /start confirm.`,
+          `NOT unwinding automatically. Trading PAUSED.\nDo NOT hedge by hand until the nonce is consumed - the bot will alert you. (/cancelnonce replaces it.)`,
       );
     }
     const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.cfg.mexcTakerFee, t.qtyStep);
     if (cexUnknown || dex.unknown) {
       status = 'one_sided';
+      notes.push('pnl unknown'); // the measured balance change may not include the final outcome yet
     } else if (unwind) {
       status = 'one_sided';
       const qty = unwind.qty.toFixed(decimalsOfStep(t.qtyStep));
@@ -478,8 +526,8 @@ export class Engine {
 
     // 6) Exact PnL = change in total value of everything the trade touched, at pre-trade prices.
     //    Orders are closed (filled/cancelled) by now; free + locked balances avoid counting held funds as lost.
-    await this.sleep(2500);
-    const after = await this.d.balances(true);
+    const { balances: after, stable } = await this.stableBalances(t, c.tokenUsd, ethUsd);
+    if (!stable) notes.push('pnl approximate (balances still changing after 15 s)');
     const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd) - portfolioUsd(before, t, c.tokenUsd, ethUsd);
     const gasPaid = (Number(dex.gasCostWei + approvalCostWei) / 1e18) * ethUsd;
     this.d.db.updateTrade(tradeId, {
@@ -506,7 +554,20 @@ export class Engine {
         .filter(Boolean)
         .join('\n'),
     );
+    this.currentTradeId = null;
     await this.handleRisk(this.d.risk.afterTrade(status));
+  }
+
+  /** Read balances until two reads in a row give the same value (settled), for at most ~15 s. */
+  private async stableBalances(t: Token, tokenUsd: number, ethUsd: number): Promise<{ balances: Balances; stable: boolean }> {
+    let prev = await this.d.balances(true);
+    for (let i = 0; i < 6; i++) {
+      await this.sleep(2500);
+      const cur = await this.d.balances(true);
+      if (Math.abs(portfolioUsd(cur, t, tokenUsd, ethUsd) - portfolioUsd(prev, t, tokenUsd, ethUsd)) < 1e-6) return { balances: cur, stable: true };
+      prev = cur;
+    }
+    return { balances: prev, stable: false };
   }
 
   /**
@@ -516,13 +577,13 @@ export class Engine {
    */
   async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number; dust?: string }> {
     const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
-    const f = 10 ** t.priceDecimals;
-    const off = aggressiveOffset(t.rules); // 2%, or less if the symbol's price band is tight
-    const pxNum = side === 'BUY' ? Math.ceil(b.asks[0][0] * (1 + off) * f) / f : Math.floor(b.bids[0][0] * (1 - off) * f) / f;
+    // 2% through the book, but inside the symbol's PERCENT_PRICE_BY_SIDE band (some are 0.5% - 2%).
+    const pxNum = closePrice({ ...t.rules, priceDecimals: t.priceDecimals }, side, { bid: b.bids[0][0], ask: b.asks[0][0] });
     const dust = orderProblem(t.rules, side, Number(qty), pxNum);
     if (dust) return { orderId: '', filled: 0, dust };
     const px = pxNum.toFixed(t.priceDecimals);
     const cid = clientId('c');
+    if (this.currentTradeId !== null) this.d.db.appendCid(this.currentTradeId, cid); // before placing (crash safety)
     const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, side, qty, px, cid), this.sleep);
     await this.sleep(1500);
     let o = await this.d.mexc.getOrder(t.symbol, orderId);

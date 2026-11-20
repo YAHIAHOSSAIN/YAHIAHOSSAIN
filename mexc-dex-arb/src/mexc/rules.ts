@@ -34,6 +34,30 @@ export function aggressiveOffset(r: SymbolRules): number {
   return r.priceBand ? Math.min(0.02, r.priceBand * 0.5) : 0.02;
 }
 
+/** Band used when exchangeInfo has no PERCENT_PRICE_BY_SIDE filter. */
+export const DEFAULT_BAND = 0.2;
+
+/**
+ * Aggressive close price: 2% through the book, clamped to 80% of the symbol's band around the reference
+ * (mid of a fresh book), rounded to the price step in the safe direction.
+ */
+export function closePrice(r: SymbolRules, side: Side, book: { bid: number; ask: number }): number {
+  const f = 10 ** r.priceDecimals;
+  const ref = (book.bid + book.ask) / 2;
+  const band = r.priceBand ?? DEFAULT_BAND;
+  // Small epsilon: 100.1 * 1.02 is 102.10199999... in floating point and must still round to 102.102.
+  if (side === 'BUY') return Math.floor(Math.min(book.ask * 1.02, ref * (1 + 0.8 * band)) * f + 1e-6) / f;
+  return Math.ceil(Math.max(book.bid * 0.98, ref * (1 - 0.8 * band)) * f - 1e-6) / f;
+}
+
+/** Is a limit price inside the symbol's band around the reference price? */
+export function bandProblem(r: SymbolRules, side: Side, price: number, ref: number): string | null {
+  const band = r.priceBand ?? DEFAULT_BAND;
+  if (side === 'BUY' && price > ref * (1 + band)) return `buy price ${price} above the ${band * 100}% band around ${ref}`;
+  if (side === 'SELL' && price < ref * (1 - band)) return `sell price ${price} below the ${band * 100}% band around ${ref}`;
+  return null;
+}
+
 export function rulesFrom(s: SymbolInfo): SymbolRules {
   const qtyDecimals = s.baseAssetPrecision ?? Math.max(0, Math.round(-Math.log10(Number(s.baseSizePrecision) || 1)));
   return {
