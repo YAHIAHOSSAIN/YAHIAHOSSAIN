@@ -1,12 +1,12 @@
 // The trading loop: find the best opportunity each block, confirm it, trade both legs, clean up, account.
 import type { Config } from './config.js';
-import type { Aggregator, Quote, QuoteRequest } from './dex/aggregator.js';
+import { BestOf, QuoteBudgetError, type Aggregator, type Quote, type QuoteRequest } from './dex/aggregator.js';
 import type { GasInfo, TxResult } from './dex/chain.js';
 import type { Book, Order, Side } from './mexc/rest.js';
-import type { Db, TradeStatus } from './db.js';
+import type { Db, OpportunityRow, TradeStatus } from './db.js';
 import type { Risk, RiskEvent } from './risk.js';
 import type { Token } from './watchlist.js';
-import { type Balances, inventoryWarnings, portfolioUsd } from './inventory.js';
+import { type Balances, inventoryPlan, inventoryWarnings, portfolioUsd } from './inventory.js';
 import {
   type Opportunity,
   evaluateCexBuy,
@@ -108,6 +108,7 @@ export interface CexApi {
   limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
   marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
   getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
+  myTrades?(symbol: string, orderId: string): Promise<{ price: string; qty: string; quoteQty: string; commission: string; commissionAsset: string }[]>;
   getOrder(symbol: string, orderId: string): Promise<Order>;
   cancelOrder(symbol: string, orderId: string): Promise<Order>;
 }
@@ -160,6 +161,10 @@ export interface Candidate {
   spender: string;
   approvalGas: bigint;
   tokenUsd: number;
+  /** What gets logged to `opportunities` (decision filled in by tick). */
+  row?: OpportunityRow;
+  /** Hurdle for this candidate (base hurdle, skewed by inventory balance). */
+  need?: number;
 }
 
 const mid = (b: Book) => (b.bids[0][0] + b.asks[0][0]) / 2;
@@ -243,7 +248,10 @@ export class Engine {
   /** One scan; executes at most one trade. */
   async tick(): Promise<void> {
     const block = this.d.risk.blockReason();
-    if (block) return this.note('block', `trading blocked: ${block}`);
+    if (block) {
+      this.logBlocked('paused', block);
+      return this.note('block', `trading blocked: ${block}`);
+    }
     this.note('block', 'trading enabled');
 
     if (this.d.chain.checkUnresolved) {
@@ -268,6 +276,7 @@ export class Engine {
     const gas = await this.d.chain.gas();
     this.lastGasGwei = Number(gas.effective) / 1e9;
     if (this.lastGasGwei > this.cfg.maxGasGwei) {
+      this.logBlocked('gas', `gas ${this.lastGasGwei.toFixed(2)} gwei > ${this.cfg.maxGasGwei}`);
       return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > MAX_GAS_GWEI ${this.cfg.maxGasGwei}, waiting`);
     }
     this.note('gas', 'gas ok');
@@ -297,6 +306,11 @@ export class Engine {
       }
     }
 
+    this.inventoryHousekeeping(bal, prices);
+    // BestOf compares aggregators after gas: tell it what gas costs in each output token right now.
+    if (this.d.agg instanceof BestOf) this.d.agg.gasInOutput = this.gasValuer(gas, ethUsd, prices);
+
+    const rows: OpportunityRow[] = [];
     let best: Candidate | null = null;
     for (const t of this.d.tokens) {
       const b = books.get(t.symbol);
@@ -307,15 +321,86 @@ export class Engine {
       }
       this.note(`susp-${t.base}`, `${t.base}: active`);
       try {
-        for (const c of await this.candidates(t, b, bal, gas, ethUsd)) {
-          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(this.need(c.opp.sizeUsd))})`);
-          if (c.opp.net > this.need(c.opp.sizeUsd) && (!best || c.opp.net > best.opp.net)) best = c;
+        for (const c of await this.candidates(t, b, bal, gas, ethUsd, rows)) {
+          const need = c.need ?? this.need(c.opp.sizeUsd);
+          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(need)})`);
+          const passes = c.opp.net > need;
+          if (c.row) {
+            c.row.decision = passes ? 'trade' : 'below_hurdle';
+            c.row.reason = passes ? null : `net ${c.opp.net.toFixed(4)} <= need ${need.toFixed(4)}`;
+          }
+          if (passes && (!best || c.opp.net > best.opp.net)) best = c;
         }
       } catch (e) {
-        log.warn(`${t.base} quote: ${errMsg(e)}`);
+        if (e instanceof QuoteBudgetError) rows.push(this.blankRow(t, 'rate_limited', errMsg(e)));
+        else log.warn(`${t.base} quote: ${errMsg(e)}`);
       }
     }
+    for (const r of rows) if (r.decision === 'trade' && best?.row !== r) r.reason = 'passed, but another candidate was better this tick';
+    this.flushRows(rows);
     if (best) await this.execute(best, gas, ethUsd);
+  }
+
+  // ---------- opportunity logging ----------
+  private lastBlockedLog = new Map<string, number>();
+
+  private blankRow(t: Token, decision: OpportunityRow['decision'], reason: string | null, direction = '-'): OpportunityRow {
+    return {
+      ts: Date.now(), chain: this.cfg.chain.name, token: t.base, direction, size_usd: null, mexc_bid: null, mexc_ask: null,
+      book_age_ms: null, aggregator: null, dex_out: null, dex_min_out: null, usdc_usdt: this.stableRate, gross_bps: null,
+      fee_bps: this.fee(t) * 10_000, gas_usd: null, net_usd: null, hurdle_usd: null, decision, reason,
+    };
+  }
+
+  /** Paused / gas too high: one row per token, at most once a minute (so the report shows WHY nothing traded). */
+  private logBlocked(decision: 'paused' | 'gas', reason: string) {
+    const last = this.lastBlockedLog.get(decision) ?? 0;
+    if (Date.now() - last < 60_000) return;
+    this.lastBlockedLog.set(decision, Date.now());
+    this.flushRows(this.d.tokens.map((t) => this.blankRow(t, decision, reason)));
+  }
+
+  private flushRows(rows: OpportunityRow[]) {
+    try {
+      this.d.db.insertOpportunities(rows);
+    } catch (e) {
+      log.warn(`opportunity log: ${errMsg(e)}`);
+    }
+  }
+
+  /** Gas units -> output-token base units, so BestOf can compare aggregators after gas. */
+  private gasValuer(gas: GasInfo, ethUsd: number, prices: Record<string, number>) {
+    return (units: bigint, buyToken: string): bigint => {
+      const usdCost = gasUsd(units, gas.effective, ethUsd);
+      if (buyToken.toLowerCase() === this.cfg.usdc) return toUnits(usdCost / this.stableRate, this.stableDec);
+      const t = this.d.tokens.find((x) => x.address === buyToken.toLowerCase());
+      const px = t ? prices[t.base] : undefined;
+      return t && px ? toUnits(usdCost / px, t.decimals) : 0n;
+    };
+  }
+
+  // ---------- inventory (item 5) ----------
+  /** Wallet share of a token's inventory (0..1), or null if there is none. */
+  private walletShare(t: Token, bal: Balances, px: number, dWallet = 0, dMexc = 0): number | null {
+    const w = Math.max(0, (bal.walletToken[t.base] ?? 0) * px + dWallet);
+    const m = Math.max(0, (bal.mexc[t.base] ?? 0) * px + dMexc);
+    return w + m > 0 ? w / (w + m) : null;
+  }
+
+  /**
+   * Skewed hurdle: trades that push a token's inventory further from 50/50 wallet/MEXC need more profit,
+   * trades that restore it need less (x0.8), never below the plain cost-and-safety hurdle's floor.
+   */
+  needFor(t: Token, direction: 'DEX_BUY' | 'CEX_BUY', sizeUsd: number, bal: Balances, px: number): number {
+    const base = this.need(sizeUsd);
+    if (!this.live) return base; // paper balances are synthetic
+    const before = this.walletShare(t, bal, px);
+    const after = direction === 'DEX_BUY' ? this.walletShare(t, bal, px, sizeUsd, -sizeUsd) : this.walletShare(t, bal, px, -sizeUsd, sizeUsd);
+    if (before === null || after === null) return base;
+    const worsening = Math.abs(after - 0.5) - Math.abs(before - 0.5);
+    if (worsening > 0) return base * (1 + this.cfg.skewK * worsening);
+    if (worsening < 0) return Math.max(base * 0.8, this.cfg.minProfitUsd * 0.8);
+    return base;
   }
 
   /** An unresolved tx got its outcome: tell the human which tx won, and note it on the trade row. */
@@ -333,24 +418,73 @@ export class Engine {
     if (row) this.d.db.updateTrade(row.id, { note: `${row.note ?? ''}; dex resolved: ${what}` });
   }
 
-  /** Indicative opportunities in both directions for one token. */
-  async candidates(t: Token, b: Book, bal: Balances, gas: GasInfo, ethUsd: number): Promise<Candidate[]> {
+  /**
+   * Indicative opportunities in both directions for one token, at several sizes:
+   * the base size first; if its gross gap reaches MULTISIZE_TRIGGER of the hurdle, also 0.5x and 2x
+   * (within inventory and MAX_TRADE_USD). The best net per direction is returned. Every evaluation is
+   * added to `rows` (the opportunities log).
+   */
+  async candidates(t: Token, b: Book, bal: Balances, gas: GasInfo, ethUsd: number, rows: OpportunityRow[] = []): Promise<Candidate[]> {
     const out: Candidate[] = [];
     const bestBid = b.bids[0][0];
     const tokenUsd = mid(b);
     const cexTok = bal.mexc[t.base] ?? 0;
     const walTok = bal.walletToken[t.base] ?? 0;
-    const slippageBps = this.cfg.dexSlippageBps;
+    const base = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
 
-    // DEX_BUY: USDC -> token on DEX, token -> USDT on MEXC.
-    const sizeA = Math.floor(Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99) * 100) / 100;
-    if (sizeA >= this.cfg.minTradeUsd) {
-      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(sizeA, this.stableDec), taker: this.taker, slippageBps };
+    const capA = Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99);
+    const capB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
+
+    for (const [dir, cap] of [['DEX_BUY', capA], ['CEX_BUY', capB]] as const) {
+      if (cap < this.cfg.minTradeUsd) {
+        rows.push(this.blankRow(t, 'inventory', `max size ${usd(cap)} < MIN_TRADE_USD (not enough ${dir === 'DEX_BUY' ? 'wallet stable / MEXC token' : 'MEXC USDT / wallet token'})`, dir));
+        continue;
+      }
+      const sizes = [Math.max(this.cfg.minTradeUsd, Math.min(base, cap))];
+      const results: Candidate[] = [];
+      const first = await this.evalAt(t, b, bal, gas, ethUsd, dir, sizes[0], rows);
+      if (first) results.push(first);
+      // Multi-size: only worth the extra quotes when the base size is already close to the hurdle.
+      if (first && first.opp.grossUsd >= this.cfg.multiSizeTrigger * (first.need ?? this.need(first.opp.sizeUsd))) {
+        for (const k of [0.5, 2]) {
+          const size = Math.floor(Math.min(sizes[0] * k, cap) * 100) / 100;
+          if (size < this.cfg.minTradeUsd || sizes.includes(size)) continue;
+          sizes.push(size);
+          const c = await this.evalAt(t, b, bal, gas, ethUsd, dir, size, rows);
+          if (c) results.push(c);
+        }
+      }
+      if (results.length) out.push(results.reduce((x, y) => (y.opp.net > x.opp.net ? y : x)));
+    }
+    return out;
+  }
+
+  /** One direction at one size: DEX quote + MEXC book walk -> Candidate (or null), plus its opportunities row. */
+  private async evalAt(
+    t: Token,
+    b: Book,
+    bal: Balances,
+    gas: GasInfo,
+    ethUsd: number,
+    dir: 'DEX_BUY' | 'CEX_BUY',
+    size: number,
+    rows: OpportunityRow[],
+  ): Promise<Candidate | null> {
+    const slippageBps = this.cfg.dexSlippageBps;
+    const tokenUsd = mid(b);
+    const row = this.blankRow(t, 'below_hurdle', null, dir);
+    Object.assign(row, { size_usd: size, mexc_bid: b.bids[0][0], mexc_ask: b.asks[0][0], book_age_ms: Date.now() - b.ts });
+    rows.push(row);
+
+    let c: Candidate | null = null;
+    if (dir === 'DEX_BUY') {
+      // USDC -> token on DEX, token -> USDT on MEXC.
+      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(size, this.stableDec), taker: this.taker, slippageBps };
       const q = await this.d.agg.price(req);
       const spender = this.spenderOf(q);
       const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
       const opp = evaluateDexBuy({
-        sizeUsd: sizeA,
+        sizeUsd: size,
         tokensOut: toFloat(q.buyAmount, t.decimals),
         tokensMin: toFloat(q.minBuyAmount, t.decimals),
         bids: b.bids,
@@ -358,33 +492,111 @@ export class Engine {
         gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
         costs: this.costs(t),
       });
-      const problem = opp && orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
-      if (problem) this.note(`rule-${t.base}-A`, `${t.base} DEX_BUY skipped: MEXC would reject the sell (${problem})`);
-      else if (opp && opp.cexQty <= cexTok) out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
+      Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, t.decimals), dex_min_out: toFloat(q.minBuyAmount, t.decimals) });
+      if (!opp) {
+        row.decision = 'inventory';
+        row.reason = 'MEXC book too thin for this size';
+        return null;
+      }
+      const problem = orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
+      if (problem || opp.cexQty > (bal.mexc[t.base] ?? 0)) {
+        row.decision = problem ? 'rule' : 'inventory';
+        row.reason = problem ?? 'not enough token on MEXC';
+        this.fillRow(row, opp, size);
+        return null;
+      }
+      c = { token: t, opp, req, spender, approvalGas, tokenUsd };
+    } else {
+      // USDT -> token on MEXC, token -> USDC on DEX.
+      const plan = planCexBuy({ sizeUsd: size, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.fee(t) });
+      if (!plan || plan.tokensToSell > (bal.walletToken[t.base] ?? 0)) {
+        row.decision = 'inventory';
+        row.reason = plan ? 'not enough token in the wallet' : 'MEXC book too thin for this size';
+        return null;
+      }
+      const req = { sellToken: t.address, buyToken: this.cfg.usdc, sellAmount: toUnits(plan.tokensToSell, t.decimals), taker: this.taker, slippageBps };
+      const q = await this.d.agg.price(req);
+      const spender = this.spenderOf(q);
+      const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
+      const opp = evaluateCexBuy({
+        plan,
+        usdcOut: toFloat(q.buyAmount, this.stableDec),
+        usdcMin: toFloat(q.minBuyAmount, this.stableDec),
+        gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
+        costs: this.costs(t),
+      });
+      Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, this.stableDec), dex_min_out: toFloat(q.minBuyAmount, this.stableDec) });
+      const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
+      if (problem) {
+        Object.assign(row, { decision: 'rule', reason: problem });
+        this.fillRow(row, opp, size);
+        return null;
+      }
+      c = { token: t, opp, req, spender, approvalGas, tokenUsd };
     }
+    c.need = this.needFor(t, dir, size, bal, tokenUsd);
+    c.row = row;
+    this.fillRow(row, c.opp, size, c.need);
+    return c;
+  }
 
-    // CEX_BUY: USDT -> token on MEXC, token -> USDC on DEX.
-    const sizeB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
-    if (sizeB >= this.cfg.minTradeUsd) {
-      const plan = planCexBuy({ sizeUsd: sizeB, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.fee(t) });
-      if (plan && plan.tokensToSell <= walTok) {
-        const req = { sellToken: t.address, buyToken: this.cfg.usdc, sellAmount: toUnits(plan.tokensToSell, t.decimals), taker: this.taker, slippageBps };
-        const q = await this.d.agg.price(req);
-        const spender = this.spenderOf(q);
-        const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
-        const opp = evaluateCexBuy({
-          plan,
-          usdcOut: toFloat(q.buyAmount, this.stableDec),
-          usdcMin: toFloat(q.minBuyAmount, this.stableDec),
-          gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
-          costs: this.costs(t),
-        });
-        const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
-        if (problem) this.note(`rule-${t.base}-B`, `${t.base} CEX_BUY skipped: MEXC would reject the buy (${problem})`);
-        else out.push({ token: t, opp, req, spender, approvalGas, tokenUsd });
+  private fillRow(row: OpportunityRow, opp: Opportunity, size: number, need?: number) {
+    Object.assign(row, {
+      gross_bps: (opp.grossUsd / size) * 10_000,
+      gas_usd: opp.gasUsd,
+      net_usd: opp.net,
+      hurdle_usd: need ?? this.need(size),
+    });
+  }
+
+  /** Hourly inventory snapshot + per-side warnings + rebalance tickets (live only). */
+  private lastSnapshot = 0;
+  private lowSince = new Map<string, number>();
+  private inventoryHousekeeping(bal: Balances, prices: Record<string, number>) {
+    if (!this.live) return;
+    const now = Date.now();
+    if (now - this.lastSnapshot > 3600_000) {
+      this.lastSnapshot = now;
+      try {
+        this.d.db.insertInventorySnapshot(
+          this.d.tokens.filter((t) => prices[t.base]).map((t) => ({
+            ts: now,
+            token: t.base,
+            wallet_usd: (bal.walletToken[t.base] ?? 0) * prices[t.base],
+            mexc_usd: (bal.mexc[t.base] ?? 0) * prices[t.base],
+          })),
+        );
+      } catch (e) {
+        log.warn(`inventory snapshot: ${errMsg(e)}`);
       }
     }
-    return out;
+    const trade = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
+    for (const w of inventoryPlan(bal, this.d.tokens, prices, {
+      tradeUsd: trade,
+      perSideX: this.cfg.inventoryPerSideX,
+      maxTokenSharePct: this.cfg.maxTokenSharePct,
+      stableInUsdt: this.stableRate,
+      walletAddress: this.d.chain.address,
+    })) {
+      if (w.kind === 'warning') {
+        void this.alertThrottled(`invplan-${w.key}`, `📦 Inventory: ${w.text}`);
+        continue;
+      }
+      // A side below 1x the trade size for REBALANCE_AFTER_MIN -> ONE ticket (the bot never moves funds).
+      const key = `${w.token}:${w.side}`;
+      if (!w.low) {
+        this.lowSince.delete(key);
+        this.d.db.closeTickets(w.token, w.side);
+        continue;
+      }
+      const since = this.lowSince.get(key) ?? now;
+      this.lowSince.set(key, since);
+      const already = this.d.db.openTickets().some((x) => x.token === w.token && x.side === w.side);
+      if (!already && now - since >= this.cfg.rebalanceAfterMin * 60_000) {
+        this.d.db.openTicket({ token: w.token, side: w.side, asset: w.asset, amount: w.amount, direction: w.direction });
+        void this.d.tg.send(`🎫 Rebalance ticket: ${w.direction}: ${w.amount.toFixed(4)} ${w.asset}. (${w.side} side of ${w.token} has been low for ${this.cfg.rebalanceAfterMin} min.) The bot never moves funds itself.`);
+      }
+    }
   }
 
   private spenderOf(q: Quote): string {
@@ -397,7 +609,7 @@ export class Engine {
   async execute(c: Candidate, gas: GasInfo, ethUsd: number): Promise<void> {
     const { token: t } = c;
     this.currentTradeId = null;
-    if (!this.live) return this.recordPaper(c);
+    if (!this.live) return this.recordPaper(c, gas, ethUsd);
 
     let approvalCostWei = 0n;
     const skip = async (why: string) => {
@@ -440,6 +652,7 @@ export class Engine {
     // 2) Firm quote + simulation (eth_call). Abort on any doubt.
     let firm: Quote;
     let gasEst: bigint;
+    const tQuote = Date.now();
     try {
       firm = await this.d.agg.quote(c.req);
       if (!firm.tx) return skip('firm quote has no transaction');
@@ -448,6 +661,7 @@ export class Engine {
       return skip(`simulation/quote failed: ${errMsg(e)}`);
     }
     const tx = firm.tx;
+    const quoteMs = Date.now() - tQuote;
 
     // 3) Re-evaluate with a fresh REST book, firm amounts and simulated gas.
     const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
@@ -476,7 +690,7 @@ export class Engine {
           })
         : null;
     }
-    const need = this.need(c.opp.sizeUsd);
+    const need = c.need ?? this.need(c.opp.sizeUsd); // the inventory-skewed hurdle from the scan
     if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
     // MEXC symbol rules on the FINAL numbers, before anything is sent: a rejected MEXC leg after a sent DEX tx = one-sided.
     const side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
@@ -498,11 +712,14 @@ export class Engine {
     // Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
     // the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
     log.info(`${t.base} EXECUTE ${opp.direction} size ${usd(opp.sizeUsd)} expected ${usd(opp.net)}`);
+    const tLegs = Date.now();
+    let signMs: number | null = null;
     const [cexR, dexR] = await Promise.allSettled([
       this.cexLeg(t, opp, cid),
-      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash, nonce) =>
-        this.d.db.updateTrade(tradeId, { dex_tx: hash, note: `client order id ${cid}; nonce ${nonce}` }),
-      ),
+      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash, nonce) => {
+        signMs = Date.now() - tLegs;
+        this.d.db.updateTrade(tradeId, { dex_tx: hash, note: `client order id ${cid}; nonce ${nonce}` });
+      }),
     ]);
 
     const dex: TxResult = dexR.status === 'fulfilled' ? dexR.value : { ok: false, gasCostWei: 0n, reason: errMsg(dexR.reason) };
@@ -592,6 +809,10 @@ export class Engine {
         .filter(Boolean)
         .join('\n'),
     );
+    await this.recordLegs(tradeId, t, opp, firm, before, after, dex, cexR.status === 'fulfilled' ? cexR.value : null, {
+      quoteMs,
+      signMs,
+    }).catch((e) => log.warn(`legs: ${errMsg(e)}`));
     this.currentTradeId = null;
     await this.handleRisk(this.d.risk.afterTrade(status));
   }
@@ -635,11 +856,12 @@ export class Engine {
   }
 
   /** MEXC marketable limit order; cancels any unfilled rest. Returns filled quantity. */
-  async cexLeg(t: Token, opp: Opportunity, cid = clientId('t')): Promise<{ orderId: string; filled: number }> {
+  async cexLeg(t: Token, opp: Opportunity, cid = clientId('t')): Promise<{ orderId: string; filled: number; ackMs: number }> {
     const side: Side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
     const qty = opp.cexQty.toFixed(decimalsOfStep(t.qtyStep));
     const f = 10 ** t.priceDecimals;
     const px = side === 'SELL' ? Math.floor(opp.cexLimitPrice * f) / f : Math.ceil(opp.cexLimitPrice * f) / f;
+    const tPlace = Date.now();
     const { orderId } = await placeSafely(
       this.d.mexc,
       t.symbol,
@@ -647,6 +869,7 @@ export class Engine {
       () => this.d.mexc.limitOrder(t.symbol, side, qty, px.toFixed(t.priceDecimals), cid),
       this.sleep,
     );
+    const ackMs = Date.now() - tPlace;
     log.info(`MEXC ${side} ${qty} ${t.symbol} @ ${px} id=${orderId}`);
     await this.sleep(1500);
 
@@ -671,17 +894,102 @@ export class Engine {
         throw e;
       }
     }
-    return { orderId, filled: Number(o.executedQty) };
+    return { orderId, filled: Number(o.executedQty), ackMs };
   }
 
-  private async recordPaper(c: Candidate) {
+  /**
+   * Paper realism: wait PAPER_LATENCY_MS, re-quote the DEX and re-read the MEXC book, and book THAT net.
+   * The first quote overstates profit (in live trading, prices move while both legs are sent).
+   */
+  private async recordPaper(c: Candidate, gas: GasInfo, ethUsd: number) {
     const { token: t, opp } = c;
-    this.record(c, 'paper', { pnl: opp.net, gas: opp.gasUsd });
+    await this.sleep(this.cfg.paperLatencyMs);
+    let requoted: number;
+    try {
+      requoted = (await this.requote(c, gas, ethUsd)) ?? -opp.gasUsd;
+    } catch (e) {
+      log.warn(`paper re-quote ${t.base}: ${errMsg(e)}`);
+      requoted = -opp.gasUsd; // cannot re-quote: assume the worst sensible case (gas spent, nothing earned)
+    }
+    const id = this.record(c, 'paper', { pnl: requoted, gas: opp.gasUsd });
+    this.d.db.updateTrade(id, { requoted_net: requoted });
     await this.d.tg.send(
       `📝 PAPER ${t.base} ${opp.direction}\nBuy @ ${opp.buyPrice.toPrecision(6)} | Sell @ ${opp.sellPrice.toPrecision(6)}\n` +
-        `Qty ${opp.cexQty} | size ${usd(opp.sizeUsd)} | fee ${usd(opp.cexFeeUsd)} | gas ${usd(opp.gasUsd)}\nNet ${usd(opp.net)}`,
+        `Qty ${opp.cexQty} | size ${usd(opp.sizeUsd)} | fee ${usd(opp.cexFeeUsd)} | gas ${usd(opp.gasUsd)}\n` +
+        `Net ${usd(opp.net)} at first quote, ${usd(requoted)} after ${this.cfg.paperLatencyMs} ms re-quote (booked)`,
     );
     await this.handleRisk(this.d.risk.afterTrade('paper'));
+  }
+
+  /** Same trade, fresh prices: DEX re-quote + fresh MEXC book. Returns the new net (null if it no longer fills). */
+  private async requote(c: Candidate, gas: GasInfo, ethUsd: number): Promise<number | null> {
+    const t = c.token;
+    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
+    const q = await this.d.agg.price(c.req);
+    const g = gasUsd(q.gas + c.approvalGas, gas.effective, ethUsd);
+    if (c.opp.direction === 'DEX_BUY') {
+      const o = evaluateDexBuy({
+        sizeUsd: c.opp.sizeUsd,
+        tokensOut: toFloat(q.buyAmount, t.decimals),
+        tokensMin: toFloat(q.minBuyAmount, t.decimals),
+        bids: b.bids,
+        qtyStep: t.qtyStep,
+        gasUsd: g,
+        costs: this.costs(t),
+      });
+      return o?.net ?? null;
+    }
+    const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.fee(t));
+    if (!plan) return null;
+    return evaluateCexBuy({ plan, usdcOut: toFloat(q.buyAmount, this.stableDec), usdcMin: toFloat(q.minBuyAmount, this.stableDec), gasUsd: g, costs: this.costs(t) }).net;
+  }
+
+  /** One `legs` row per leg: quoted vs filled price, gas, MEXC fills and fee (myTrades), latency per stage. */
+  private async recordLegs(
+    tradeId: number,
+    t: Token,
+    opp: Opportunity,
+    firm: Quote,
+    before: Balances,
+    after: Balances,
+    dex: TxResult,
+    cex: { orderId: string; filled: number; ackMs: number } | null,
+    lat: { quoteMs: number; signMs: number | null },
+  ) {
+    const dexBuy = opp.direction === 'DEX_BUY';
+    const tokDelta = (after.walletToken[t.base] ?? 0) - (before.walletToken[t.base] ?? 0);
+    const stableDelta = (after.walletUsdc - before.walletUsdc) * this.stableRate;
+    // DEX: buy = USDT-value spent per token received; sell = USDT-value received per token sold.
+    const dexQuoted = dexBuy ? opp.buyPrice : opp.sellPrice;
+    const dexFilled = dex.ok && tokDelta !== 0 ? Math.abs(stableDelta / tokDelta) : null;
+    const slip = (q: number, f: number | null, buy: boolean) => (f === null || !q ? null : ((buy ? f - q : q - f) / q) * 10_000);
+    this.d.db.insertLeg({
+      trade_id: tradeId, leg: 'dex', quoted_price: dexQuoted, filled_price: dexFilled, slippage_bps: slip(dexQuoted, dexFilled, dexBuy),
+      min_out: toFloat(firm.minBuyAmount, dexBuy ? t.decimals : this.stableDec), real_out: dexBuy ? tokDelta : after.walletUsdc - before.walletUsdc,
+      gas_used: dex.gasUsed?.toString() ?? null, gas_price: dex.gasPrice?.toString() ?? null, l1_fee: null,
+      executed_qty: null, avg_price: null, fee: null, fee_asset: null,
+      latency_quote_ms: lat.quoteMs, latency_sign_ms: lat.signMs, latency_inclusion_ms: dex.inclusionMs ?? null, latency_mexc_ack_ms: null,
+    });
+    if (!cex) return;
+    let qty = cex.filled;
+    let avg: number | null = null;
+    let fee: number | null = null;
+    let feeAsset: string | null = null;
+    if (this.d.mexc.myTrades && cex.filled > 0) {
+      const fills = await this.d.mexc.myTrades(t.symbol, cex.orderId);
+      qty = fills.reduce((a, f) => a + Number(f.qty), 0);
+      const quote = fills.reduce((a, f) => a + Number(f.quoteQty), 0);
+      avg = qty > 0 ? quote / qty : null;
+      fee = fills.reduce((a, f) => a + Number(f.commission), 0);
+      feeAsset = fills[0]?.commissionAsset ?? null;
+    }
+    const cexQuoted = dexBuy ? opp.sellPrice : opp.buyPrice;
+    this.d.db.insertLeg({
+      trade_id: tradeId, leg: 'mexc', quoted_price: cexQuoted, filled_price: avg, slippage_bps: slip(cexQuoted, avg, !dexBuy),
+      min_out: null, real_out: null, gas_used: null, gas_price: null, l1_fee: null,
+      executed_qty: qty, avg_price: avg, fee, fee_asset: feeAsset,
+      latency_quote_ms: null, latency_sign_ms: null, latency_inclusion_ms: null, latency_mexc_ack_ms: cex.ackMs,
+    });
   }
 
   private record(

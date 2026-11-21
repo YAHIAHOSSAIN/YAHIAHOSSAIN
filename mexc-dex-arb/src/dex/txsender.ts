@@ -31,6 +31,10 @@ export interface TxResult {
   rejected?: boolean;
   /** Not even attempted, because an earlier tx is still unresolved. Not a failed attempt. */
   refused?: boolean;
+  gasUsed?: bigint;
+  gasPrice?: bigint;
+  /** ms from signing to the receipt (inclusion latency). */
+  inclusionMs?: number;
 }
 
 export interface Unresolved {
@@ -203,6 +207,7 @@ export class TxSender {
       nonce, to: tx.to, data: tx.data, value: tx.value ?? 0n, gasLimit, maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.tip,
     });
     this.nextNonce = nonce + 1;
+    this.signedAt = this.now();
     onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
     // In flight from now on, and PERSISTED: if the bot dies while waiting, a restart still knows this nonce is taken.
     const fees = { maxFee: gas.maxFee.toString(), tip: gas.tip.toString() };
@@ -257,9 +262,11 @@ export class TxSender {
     return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancel.hash} not confirmed: outcome UNKNOWN` };
   }
 
+  private signedAt = 0;
   private result(hash: string, r: { status: number | null; gasUsed: bigint; gasPrice: bigint }): TxResult {
     const cost = r.gasUsed * r.gasPrice;
-    return r.status === 1 ? { ok: true, hash, gasCostWei: cost } : { ok: false, hash, gasCostWei: cost, reason: 'reverted' };
+    const extra = { gasUsed: r.gasUsed, gasPrice: r.gasPrice, inclusionMs: this.now() - this.signedAt };
+    return r.status === 1 ? { ok: true, hash, gasCostWei: cost, ...extra } : { ok: false, hash, gasCostWei: cost, reason: 'reverted', ...extra };
   }
 
   private async waitReceipt(hash: string, timeoutSec: number) {

@@ -174,6 +174,53 @@ npm run report -- 24 live
 
 **Live চালুর আগে একবার:** `npm run check:0x` চালান। এটা কিছুই sign বা পাঠায় না, শুধু দেখে 0x-এর `transaction.to` আসলেই AllowanceHolder কিনা। বিস্তারিত `CHANGES.md`-এ।
 
+## Running phase 1 in paper on Base for 7 days and reading the report
+
+Phase 1-এর লক্ষ্য **টাকা কামানো না, মাপা**: Base-এ প্রতিদিন আসলে কতগুলো সত্যিকারের সুযোগ আসে, সেটা দেখা।
+বিস্তারিত পরিবর্তনের তালিকা আছে `CHANGES_UPGRADE.md`-এ।
+
+**১. আগে একবার যাচাই করুন (কিছুই trade হয় না):**
+```bash
+npm run networks     # কোন chain-এ কয়টা MEXC token deposit আর withdraw করা যায়, আর chain-এর নাম ঠিক মিলছে কিনা
+npm run check:0x     # 0x ব্যবহার করলে: transaction.to আসলেই AllowanceHolder কিনা
+```
+
+**২. Base-এর জন্য `.env` সেট করুন:**
+```
+MODE=paper
+CHAIN=base
+RPC_URL=<Base RPC, যেমন Alchemy-র base-mainnet>
+SEND_RPC_URL=<Base RPC>            # শুধু paper mode-এ ব্যবহার হয় না, তবু Base-এর হতে হবে
+DEX_AGGREGATOR=kyber               # API key লাগে না। 0x key থাকলে "0x,kyber" দিন
+WATCHLIST=AERO,VIRTUAL,MORPHO      # networks-এর ফল থেকে ২–৪টা token বেছে নিন
+MAX_TRADE_USD=200
+```
+
+**৩. চালান:**
+```bash
+npm run build
+BOT_CHAINS=base pm2 start ecosystem.config.cjs && pm2 save
+```
+বট প্রতি ১ সেকেন্ডে scan করে। প্রতিটা সুযোগ, trade হোক বা না হোক, `data/base.sqlite`-এর `opportunities` table-এ লেখা হয়।
+Paper trade-এর লাভ হিসাব করা হয় ১ সেকেন্ড পরে আবার quote নিয়ে, প্রথম quote-এর ভিত্তিতে না।
+
+**৪. Report পড়ুন** (প্রতিদিন রাত ১১টায় Telegram-এ আসে, অথবা হাতে চালাতে পারেন):
+```bash
+CHAIN=base npm run report -- 168 paper          # শেষ ৭ দিন
+CHAIN=base npm run report -- 168 paper --csv > base.csv
+```
+যে সংখ্যাগুলো দেখবেন:
+| লাইন | মানে | কী হলে ভালো |
+|---|---|---|
+| `minutes with gross gap ≥20/35/50 bps` | দিনে কত মিনিট gap ছিল | ৫০ bps-এর ঘরে দিনে কয়েক মিনিট বা তার বেশি |
+| `Would-have PnL` | threshold ২০, ৩০, ৪০ বা ৬০ bps হলে কত লাভ হতো | কোনো একটা threshold-এ ধনাত্মক |
+| `decisions` | কেন trade হয়নি: `below_hurdle`, `inventory`, `rate_limited` | `rate_limited` বেশি হলে quote budget কম পড়ছে |
+| Gap histogram / hour | কোন token-এ আর কোন সময়ে gap আসে | যে token-এ gap আসে না, সেটা বাদ দিন |
+| paper `Net PnL` | আবার quote নেওয়ার পরের লাভ | ৭ দিনে ধনাত্মক হলে তবেই live-এর কথা ভাবুন |
+
+**৫. সিদ্ধান্ত:** ৭ দিনে যদি re-quote-এর পরও লাভ ধনাত্মক না আসে, তাহলে live করবেন না। Grok আর Muse দুইজনই একই কথা বলেছে।
+লাভ এলে `MODE=live` আর `MAX_TRADE_USD=50` দিয়ে শুরু করুন। Rebalance টিকিট এলে নিজে deposit বা withdraw করবেন। বট নিজে কখনো টাকা সরায় না।
+
 ## জরুরি কথা
 
 - **আসল scan-এ দেখা গেছে** (LINK, PEPE, UNI, SHIB, ENA, LDO): MEXC আর DEX-এর gap বেশিরভাগ সময় **০–১%**।

@@ -79,6 +79,7 @@ function setup(opts: {
   };
   let lastFirm: QuoteRequest | null = null;
 
+  const priced: bigint[] = []; // sellAmount of every indicative DEX quote
   const orders = new Map<string, Order>();
   const byCid = new Map<string, string>();
   let nextId = 1;
@@ -104,7 +105,7 @@ function setup(opts: {
     balances: async () => structuredClone(bal),
     agg: {
       name: '0x',
-      price: async (r) => dexQuote(r, false),
+      price: async (r) => (priced.push(r.sellAmount), dexQuote(r, false)),
       quote: async (r) => ((lastFirm = r), dexQuote(r, true)),
     },
     chain: {
@@ -174,7 +175,7 @@ function setup(opts: {
       },
     },
   });
-  return { engine, db, risk, alerts, calls, bal, cfg };
+  return { engine, db, risk, alerts, calls, bal, cfg, priced };
 }
 
 const trades = (db: Db) => db.statsSince(0);
@@ -381,4 +382,79 @@ test('stale or unreasonable USDC/USDT rate: no trading', async () => {
   const off = setup({ usdcUsdt: 1.05 });
   await off.engine.tick();
   assert.deepEqual(off.calls, []);
+});
+
+// ---------------- Phase-1 upgrade: items 2, 4e, 5 ----------------
+const opps = (db: Db) => db.all<{ token: string; direction: string; size_usd: number | null; decision: string; net_usd: number | null; gross_bps: number | null }>('SELECT * FROM opportunities');
+
+test('every evaluated candidate is logged to opportunities, with its decision', async () => {
+  const { engine, db } = setup({ bid: 10.9 }); // below the hurdle
+  await engine.tick();
+  const rows = opps(db);
+  assert.ok(rows.length >= 2); // both directions
+  assert.ok(rows.every((r) => r.token === 'LINK'));
+  assert.ok(rows.some((r) => r.decision === 'below_hurdle' && r.gross_bps !== null && r.net_usd !== null));
+});
+
+test('a traded candidate is logged as trade; paused ticks are logged as paused', async () => {
+  const s1 = setup({});
+  await s1.engine.tick();
+  assert.ok(opps(s1.db).some((r) => r.decision === 'trade'));
+  const s2 = setup({});
+  s2.risk.pause('Telegram /stop');
+  await s2.engine.tick();
+  assert.ok(opps(s2.db).every((r) => r.decision === 'paused'));
+});
+
+test('multi-size: near the hurdle, 0.5x and 2x of the base size are quoted and the best net is used', async () => {
+  const { engine, priced, calls } = setup({});
+  await engine.tick();
+  // DEX_BUY quotes in USDC base units: base = MAX_TRADE_USD/2 = 100, then 50 and 200
+  const usdc = priced.filter((x) => x % 1_000_000n === 0n && x <= 1_000_000_000n).map((x) => Number(x / 1_000_000n));
+  assert.ok(usdc.includes(100) && usdc.includes(50) && usdc.includes(200), String(usdc));
+  assert.ok(calls.includes('limit SELL 19.98 @ 11.177')); // the $200 size won (largest net)
+});
+
+test('legs: a live trade writes one dex and one mexc leg with latency', async () => {
+  const { engine, db } = setup({});
+  await engine.tick();
+  const legs = db.all<{ leg: string; quoted_price: number; executed_qty: number | null; latency_quote_ms: number | null; latency_mexc_ack_ms: number | null }>('SELECT * FROM legs');
+  assert.deepEqual(legs.map((l) => l.leg).sort(), ['dex', 'mexc']);
+  assert.ok(legs.find((l) => l.leg === 'dex')!.latency_quote_ms !== null);
+  assert.equal(legs.find((l) => l.leg === 'mexc')!.executed_qty, 19.98);
+});
+
+test('paper: the trade is booked at the re-quoted net, not the first quote', async () => {
+  const { engine, db } = setup({ mode: 'paper' });
+  await engine.tick();
+  const t = db.all<{ pnl_usd: number; expected_net: number; requoted_net: number | null }>("SELECT * FROM trades WHERE mode = 'paper'")[0];
+  assert.ok(t.requoted_net !== null);
+  assert.equal(t.pnl_usd, t.requoted_net);
+});
+
+test('skewed hurdle: a trade that worsens the wallet/MEXC balance needs more, one that restores it needs less', () => {
+  const { engine, bal } = setup({});
+  const tok = { ...LINK, rules: { ...LINK.rules } };
+  const plain = 15; // need without skew: max(MIN_PROFIT_USD 15, 50 bps of $200)
+  const lopsided = { ...bal, walletToken: { LINK: 150 }, mexc: { ...bal.mexc, LINK: 50 } }; // 75% in the wallet
+  const worse = engine.needFor(tok, 'DEX_BUY', 200, lopsided, 10); // 75% -> 85% wallet: worse by 0.10
+  const better = engine.needFor(tok, 'CEX_BUY', 200, lopsided, 10); // 75% -> 65%: restores
+  assert.ok(Math.abs(worse - plain * (1 + 0.75 * 0.1)) < 1e-9, String(worse)); // SKEW_K 0.75
+  assert.ok(Math.abs(better - plain * 0.8) < 1e-9, String(better));
+});
+
+test('rebalance ticket: a side low for REBALANCE_AFTER_MIN opens ONE ticket and alerts once', async () => {
+  process.env.REBALANCE_AFTER_MIN = '0';
+  try {
+    const { engine, db, alerts, bal } = setup({});
+    bal.mexc.LINK = 0.5; // MEXC side of LINK far below 1x the trade size
+    await engine.tick();
+    await engine.tick();
+    const open = db.openTickets().filter((k) => k.token === 'LINK' && k.side === 'mexc');
+    assert.equal(open.length, 1);
+    assert.match(open[0].direction, /deposit wallet→MEXC/);
+    assert.equal(alerts.filter((a) => a.startsWith('🎫 Rebalance ticket') && a.includes('LINK')).length, 1);
+  } finally {
+    delete process.env.REBALANCE_AFTER_MIN;
+  }
 });

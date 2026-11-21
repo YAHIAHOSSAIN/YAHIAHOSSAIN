@@ -239,6 +239,11 @@ export class MexcRest {
   }
 
   /** MARKET SELL by base quantity (documented). For buys use an aggressive LIMIT instead. */
+  /** Fills of one order (GET /api/v3/myTrades): real price, quantity and the fee actually charged. */
+  myTrades(symbol: string, orderId: string): Promise<{ price: string; qty: string; quoteQty: string; commission: string; commissionAsset: string }[]> {
+    return this.request('GET', '/api/v3/myTrades', { symbol, orderId }, true);
+  }
+
   /** Open orders of one symbol (GET /api/v3/openOrders). */
   openOrders(symbol: string): Promise<(Order & { clientOrderId?: string })[]> {
     return this.request('GET', '/api/v3/openOrders', { symbol }, true);

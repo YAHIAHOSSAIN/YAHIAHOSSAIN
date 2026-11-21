@@ -41,6 +41,8 @@ export interface Opportunity {
   cexFeeUsd: number;
   gasUsd: number;
   slippageUsd: number;
+  /** Value out minus value in, before MEXC fee, gas, slippage reserve and safety margin (USDT). */
+  grossUsd: number;
   net: number;
 }
 
@@ -116,6 +118,7 @@ export function evaluateDexBuy(p: {
     cexFeeUsd,
     gasUsd: p.gasUsd,
     slippageUsd,
+    grossUsd: fill.quote - (costUsdt - dustUsd),
     net,
   };
 }
@@ -169,6 +172,7 @@ export function evaluateCexBuy(p: {
     cexFeeUsd,
     gasUsd: p.gasUsd,
     slippageUsd,
+    grossUsd: outUsdt + cexFeeUsd - plan.costUsd, // the token fee is added back: gross is before fees
     net,
   };
 }

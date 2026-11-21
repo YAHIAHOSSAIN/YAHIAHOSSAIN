@@ -76,3 +76,46 @@ export function inventoryWarnings(
   }
   return w;
 }
+
+export type PlanItem =
+  | { kind: 'warning'; key: string; text: string }
+  | { kind: 'side'; token: string; side: 'wallet' | 'mexc'; low: boolean; asset: string; amount: number; direction: string };
+
+/**
+ * Inventory sizing (phase 1, item 5):
+ *  - target per token per side = INVENTORY_PER_SIDE_X x the trade size;
+ *  - a side below 1x the trade size is "low" (the engine turns a long-lasting low side into ONE ticket);
+ *  - token holdings above MAX_TOKEN_SHARE_PCT of the portfolio -> warning.
+ * The bot never moves funds: tickets tell a human what to deposit or withdraw.
+ */
+export function inventoryPlan(
+  b: Balances,
+  tokens: Token[],
+  prices: Record<string, number>,
+  o: { tradeUsd: number; perSideX: number; maxTokenSharePct: number; stableInUsdt?: number; walletAddress?: string },
+): PlanItem[] {
+  const out: PlanItem[] = [];
+  const target = o.tradeUsd * o.perSideX;
+  const toWallet = `withdraw MEXC→wallet${o.walletAddress ? ` ${o.walletAddress}` : ''} (in the MEXC app)`;
+  const toMexc = 'deposit wallet→MEXC';
+  let tokenUsd = 0;
+  for (const t of tokens) {
+    const px = prices[t.base];
+    if (!px) continue;
+    const w = (b.walletToken[t.base] ?? 0) * px;
+    const m = (b.mexc[t.base] ?? 0) * px;
+    tokenUsd += w + m;
+    out.push({ kind: 'side', token: t.base, side: 'wallet', low: w < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - w, m)) / px, direction: toWallet });
+    out.push({ kind: 'side', token: t.base, side: 'mexc', low: m < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - m, w)) / px, direction: toMexc });
+  }
+  const walletStable = b.walletUsdc * (o.stableInUsdt ?? 1);
+  const mexcStable = b.mexc.USDT ?? 0;
+  out.push({ kind: 'side', token: 'STABLE', side: 'wallet', low: walletStable < o.tradeUsd, asset: 'USDC/USDT', amount: Math.max(0, Math.min(target - walletStable, mexcStable)), direction: toWallet });
+  out.push({ kind: 'side', token: 'STABLE', side: 'mexc', low: mexcStable < o.tradeUsd, asset: 'USDT', amount: Math.max(0, Math.min(target - mexcStable, walletStable)), direction: toMexc });
+
+  const total = tokenUsd + walletStable + mexcStable;
+  if (total > 0 && (tokenUsd / total) * 100 > o.maxTokenSharePct) {
+    out.push({ kind: 'warning', key: 'token-share', text: `tokens are ${((tokenUsd / total) * 100).toFixed(0)}% of the portfolio (max ${o.maxTokenSharePct}%): token price moves now dominate PnL` });
+  }
+  return out;
+}

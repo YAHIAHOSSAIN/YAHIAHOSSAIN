@@ -46,6 +46,8 @@ export function unresolvedLines(db: Db, chain: ChainLike): string[] {
   const out: string[] = [];
   const u = chain.unresolved;
   if (u) out.push(`⏳ DEX tx at nonce ${u.nonce} ${u.unknown ? 'UNKNOWN' : 'in flight'}: ${u.hashes.join(', ')} (/cancelnonce)`);
+  const tickets = db.openTickets();
+  if (tickets.length) out.push(`🎫 Rebalance tickets: ${tickets.map((k) => `#${k.id} ${k.direction}: ${k.amount.toFixed(4)} ${k.asset} (${k.token} ${k.side} low)`).join('; ')}`);
   const t = db.unresolvedTrades();
   if (t.length) out.push(`🧾 PnL unknown: ${t.map((r) => `#${r.id} ${r.symbol}`).join(', ')} -> /resolve <id> <pnl>`);
   return out;

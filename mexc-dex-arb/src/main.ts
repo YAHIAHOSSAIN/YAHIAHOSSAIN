@@ -8,7 +8,7 @@ import { Telegram } from './telegram.js';
 import { MexcRest, RateLimitError } from './mexc/rest.js';
 import { MexcBookStream } from './mexc/ws.js';
 import { Chain } from './dex/chain.js';
-import { OneInch, ZeroEx, type Aggregator } from './dex/aggregator.js';
+import { BestOf, Kyber, Limited, OneInch, TokenBucket, ZeroEx, type Aggregator } from './dex/aggregator.js';
 import { buildWatchlist, refreshStatus } from './watchlist.js';
 import { paperBalances, snapshot } from './inventory.js';
 import { Engine } from './engine.js';
@@ -100,8 +100,17 @@ async function main() {
     get: () => db.getState('unresolved_tx') || undefined,
     set: (v) => db.setState('unresolved_tx', v ?? ''),
   }, cfg.chain.chainId);
-  const agg: Aggregator =
-    cfg.aggregator === '0x' ? new ZeroEx(cfg.zeroExApiKey, fetch, cfg.chain.chainId) : new OneInch(cfg.oneInchApiKey, fetch, cfg.chain.chainId);
+  // Every aggregator gets its own quote budget (token bucket, honours 429 / Retry-After).
+  const limited = cfg.aggregators.map((name) => {
+    const inner =
+      name === '0x'
+        ? new ZeroEx(cfg.zeroExApiKey, fetch, cfg.chain.chainId)
+        : name === '1inch'
+          ? new OneInch(cfg.oneInchApiKey, fetch, cfg.chain.chainId)
+          : new Kyber(cfg.chain.kyberName, cfg.kyberClientId);
+    return new Limited(inner, new TokenBucket(cfg.quoteRps[name]));
+  });
+  const agg: Aggregator = limited.length === 1 ? limited[0] : new BestOf(limited);
 
   // --- Pre-flight checks: fail at startup, not in the middle of the first trade ---
   const chainId = BigInt(await chain.provider.send('eth_chainId', []));
@@ -254,6 +263,14 @@ async function main() {
       log.warn(`status refresh: ${errMsg(e)}`);
     }
   }, 10 * 60_000);
+
+  // Keep the opportunities log bounded (OPP_RETENTION_DAYS).
+  const prune = () => {
+    const n = db.pruneOpportunities(Date.now() - cfg.oppRetentionDays * 86_400_000);
+    if (n) log.info(`pruned ${n} old opportunity rows`);
+  };
+  prune();
+  setInterval(prune, 6 * 3600_000);
 
   // Daily summary at 23:00 Bangladesh time.
   setInterval(async () => {

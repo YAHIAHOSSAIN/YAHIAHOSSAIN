@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { chainProfile } from './chains.js';
 
 export type Mode = 'live' | 'paper';
-export type AggregatorName = '0x' | '1inch';
+export type AggregatorName = '0x' | '1inch' | 'kyber';
 
 function str(name: string, def?: string): string {
   const v = process.env[name];
@@ -21,8 +21,13 @@ function num(name: string, def: number): number {
 export function loadConfig() {
   const mode = str('MODE', 'paper').toLowerCase() as Mode;
   if (mode !== 'live' && mode !== 'paper') throw new Error('MODE must be live or paper');
-  const aggregator = str('DEX_AGGREGATOR', '0x') as AggregatorName;
-  if (aggregator !== '0x' && aggregator !== '1inch') throw new Error('DEX_AGGREGATOR must be 0x or 1inch');
+  // One or several, e.g. "0x,kyber": all are asked, the best quote after gas is used.
+  const aggregators = str('DEX_AGGREGATOR', '0x')
+    .split(',')
+    .map((a) => a.trim().toLowerCase())
+    .filter(Boolean) as AggregatorName[];
+  for (const a of aggregators) if (!['0x', '1inch', 'kyber'].includes(a)) throw new Error(`DEX_AGGREGATOR: unknown "${a}" (use 0x, 1inch, kyber)`);
+  const aggregator = aggregators[0];
 
   const strategy = str('STRATEGY', 'inventory').toLowerCase();
   if (strategy !== 'transfer' && strategy !== 'inventory') throw new Error('STRATEGY must be transfer or inventory');
@@ -50,6 +55,24 @@ export function loadConfig() {
     tickMs: num('TICK_MS', chain.tickMs ?? 0),
     // --- DEX aggregator ---
     aggregator,
+    aggregators,
+    kyberClientId: str('KYBER_CLIENT_ID', 'mexc-dex-arb'),
+    // Our own quote budget per aggregator (calls per second). 0x Standard ~5 rps; Kyber public 3 rps
+    // (docs.kyberswap.com rate limits); 1inch free 1 rps.
+    quoteRps: { '0x': num('QUOTE_RPS_0X', 4), kyber: num('QUOTE_RPS_KYBER', 3), '1inch': num('QUOTE_RPS_1INCH', 1) },
+    // Multi-size quoting: base size = BASE_TRADE_USD (default MAX_TRADE_USD/2); 0.5x and 2x are tried when the
+    // base-size gross gap reaches MULTISIZE_TRIGGER of the hurdle.
+    baseTradeUsd: num('BASE_TRADE_USD', 0),
+    multiSizeTrigger: num('MULTISIZE_TRIGGER', 0.7),
+    // --- Monitoring ---
+    oppRetentionDays: num('OPP_RETENTION_DAYS', 30),
+    // Paper mode re-quotes both legs after this delay and books THAT net (the first quote overstates profit).
+    paperLatencyMs: num('PAPER_LATENCY_MS', 1000),
+    // --- Inventory ---
+    inventoryPerSideX: num('INVENTORY_PER_SIDE_X', 3), // hold ~3x the trade size per token per side
+    maxTokenSharePct: num('MAX_TOKEN_SHARE_PCT', 50), // token holdings above this % of the portfolio: warn
+    skewK: num('SKEW_K', 0.75), // hurdle *= 1 + SKEW_K * (how much a trade worsens the wallet/MEXC balance)
+    rebalanceAfterMin: num('REBALANCE_AFTER_MIN', 30), // a side below 1x trade size this long: one rebalance ticket
     zeroExApiKey: str('ZEROX_API_KEY', ''),
     oneInchApiKey: str('ONEINCH_API_KEY', ''),
     // --- MEXC ---
@@ -107,7 +130,7 @@ export function loadConfig() {
     // After arrival, do not sell automatically if it would lose more than this % of the cost: hold + alert.
     transferMaxLossPct: num('TRANSFER_MAX_LOSS_PCT', 3),
     // --- Misc ---
-    dbPath: str('DB_PATH', 'data/bot.sqlite'),
+    dbPath: str('DB_PATH', `data/${chain.name}.sqlite`), // one database per chain
     envPath: str('ENV_PATH', '.env'),
   };
 }
