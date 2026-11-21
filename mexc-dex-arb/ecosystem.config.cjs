@@ -3,6 +3,11 @@
 //   BOT_CHAINS=base pm2 start ecosystem.config.cjs
 //   BOT_CHAINS=ethereum,base pm2 start ecosystem.config.cjs
 // Each app reads the same .env; CHAIN and DB_PATH are set per app here (they override .env).
+//
+// WARNING (round-3 review, M2): two chains on ONE MEXC account share the same balances and hot
+// wallet, but each keeps its own risk state (daily loss limit, trade count, fail streak, inventory
+// caps). Both processes can commit the same inventory and each can spend the full daily loss
+// budget. Run one chain per MEXC account, or accept that the limits are per-process, not shared.
 const chains = (process.env.BOT_CHAINS || 'ethereum')
   .split(',')
   .map((c) => c.trim())

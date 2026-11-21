@@ -1,7 +1,7 @@
 // Phase-1 upgrade, item 3: configurable chain.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CHAINS, chainProfile, networkFor } from '../src/chains.js';
+import { CHAINS, chainProfile, explorerTxUrl, networkFor } from '../src/chains.js';
 import { loadConfig } from '../src/config.js';
 import { dexTvl } from '../src/watchlist.js';
 import { ZEROX_ALLOWANCE_HOLDER } from '../src/dex/aggregator.js';
@@ -70,4 +70,24 @@ test('every chain shares the same pinned 0x AllowanceHolder', () => {
   // docs.0x.org/docs/core-concepts/contracts: same address on Ethereum, Base, Arbitrum, BSC, ...
   assert.equal(ZEROX_ALLOWANCE_HOLDER, '0x0000000000001ff3684f28c67538d4d072c22734');
   for (const c of Object.values(CHAINS)) assert.match(c.stable.address, /^0x[0-9a-f]{40}$/);
+});
+
+test('explorerTxUrl uses the chain\'s own explorer (round-3 L4)', () => {
+  assert.equal(explorerTxUrl(CHAINS.ethereum, '0xabc'), 'https://etherscan.io/tx/0xabc');
+  assert.equal(explorerTxUrl(CHAINS.base, '0xabc'), 'https://basescan.org/tx/0xabc');
+  assert.equal(explorerTxUrl(CHAINS.bsc, '0xabc'), 'https://bscscan.com/tx/0xabc');
+  assert.equal(explorerTxUrl(CHAINS.arbitrum, '0xabc'), 'https://arbiscan.io/tx/0xabc');
+});
+
+test('STABLE_ADDRESS override also flips stableIsUsdt (round-3 L7c)', () => {
+  // Point Ethereum at BSC's USDT: the stable rate must follow the address, not the chain default.
+  const c = cfgFor({ STABLE_ADDRESS: '0x55d398326f99059ff775485246999027b3197955' });
+  assert.equal(c.usdc, '0x55d398326f99059ff775485246999027b3197955');
+  assert.equal(c.stableIsUsdt, true);
+  // And the other way: BSC at Ethereum USDC.
+  const d = cfgFor({ CHAIN: 'bsc', STABLE_ADDRESS: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' });
+  assert.equal(d.stableIsUsdt, false);
+  // An unknown address falls back to the chain default.
+  const e = cfgFor({ STABLE_ADDRESS: '0x0000000000000000000000000000000000000001' });
+  assert.equal(e.stableIsUsdt, false);
 });

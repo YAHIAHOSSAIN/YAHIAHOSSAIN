@@ -12,8 +12,7 @@
 //  - If arrival-time price would lose more than TRANSFER_MAX_LOSS_PCT, the tokens are held (alert).
 //  - An unknown on-chain outcome pauses trading instead of retrying.
 import type { Config } from './config.js';
-import type { Aggregator, Quote } from './dex/aggregator.js';
-import { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
+import { BestOf, ZEROX_ALLOWANCE_HOLDER, type Aggregator, type Quote } from './dex/aggregator.js';
 import type { GasInfo, TxResult } from './dex/chain.js';
 import type { Book, CoinConfig, Order, SymbolInfo, WithdrawRecord } from './mexc/rest.js';
 import { AmbiguousRequestError } from './mexc/rest.js';
@@ -163,6 +162,13 @@ export class TransferEngine {
     if (!(rate >= 0.99 && rate <= 1.01)) return this.note('stable', `no trading: USDC/USDT rate ${rate} unusable`);
     this.stableRate = rate;
 
+    // BestOf must compare quotes AFTER gas, like the inventory engine does (round-3, L7f).
+    // The transfer's buy token is always the stable, so gas converts straight to stable units.
+    if (this.d.agg instanceof BestOf) {
+      const dec = await this.d.chain.decimals(this.cfg.usdc);
+      this.d.agg.gasInOutput = (units) => toUnits(gasUsd(units, gas.effective, ethUsd) / this.stableRate, dec);
+    }
+
     // An earlier DEX tx with unknown outcome blocks every new send (same nonce rule as the inventory engine).
     let txBlocked = false;
     if (this.d.chain.checkUnresolved) {
@@ -263,7 +269,7 @@ export class TransferEngine {
       withdrawFeeTokens: t.withdrawFee,
       usdcOut: toFloat(q.buyAmount, USDC_DECIMALS),
       usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
-      gasUsd: gasUsd(q.gas + APPROVE_GAS, gas.effective, ethUsd),
+      gasUsd: gasUsd(q.gas + APPROVE_GAS, gas.effective, ethUsd) + this.cfg.l1FeeUsd,
       driftBps: this.cfg.transferDriftBps,
       costs: this.costs(t.base),
     });
@@ -478,6 +484,31 @@ export class TransferEngine {
     }
   }
 
+  /**
+   * Loss floor: if the DEX would pay less than cost minus TRANSFER_MAX_LOSS_PCT, hold the tokens
+   * (alert once) instead of locking in a big loss. Returns true when held.
+   * Called on the first quote AND on the firm quote after the approval, because the price may
+   * have moved during the approval window (round-3 review, M3).
+   */
+  private async holdIfBelowFloor(row: TransferRow, minBuyAmount: bigint, qty: number): Promise<boolean> {
+    const worstOut = toFloat(minBuyAmount, USDC_DECIMALS) * this.stableRate; // in USDT, like the cost
+    const floor = row.cost_usd * (1 - this.cfg.transferMaxLossPct / 100);
+    if (worstOut >= floor && row.hold_alerted) this.d.db.updateTransfer(row.id!, { hold_alerted: 0 }); // recovered: alert again if it falls
+    if (worstOut < floor && !row.force_sell) {
+      this.d.db.updateTransfer(row.id!, { next_try: this.now() + 5 * 60_000 });
+      if (!row.hold_alerted) {
+        this.d.db.updateTransfer(row.id!, { hold_alerted: 1 });
+        await this.d.tg.send(
+          `✋ TRANSFER #${row.id} ${row.base}: DEX would pay only ${usd(worstOut)} for tokens that cost ${usd(row.cost_usd)} ` +
+            `(more than ${this.cfg.transferMaxLossPct}% loss). HOLDING ${qty} ${row.base} in the wallet and re-checking every 5 min.\n` +
+            `Send /sell ${row.id} to sell anyway.`,
+        );
+      }
+      return true;
+    }
+    return false;
+  }
+
   private async sellStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
     if (row.next_try > this.now()) return;
     if (Number(gas.effective) / 1e9 > this.cfg.maxGasGwei) return this.note(`sell-${row.id}`, `transfer #${row.id}: gas too high, sale waits`);
@@ -508,23 +539,7 @@ export class TransferEngine {
     let txHash: string | undefined;
     try {
       const first = await this.d.agg.quote(req);
-
-      // Loss floor: price may have fallen while the withdrawal travelled. Hold instead of locking in a big loss.
-      const worstOut = toFloat(first.minBuyAmount, USDC_DECIMALS) * this.stableRate; // in USDT, like the cost
-      const floor = row.cost_usd * (1 - this.cfg.transferMaxLossPct / 100);
-      if (worstOut >= floor && row.hold_alerted) this.d.db.updateTransfer(row.id!, { hold_alerted: 0 }); // recovered: alert again if it falls
-      if (worstOut < floor && !row.force_sell) {
-        this.d.db.updateTransfer(row.id!, { next_try: this.now() + 5 * 60_000 });
-        if (!row.hold_alerted) {
-          this.d.db.updateTransfer(row.id!, { hold_alerted: 1 });
-          await this.d.tg.send(
-            `✋ TRANSFER #${row.id} ${row.base}: DEX would pay only ${usd(worstOut)} for tokens that cost ${usd(row.cost_usd)} ` +
-              `(more than ${this.cfg.transferMaxLossPct}% loss). HOLDING ${qty} ${row.base} in the wallet and re-checking every 5 min.\n` +
-              `Send /sell ${row.id} to sell anyway.`,
-          );
-        }
-        return;
-      }
+      if (await this.holdIfBelowFloor(row, first.minBuyAmount, qty)) return;
 
       const ap = await this.d.chain.approveExact(row.address, this.spenderOf(first), amount, gas);
       gasWei += ap.gasCostWei;
@@ -532,6 +547,13 @@ export class TransferEngine {
       if (!ap.ok) throw new Error(`approval failed: ${ap.reason}`);
       const firm = await this.d.agg.quote(req); // fresh after the approval
       if (!firm.tx) throw new Error('quote without transaction');
+      // The price may have moved during the approval (up to ~60 s on mainnet): re-check the floor
+      // on the FIRM quote before sending, or the loss floor does not protect the actual sale (round-3, M3).
+      if (await this.holdIfBelowFloor(row, firm.minBuyAmount, qty)) {
+        // The approval gas was really spent; book it so the row's gas stays honest.
+        this.d.db.updateTransfer(row.id!, { gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * ethUsd });
+        return;
+      }
       const est = await this.d.chain.simulate(firm.tx);
       const usdcBefore = await this.d.chain.tokenBalance(this.cfg.usdc);
       const r = await this.d.chain.send(firm.tx, (est * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash) =>

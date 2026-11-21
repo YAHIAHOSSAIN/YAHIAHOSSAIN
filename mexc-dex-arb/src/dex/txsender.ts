@@ -35,6 +35,8 @@ export interface TxResult {
   gasPrice?: bigint;
   /** ms from signing to the receipt (inclusion latency). */
   inclusionMs?: number;
+  /** OP-stack L1 data fee (wei), when the raw receipt carries one (Base/Optimism). */
+  l1FeeWei?: bigint;
 }
 
 export interface Unresolved {
@@ -52,6 +54,8 @@ export interface TxBackend {
   address: string;
   confirmedNonce(): Promise<number>;
   receipt(hash: string): Promise<{ status: number | null; gasUsed: bigint; gasPrice: bigint } | null>;
+  /** Optional raw receipt (ethers does not expose the OP-stack L1 fee): only l1Fee is read. */
+  rawReceipt?(hash: string): Promise<{ l1Fee?: bigint } | null>;
   /** true if the public or the private RPC still knows this tx (pending or mined). */
   knowsTx(hash: string): Promise<boolean>;
   sign(tx: { nonce: number; to: string; data: string; value: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Promise<{ raw: string; hash: string }>;
@@ -263,9 +267,13 @@ export class TxSender {
   }
 
   private signedAt = 0;
-  private result(hash: string, r: { status: number | null; gasUsed: bigint; gasPrice: bigint }): TxResult {
-    const cost = r.gasUsed * r.gasPrice;
-    const extra = { gasUsed: r.gasUsed, gasPrice: r.gasPrice, inclusionMs: this.now() - this.signedAt };
+  private async result(hash: string, r: { status: number | null; gasUsed: bigint; gasPrice: bigint }): Promise<TxResult> {
+    // OP-stack chains (Base/Optimism) charge an L1 data fee on top of the L2 gas: it lives in the
+    // raw receipt's l1Fee field, which ethers does not expose. Without it the recorded gas
+    // understates the true cost (round-3 review, M1). On other chains the field is absent.
+    const l1 = (await this.b.rawReceipt?.(hash).catch(() => null))?.l1Fee ?? 0n;
+    const cost = r.gasUsed * r.gasPrice + l1;
+    const extra = { gasUsed: r.gasUsed, gasPrice: r.gasPrice, inclusionMs: this.now() - this.signedAt, ...(l1 > 0n ? { l1FeeWei: l1 } : {}) };
     return r.status === 1 ? { ok: true, hash, gasCostWei: cost, ...extra } : { ok: false, hash, gasCostWei: cost, reason: 'reverted', ...extra };
   }
 

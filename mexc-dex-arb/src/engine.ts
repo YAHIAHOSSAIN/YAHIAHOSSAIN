@@ -1,5 +1,6 @@
 // The trading loop: find the best opportunity each block, confirm it, trade both legs, clean up, account.
 import type { Config } from './config.js';
+import { explorerTxUrl } from './chains.js';
 import { BestOf, QuoteBudgetError, type Aggregator, type Quote, type QuoteRequest } from './dex/aggregator.js';
 import type { GasInfo, TxResult } from './dex/chain.js';
 import type { Book, Order, Side } from './mexc/rest.js';
@@ -369,9 +370,14 @@ export class Engine {
   }
 
   /** Gas units -> output-token base units, so BestOf can compare aggregators after gas. */
+  /** Gas estimate in USD, including the OP-stack L1 data fee reserve (0 on Ethereum/Arbitrum). */
+  private estGasUsd(units: bigint, gas: GasInfo, ethUsd: number): number {
+    return gasUsd(units, gas.effective, ethUsd) + this.cfg.l1FeeUsd;
+  }
+
   private gasValuer(gas: GasInfo, ethUsd: number, prices: Record<string, number>) {
     return (units: bigint, buyToken: string): bigint => {
-      const usdCost = gasUsd(units, gas.effective, ethUsd);
+      const usdCost = this.estGasUsd(units, gas, ethUsd);
       if (buyToken.toLowerCase() === this.cfg.usdc) return toUnits(usdCost / this.stableRate, this.stableDec);
       const t = this.d.tokens.find((x) => x.address === buyToken.toLowerCase());
       const px = t ? prices[t.base] : undefined;
@@ -489,7 +495,7 @@ export class Engine {
         tokensMin: toFloat(q.minBuyAmount, t.decimals),
         bids: b.bids,
         qtyStep: t.qtyStep,
-        gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
+        gasUsd: this.estGasUsd(q.gas + approvalGas, gas, ethUsd),
         costs: this.costs(t),
       });
       Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, t.decimals), dex_min_out: toFloat(q.minBuyAmount, t.decimals) });
@@ -522,7 +528,7 @@ export class Engine {
         plan,
         usdcOut: toFloat(q.buyAmount, this.stableDec),
         usdcMin: toFloat(q.minBuyAmount, this.stableDec),
-        gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
+        gasUsd: this.estGasUsd(q.gas + approvalGas, gas, ethUsd),
         costs: this.costs(t),
       });
       Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, this.stableDec), dex_min_out: toFloat(q.minBuyAmount, this.stableDec) });
@@ -576,6 +582,7 @@ export class Engine {
       perSideX: this.cfg.inventoryPerSideX,
       maxTokenSharePct: this.cfg.maxTokenSharePct,
       stableInUsdt: this.stableRate,
+      stableSymbol: this.cfg.chain.stable.symbol,
       walletAddress: this.d.chain.address,
     })) {
       if (w.kind === 'warning') {
@@ -665,7 +672,7 @@ export class Engine {
 
     // 3) Re-evaluate with a fresh REST book, firm amounts and simulated gas.
     const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
-    const g = gasUsd(gasEst, gas.effective, ethUsd);
+    const g = this.estGasUsd(gasEst, gas, ethUsd);
     let opp: Opportunity | null;
     if (c.opp.direction === 'DEX_BUY') {
       opp = evaluateDexBuy({
@@ -704,8 +711,12 @@ export class Engine {
     }
 
     // 4) Persist the trade as 'executing' BEFORE anything is sent: if the bot dies now, startup sees it.
+    // The approval gas was already spent (and sits inside the balance-based PnL below), so the stored
+    // expectation must not promise it back: expected = re-checked net minus approval gas actually paid.
+    // (Round-3 review, L3: otherwise realized-minus-expected shows a drag equal to the approval gas.)
+    const expectedNet = opp.net - (Number(approvalCostWei) / 1e18) * ethUsd;
     const cid = clientId('t');
-    const tradeId = this.record({ ...c, opp }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
+    const tradeId = this.record({ ...c, opp: { ...opp, net: expectedNet } }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
     this.currentTradeId = tradeId;
     this.d.db.appendCid(tradeId, cid);
 
@@ -802,8 +813,8 @@ export class Engine {
         `Sell ${dexIsBuy ? 'MEXC' : 'DEX '} @ ${opp.sellPrice.toPrecision(6)}`,
         `Qty ${opp.cexQty} ${t.base} | size ${usd(opp.sizeUsd)}`,
         `MEXC fee ${usd(opp.cexFeeUsd)} | Gas ${usd(gasPaid)}`,
-        `Expected ${usd(opp.net)} | Net PnL ${usd(pnl)}`,
-        dex.hash ? `https://etherscan.io/tx/${dex.hash}` : '',
+        `Expected ${usd(expectedNet)} | Net PnL ${usd(pnl)}`,
+        dex.hash ? explorerTxUrl(this.cfg.chain, dex.hash) : '',
         notes.length ? `Notes: ${notes.join('; ')}` : '',
       ]
         .filter(Boolean)
@@ -926,7 +937,7 @@ export class Engine {
     const t = c.token;
     const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
     const q = await this.d.agg.price(c.req);
-    const g = gasUsd(q.gas + c.approvalGas, gas.effective, ethUsd);
+    const g = this.estGasUsd(q.gas + c.approvalGas, gas, ethUsd);
     if (c.opp.direction === 'DEX_BUY') {
       const o = evaluateDexBuy({
         sizeUsd: c.opp.sizeUsd,
@@ -966,7 +977,7 @@ export class Engine {
     this.d.db.insertLeg({
       trade_id: tradeId, leg: 'dex', quoted_price: dexQuoted, filled_price: dexFilled, slippage_bps: slip(dexQuoted, dexFilled, dexBuy),
       min_out: toFloat(firm.minBuyAmount, dexBuy ? t.decimals : this.stableDec), real_out: dexBuy ? tokDelta : after.walletUsdc - before.walletUsdc,
-      gas_used: dex.gasUsed?.toString() ?? null, gas_price: dex.gasPrice?.toString() ?? null, l1_fee: null,
+      gas_used: dex.gasUsed?.toString() ?? null, gas_price: dex.gasPrice?.toString() ?? null, l1_fee: dex.l1FeeWei?.toString() ?? null,
       executed_qty: null, avg_price: null, fee: null, fee_asset: null,
       latency_quote_ms: lat.quoteMs, latency_sign_ms: lat.signMs, latency_inclusion_ms: dex.inclusionMs ?? null, latency_mexc_ack_ms: null,
     });

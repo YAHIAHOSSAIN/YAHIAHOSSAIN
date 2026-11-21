@@ -25,6 +25,8 @@ export interface ChainProfile {
   dexScreenerId: string;
   /** Matches MEXC coinConfig networkList entries (network / netWork) for this chain. */
   mexcNetwork: RegExp;
+  /** Block explorer host for transaction links (no https:// prefix). */
+  explorer: string;
   /** null = one scan per new block (12 s chains); otherwise scan on a timer (ms). */
   tickMs: number | null;
 }
@@ -39,6 +41,7 @@ export const CHAINS: Record<ChainName, ChainProfile> = {
     kyberName: 'ethereum',
     dexScreenerId: 'ethereum',
     mexcNetwork: /^ETH$|ERC20|^Ethereum$/i,
+    explorer: 'etherscan.io',
     tickMs: null,
   },
   base: {
@@ -50,6 +53,7 @@ export const CHAINS: Record<ChainName, ChainProfile> = {
     kyberName: 'base',
     dexScreenerId: 'base',
     mexcNetwork: /^BASE$|^Base\b/i,
+    explorer: 'basescan.org',
     tickMs: 1000, // 200 ms blocks: a timer, not block events
   },
   bsc: {
@@ -61,6 +65,7 @@ export const CHAINS: Record<ChainName, ChainProfile> = {
     kyberName: 'bsc',
     dexScreenerId: 'bsc',
     mexcNetwork: /^BSC$|BEP20|BNB Smart Chain/i,
+    explorer: 'bscscan.com',
     tickMs: 1000,
   },
   arbitrum: {
@@ -72,6 +77,7 @@ export const CHAINS: Record<ChainName, ChainProfile> = {
     kyberName: 'arbitrum',
     dexScreenerId: 'arbitrum',
     mexcNetwork: /^ARB$|Arbitrum One|^ARBITRUM$/i,
+    explorer: 'arbiscan.io',
     tickMs: 1000,
   },
 };
@@ -80,6 +86,17 @@ export function chainProfile(name: string): ChainProfile {
   const c = CHAINS[name.toLowerCase() as ChainName];
   if (!c) throw new Error(`CHAIN must be one of ${Object.keys(CHAINS).join(', ')}`);
   return c;
+}
+
+/** Symbol of a known DEX stable address, if it is one of the four chains' stables. */
+export function stableSymbolFor(address: string): 'USDC' | 'USDT' | undefined {
+  const found = Object.values(CHAINS).find((c) => c.stable.address.toLowerCase() === address.toLowerCase());
+  return found?.stable.symbol;
+}
+
+/** Transaction URL on the chain's own explorer (round-3 review, L4: no hardcoded etherscan.io). */
+export function explorerTxUrl(chain: ChainProfile, hash: string): string {
+  return `https://${chain.explorer}/tx/${hash}`;
 }
 
 /** The coin's MEXC network entry for this chain, if any. */

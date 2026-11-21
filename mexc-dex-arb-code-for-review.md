@@ -1,10 +1,8 @@
 # mexc-dex-arb: full source for review
 
-MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=inventory, CHAIN=ethereum. Line numbers are per file. See CHANGES.md and CHANGES_UPGRADE.md.
-
 ## `package.json`
 
-```json
+```
      1	{
      2	  "name": "mexc-dex-arb",
      3	  "version": "1.0.0",
@@ -42,7 +40,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `tsconfig.json`
 
-```json
+```
      1	{
      2	  "compilerOptions": {
      3	    "target": "ES2022",
@@ -61,7 +59,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `.gitignore`
 
-```text
+```
      1	node_modules/
      2	dist/
      3	data/
@@ -71,7 +69,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `.env.example`
 
-```bash
+```
      1	# Copy to .env, fill in, then: chmod 600 .env
      2	# The bot refuses to start in live mode if .env is readable by other users.
      3	
@@ -86,199 +84,250 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     12	
     13	# ethereum | base | bsc | arbitrum  (one chain per process; pm2: BOT_CHAINS=base pm2 start ecosystem.config.cjs)
     14	# Run `npm run networks` first: it shows which MEXC tokens can be deposited/withdrawn on each chain.
-    15	CHAIN=ethereum
-    16	# Optional: override the chain's default DEX stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC).
-    17	# STABLE_ADDRESS=
-    18	# Fast chains scan on a timer (Base/BSC/Arbitrum default 1000 ms); Ethereum scans once per block.
-    19	# TICK_MS=1000
-    20	ALLOW_WITHDRAWALS=no
-    21	
-    22	# ---------- Ethereum ----------
-    23	# Your own RPC (Alchemy / Infura / QuickNode). Used for reading and simulation.
-    24	# Must be the same chain as CHAIN (the bot checks the chain id at startup).
-    25	RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
-    26	# Private RPC for sending (never the public mempool): MEV Blocker or Flashbots Protect
-    27	SEND_RPC_URL=https://rpc.mevblocker.io
-    28	# SEND_RPC_URL=https://rpc.flashbots.net/fast
-    29	# NEW hot wallet used only by this bot. Keep only the trading inventory in it.
-    30	PRIVATE_KEY=
-    31	
-    32	# ---------- DEX aggregator ----------
-    33	# 0x (https://dashboard.0x.org) or 1inch (https://portal.1inch.dev)
-    34	# One or several: 0x, kyber, 1inch. With several (e.g. 0x,kyber) the best quote AFTER gas is used.
-    35	# Kyber needs no API key. Each aggregator has its own quote budget (calls per second):
-    36	DEX_AGGREGATOR=0x
-    37	KYBER_CLIENT_ID=mexc-dex-arb
-    38	QUOTE_RPS_0X=4
-    39	QUOTE_RPS_KYBER=3
-    40	QUOTE_RPS_1INCH=1
-    41	ZEROX_API_KEY=
-    42	ONEINCH_API_KEY=
-    43	
-    44	# ---------- MEXC ----------
-    45	# API key: Spot TRADE permission ONLY. NO withdraw permission. IP-whitelisted to your VPS.
-    46	# (Only for STRATEGY=transfer + ALLOW_WITHDRAWALS=yes would withdraw be needed - not recommended.)
-    47	MEXC_API_KEY=
-    48	MEXC_API_SECRET=
-    49	MEXC_TAKER_FEE=0.0005
-    50	
-    51	# ---------- Telegram ----------
-    52	# Create a bot with @BotFather, send it any message, then get your chat id from
-    53	# https://api.telegram.org/bot<TOKEN>/getUpdates  (message.chat.id)
-    54	TELEGRAM_BOT_TOKEN=
-    55	TELEGRAM_CHAT_ID=
-    56	# Your own Telegram user id (message.from.id). Commands are obeyed only from this user, in a private chat.
-    57	TELEGRAM_ADMIN_ID=
-    58	
-    59	# ---------- Watchlist ----------
-    60	# Optional: only these tokens (MEXC base symbols). Empty = auto-discover by volume.
-    61	WATCHLIST=
-    62	WATCHLIST_MAX=8
-    63	MIN_DEX_TVL_USD=200000
-    64	MIN_MEXC_VOLUME_USD=500000
-    65	
-    66	# ---------- Profit rules ----------
-    67	# Trade only if net > max(MIN_PROFIT_USD, MIN_PROFIT_BPS of size). net already subtracts the per-symbol
-    68	# MEXC taker fee (exchangeInfo), DEX fees, gas, CEX slippage and the safety margin.
-    69	MIN_PROFIT_USD=0.25
-    70	MIN_PROFIT_BPS=20
-    71	DEX_SLIPPAGE_BPS=30
-    72	CEX_SLIPPAGE_BPS=5
-    73	# safety margin = max(SAFETY_MARGIN_USD, SAFETY_MARGIN_BPS of size)
-    74	SAFETY_MARGIN_USD=0
-    75	SAFETY_MARGIN_BPS=10
-    76	# A CAP: the tip used is the median of recent blocks' tips (eth_feeHistory), at most this.
-    77	PRIORITY_FEE_GWEI=1
-    78	# Floor for the MEXC taker fee; the bot uses max(this, the symbol's own fee: most pairs 0.08%, some 0.20%).
-    79	# MEXC_TAKER_FEE=0.0005
-    80	
-    81	# ---------- Risk limits ----------
-    82	MAX_TRADE_USD=50
-    83	# Multi-size quoting: base size (default MAX_TRADE_USD/2); 0.5x and 2x are also tried when the base size's
-    84	# gross gap reaches MULTISIZE_TRIGGER x the hurdle.
-    85	# BASE_TRADE_USD=25
-    86	MULTISIZE_TRIGGER=0.7
-    87	MIN_TRADE_USD=25
-    88	MAX_TRADES_PER_DAY=20
-    89	DAILY_LOSS_LIMIT_USD=30
-    90	# Skip a trade if losing this % of its size (+ gas) would break what is left of the daily loss budget
-    91	WORST_CASE_LOSS_PCT=5
-    92	MAX_GAS_GWEI=40
-    93	MAX_CONSECUTIVE_FAILS=3
-    94	MIN_ETH_FOR_GAS=0.01
-    95	TX_TIMEOUT_SEC=60
-    96	
-    97	# ---------- Transfer strategy ----------
-    98	SCAN_INTERVAL_SEC=20
-    99	# Cheap pre-filter (MEXC ask vs DexScreener price) before exact quotes
-   100	SCAN_MIN_GAP_PCT=3
-   101	# Bigger "gaps" are almost always a wrong token or a dead pool
-   102	SCAN_MAX_GAP_PCT=30
-   103	SCAN_EXACT_QUOTES=5
-   104	# Price-move reserve while the withdrawal travels (150 = 1.5%)
-   105	TRANSFER_DRIFT_BPS=150
-   106	TRANSFER_TIMEOUT_MIN=90
-   107	MAX_OPEN_TRANSFERS=1
-   108	# On arrival, do not auto-sell at more than this % loss vs the MEXC cost: hold + alert (/sell <id> forces)
-   109	TRANSFER_MAX_LOSS_PCT=3
-   110	
-   111	# ---------- Monitoring and inventory (phase 1) ----------
-   112	OPP_RETENTION_DAYS=30
-   113	# Paper mode books the net after this delay + a re-quote (not the first quote)
-   114	PAPER_LATENCY_MS=1000
-   115	INVENTORY_PER_SIDE_X=3
-   116	MAX_TOKEN_SHARE_PCT=50
-   117	SKEW_K=0.75
-   118	REBALANCE_AFTER_MIN=30
-   119	
-   120	# Default: data/<CHAIN>.sqlite (one database per chain)
-   121	# DB_PATH=data/ethereum.sqlite
+    15	# One MEXC account = one chain: two chains on the same account share balances but keep separate
+    16	# loss limits and inventory caps, so each can spend the full daily budget (round-3, M2).
+    17	CHAIN=ethereum
+    18	# Optional: override the chain's default DEX stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC).
+    19	# STABLE_ADDRESS=
+    20	# Fast chains scan on a timer (Base/BSC/Arbitrum default 1000 ms); Ethereum scans once per block.
+    21	# TICK_MS=1000
+    22	ALLOW_WITHDRAWALS=no
+    23	
+    24	# ---------- Ethereum ----------
+    25	# Your own RPC (Alchemy / Infura / QuickNode). Used for reading and simulation.
+    26	# Must be the same chain as CHAIN (the bot checks the chain id at startup).
+    27	RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+    28	# Private RPC for sending (never the public mempool): MEV Blocker or Flashbots Protect.
+    29	# These are Ethereum mainnet only: on Base/BSC/Arbitrum point SEND_RPC_URL at a private RPC for
+    30	# THAT chain (or the chain's own RPC). The bot fails loudly at startup if the chain id mismatches.
+    31	SEND_RPC_URL=https://rpc.mevblocker.io
+    32	# SEND_RPC_URL=https://rpc.flashbots.net/fast
+    33	# NEW hot wallet used only by this bot. Keep only the trading inventory in it.
+    34	PRIVATE_KEY=
+    35	
+    36	# ---------- DEX aggregator ----------
+    37	# 0x (https://dashboard.0x.org) or 1inch (https://portal.1inch.dev)
+    38	# One or several: 0x, kyber, 1inch. With several (e.g. 0x,kyber) the best quote AFTER gas is used.
+    39	# Kyber needs no API key. Each aggregator has its own quote budget (calls per second):
+    40	DEX_AGGREGATOR=0x
+    41	KYBER_CLIENT_ID=mexc-dex-arb
+    42	QUOTE_RPS_0X=4
+    43	QUOTE_RPS_KYBER=3
+    44	QUOTE_RPS_1INCH=1
+    45	ZEROX_API_KEY=
+    46	ONEINCH_API_KEY=
+    47	
+    48	# ---------- MEXC ----------
+    49	# API key: Spot TRADE permission ONLY. NO withdraw permission. IP-whitelisted to your VPS.
+    50	# (Only for STRATEGY=transfer + ALLOW_WITHDRAWALS=yes would withdraw be needed - not recommended.)
+    51	MEXC_API_KEY=
+    52	MEXC_API_SECRET=
+    53	MEXC_TAKER_FEE=0.0005
+    54	
+    55	# ---------- Telegram ----------
+    56	# Create a bot with @BotFather, send it any message, then get your chat id from
+    57	# https://api.telegram.org/bot<TOKEN>/getUpdates  (message.chat.id)
+    58	TELEGRAM_BOT_TOKEN=
+    59	TELEGRAM_CHAT_ID=
+    60	# Your own Telegram user id (message.from.id). Commands are obeyed only from this user, in a private chat.
+    61	TELEGRAM_ADMIN_ID=
+    62	
+    63	# ---------- Watchlist ----------
+    64	# Optional: only these tokens (MEXC base symbols). Empty = auto-discover by volume.
+    65	WATCHLIST=
+    66	WATCHLIST_MAX=8
+    67	MIN_DEX_TVL_USD=200000
+    68	MIN_MEXC_VOLUME_USD=500000
+    69	
+    70	# ---------- Profit rules ----------
+    71	# Trade only if net > max(MIN_PROFIT_USD, MIN_PROFIT_BPS of size). net already subtracts the per-symbol
+    72	# MEXC taker fee (exchangeInfo), DEX fees, gas, CEX slippage and the safety margin.
+    73	MIN_PROFIT_USD=0.25
+    74	MIN_PROFIT_BPS=20
+    75	DEX_SLIPPAGE_BPS=30
+    76	CEX_SLIPPAGE_BPS=5
+    77	# safety margin = max(SAFETY_MARGIN_USD, SAFETY_MARGIN_BPS of size)
+    78	SAFETY_MARGIN_USD=0
+    79	SAFETY_MARGIN_BPS=10
+    80	# A CAP: the tip used is the median of recent blocks' tips (eth_feeHistory), at most this.
+    81	PRIORITY_FEE_GWEI=1
+    82	# OP-stack L1 data fee reserve (USD) added to every gas estimate. 0 on Ethereum/Arbitrum.
+    83	# On Base, set it to a typical legs.l1_fee from a past trade (usually a few cents).
+    84	L1_FEE_USD=0
+    85	# Floor for the MEXC taker fee; the bot uses max(this, the symbol's own fee: most pairs 0.08%, some 0.20%).
+    86	# MEXC_TAKER_FEE=0.0005
+    87	
+    88	# ---------- Risk limits ----------
+    89	MAX_TRADE_USD=50
+    90	# Multi-size quoting: base size (default MAX_TRADE_USD/2); 0.5x and 2x are also tried when the base size's
+    91	# gross gap reaches MULTISIZE_TRIGGER x the hurdle.
+    92	# BASE_TRADE_USD=25
+    93	MULTISIZE_TRIGGER=0.7
+    94	MIN_TRADE_USD=25
+    95	MAX_TRADES_PER_DAY=20
+    96	DAILY_LOSS_LIMIT_USD=30
+    97	# Skip a trade if losing this % of its size (+ gas) would break what is left of the daily loss budget
+    98	WORST_CASE_LOSS_PCT=5
+    99	MAX_GAS_GWEI=40
+   100	MAX_CONSECUTIVE_FAILS=3
+   101	MIN_ETH_FOR_GAS=0.01
+   102	TX_TIMEOUT_SEC=60
+   103	
+   104	# ---------- Transfer strategy ----------
+   105	SCAN_INTERVAL_SEC=20
+   106	# Cheap pre-filter (MEXC ask vs DexScreener price) before exact quotes
+   107	SCAN_MIN_GAP_PCT=3
+   108	# Bigger "gaps" are almost always a wrong token or a dead pool
+   109	SCAN_MAX_GAP_PCT=30
+   110	SCAN_EXACT_QUOTES=5
+   111	# Price-move reserve while the withdrawal travels (150 = 1.5%)
+   112	TRANSFER_DRIFT_BPS=150
+   113	TRANSFER_TIMEOUT_MIN=90
+   114	MAX_OPEN_TRANSFERS=1
+   115	# On arrival, do not auto-sell at more than this % loss vs the MEXC cost: hold + alert (/sell <id> forces)
+   116	TRANSFER_MAX_LOSS_PCT=3
+   117	
+   118	# ---------- Monitoring and inventory (phase 1) ----------
+   119	# Fast chains log every evaluation (100k+ rows/day on Base): keep 7 days, not 30 (~1-2 GB at 30).
+   120	# The report only looks back 7 days. Pruning runs at startup and every 6 h.
+   121	OPP_RETENTION_DAYS=7
+   122	# Paper mode books the net after this delay + a re-quote (not the first quote)
+   123	PAPER_LATENCY_MS=1000
+   124	INVENTORY_PER_SIDE_X=3
+   125	MAX_TOKEN_SHARE_PCT=50
+   126	SKEW_K=0.75
+   127	REBALANCE_AFTER_MIN=30
+   128	
+   129	# Default: data/<CHAIN>.sqlite (one database per chain)
+   130	# DB_PATH=data/ethereum.sqlite
 ```
 
 ## `ecosystem.config.cjs`
 
-```js
+```
      1	// pm2 start ecosystem.config.cjs
      2	// One pm2 app per chain, each with its own database. Choose the chains with BOT_CHAINS, e.g.
      3	//   BOT_CHAINS=base pm2 start ecosystem.config.cjs
      4	//   BOT_CHAINS=ethereum,base pm2 start ecosystem.config.cjs
      5	// Each app reads the same .env; CHAIN and DB_PATH are set per app here (they override .env).
-     6	const chains = (process.env.BOT_CHAINS || 'ethereum')
-     7	  .split(',')
-     8	  .map((c) => c.trim())
-     9	  .filter(Boolean);
-    10	
-    11	module.exports = {
-    12	  apps: chains.map((chain) => ({
-    13	    name: `mexc-dex-arb-${chain}`,
-    14	    script: 'dist/main.js',
-    15	    cwd: __dirname,
-    16	    env: { CHAIN: chain, DB_PATH: `data/${chain}.sqlite` },
-    17	    autorestart: true,
-    18	    // Keep restarting (with growing delay) instead of giving up silently after a few crashes.
-    19	    max_restarts: 1000,
-    20	    min_uptime: '60s',
-    21	    exp_backoff_restart_delay: 5000,
-    22	    // pm2 sends SIGKILL 1.6 s after SIGINT by default, which would kill the bot halfway through a trade.
-    23	    // The bot waits up to TX_TIMEOUT_SEC*2+60 s (max 220 s) for a running trade, so give it 240 s.
-    24	    kill_timeout: 240000,
-    25	    time: true,
-    26	    out_file: `logs/${chain}.out.log`,
-    27	    error_file: `logs/${chain}.error.log`,
-    28	  })),
-    29	};
+     6	//
+     7	// WARNING (round-3 review, M2): two chains on ONE MEXC account share the same balances and hot
+     8	// wallet, but each keeps its own risk state (daily loss limit, trade count, fail streak, inventory
+     9	// caps). Both processes can commit the same inventory and each can spend the full daily loss
+    10	// budget. Run one chain per MEXC account, or accept that the limits are per-process, not shared.
+    11	const chains = (process.env.BOT_CHAINS || 'ethereum')
+    12	  .split(',')
+    13	  .map((c) => c.trim())
+    14	  .filter(Boolean);
+    15	
+    16	module.exports = {
+    17	  apps: chains.map((chain) => ({
+    18	    name: `mexc-dex-arb-${chain}`,
+    19	    script: 'dist/main.js',
+    20	    cwd: __dirname,
+    21	    env: { CHAIN: chain, DB_PATH: `data/${chain}.sqlite` },
+    22	    autorestart: true,
+    23	    // Keep restarting (with growing delay) instead of giving up silently after a few crashes.
+    24	    max_restarts: 1000,
+    25	    min_uptime: '60s',
+    26	    exp_backoff_restart_delay: 5000,
+    27	    // pm2 sends SIGKILL 1.6 s after SIGINT by default, which would kill the bot halfway through a trade.
+    28	    // The bot waits up to TX_TIMEOUT_SEC*2+60 s (max 220 s) for a running trade, so give it 240 s.
+    29	    kill_timeout: 240000,
+    30	    time: true,
+    31	    out_file: `logs/${chain}.out.log`,
+    32	    error_file: `logs/${chain}.error.log`,
+    33	  })),
+    34	};
 ```
 
 ## `CHANGES.md`
 
-```md
-     1	# Changes for Grok's round-2 fix prompt
+```
+     1	# Round-3 review fixes (Muse, 2026-11-21)
      2	
-     3	Defaults are unchanged: `MODE=paper`, `STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`, `MAX_TRADE_USD=50`.
-     4	Nothing was run live. `tsc --noEmit` passes, and `npm test` passes all 83 tests.
-     5	
-     6	Note: Grok reviewed the 57-test version. Muse's round-2 fixes (commit `04b9c84`) had already covered
-     7	part of these items. The lines below are where each item lives now.
+     3	Muse's round-3 review (`REVIEW_PROMPT_R3.md`, delivered 2026-11-21 ~08:49) was re-verified against the
+     4	repo code and official docs / live public data. Every finding below was checked; the confirmed ones are
+     5	fixed here, the rejected ones are listed at the bottom. Defaults are unchanged: `MODE=paper`,
+     6	`STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`, `MAX_TRADE_USD=50`. Nothing was run live.
+     7	`tsc --noEmit` passes, and `npm test` passes all 126 tests (112 before + 14 new).
      8	
      9	| # | Item | Where (file:line) | Tests |
     10	|---|---|---|---|
-    11	| 1 | Nonce gap after a failed broadcast | `src/dex/txsender.ts:68` `classifySendError`; `:214` a definite rejection rolls back the nonce and returns `rejected`, never `unknown`; `:151` `readyToSend()` refuses while a tx is unresolved and resets a local nonce that ran ahead of the chain; `src/engine.ts:448` calls `readyToSend()` before the MEXC leg | `test/txsender.test.ts` (rejection keeps nonce 5, 5); `test/grok-r2.test.ts` "1) readyToSend"; `test/engine.test.ts` "nonce not ready: the MEXC leg never fires" |
-    12	| 2 | `/start confirm` must not clear a pending tx | `src/commands.ts:55` `makeUnresolvedCheck`: refuses while pending ("outcome still unknown; use /cancelnonce or wait") and resets the nonce when clear; `src/dex/txsender.ts:168` `cancelNonce()` (2x fee, private + public RPC, waits up to 10 min, reports which hash won); `/cancelnonce` registered in `src/main.ts` for both strategies; `src/engine.ts:494` new alert text "Do NOT hedge by hand until the nonce is consumed"; `src/engine.ts:284` `reportResolved` alerts with `executedHash` / `ok` and notes it on the trade row (says so explicitly when there is no receipt) | `test/grok-r2.test.ts` "2) /start confirm is refused while a tx is pending; when clear it resets the nonce" |
-    13	| 3 | Save the pending tx and restore it at startup | `src/dex/txsender.ts:207`: every tx is persisted as in flight when it is signed, BEFORE broadcast, and cleared when mined or rejected. The cancel hash is added too. It lives in the SQLite `state` table (`unresolved_tx`), not a separate `pending_tx` table. Only one tx is ever in flight, because sends are blocked while one is unresolved. On restart `checkUnresolved()` runs inside `recoverExecuting` (`src/recovery.ts:28`, called from `src/main.ts:143`). A pending one triggers a critical pause and an alert, and nothing trades until the nonce is used | `test/grok-r2.test.ts` "3) a tx is recorded as in flight BEFORE broadcast"; `test/txsender.test.ts` "restart with a pending tx"; `test/engine.test.ts` "recovery: a pending DEX tx ... keeps the bot critically paused" |
-    14	| 4 | MEXC order settled after a cancel | `src/engine.ts:48` `cancelAndConfirm` (the "cancelAndSettle" of the prompt): it cancels and re-reads until the order is FILLED / CANCELED / PARTIALLY_CANCELED, otherwise it throws `OrderStillOpenError`. Used in `cexLeg`, where it becomes `UNKNOWN_ORDER_STATE` (critical pause, no unwind), in `closeAtMarket` (`src/engine.ts:590`), in transfer `finishBuy`, and in the transfer MEXC sell | `test/infra.test.ts` "cancelAndConfirm: never reports a still-open order as closed" (cancel throws and stays NEW; late cancel) |
-    15	| 5 | pm2 kill timeout | `ecosystem.config.cjs:15` `kill_timeout: 240000`; `src/main.ts:59` the shutdown waits `TX_TIMEOUT_SEC*2*1000 + 60000`; `src/config.ts:126` caps TX_TIMEOUT_SEC at 80, so the wait (at most 220 s) is always below kill_timeout. SIGINT and SIGTERM are both handled | (config) |
-    16	| 6 | Recovery of open MEXC orders and close orders | `src/db.ts:129` `appendCid` (new column `trades.cids`, a JSON array); `src/engine.ts:458` records the entry cid, and `closeAtMarket` records every close cid BEFORE placing it; `src/recovery.ts:28` looks up every cid, cancels and settles any order that is still open, and reports the final status and qty; `src/recovery.ts:95` + `src/mexc/rest.ts:241` `openOrders` sweep the watched symbols for orders with the bot prefix `arb`. The critical pause is kept | `test/grok-r2.test.ts` "6) recovery cancels a close order that is still open and sweeps open bot orders" |
-    17	| 7 | Unknown approval and silent stalls | `src/engine.ts:390` "approval outcome UNKNOWN, nonce N, hashes …" (no longer "Approval failed"); `src/engine.ts:223` hourly alert when a tx has been unresolved for more than 10 min, with nonce, hashes and a `/cancelnonce` hint | (covered by the engine paths above) |
-    18	| 8 | PERCENT_PRICE_BY_SIDE | `src/mexc/rules.ts`: `priceBand` is parsed from `filters` (default 0.2); `:44` `closePrice` = `min(ask*1.02, ref*(1+0.8*band))` for BUY and `max(bid*0.98, ref*(1-0.8*band))` for SELL, with ref = mid of a fresh book, rounded in the safe direction (with a float epsilon); `:54` `bandProblem`; `src/engine.ts:445` rejects an entry outside the band | `test/grok-r2.test.ts` "8) a 0.5% band clamps the close price", "8) an entry limit outside the band is rejected" |
-    19	| 9 | placeSafely "not found" logic | `src/mexc/rest.ts:234`: null ONLY for parsed MEXC code `-2011`, the text regex is removed and every other error is rethrown; `src/engine.ts:84` looks up over 1, 2, 3 and 4 s, and if still not found after an ambiguous error (5xx / timeout) the result is `UNKNOWN_ORDER_STATE`, never "not placed" | `test/grok-r2.test.ts` "9) ... 'currency does not exist' is rethrown", "9) placeSafely: a 5xx followed by 'not found' is UNKNOWN_ORDER_STATE" |
-    20	| 10a | PnL | `src/engine.ts:562` `stableBalances`: reads until two consecutive reads match (up to about 15 s), otherwise the note says "pnl approximate" | (engine tests) |
-    21	| 10b | Transfer sell without MARKET | `src/transfer.ts:597`: uses the aggressive banded LIMIT plus `cancelAndConfirm` when the symbol has no MARKET | (transfer tests) |
-    22	| 10c | Retry-After | `src/mexc/rest.ts:134` `RateLimitError.retryAfterSec` from the header; `src/main.ts:28` backs off for at least that long | (none) |
-    23	| 10d | 0x firm-quote check | `scripts/check-0x-quote.ts:1`, run with `npm run check:0x`. It signs and sends nothing, and prints only `transaction.to`, `allowanceTarget` and `issues` | not run (no key in this environment) |
-    24	| 10e | Recovery booking | Rows recovered as `one_sided` carry "pnl unknown"; `src/db.ts:142` `unresolvedTrades()`; `/status` lists them; `src/commands.ts:36` `/resolve <id> <pnl>` books the PnL, which then counts in the daily loss budget | `test/grok-r2.test.ts` "10e) /resolve" |
+    11	| M1 | Base L1 data fee was missing from all gas math | `src/dex/txsender.ts:58` `rawReceipt?` on TxBackend; `:270` `result()` adds the raw receipt's `l1Fee` to `gasCostWei` and reports `l1FeeWei` (`:39`); `src/dex/chain.ts:57` implements `rawReceipt` via `eth_getTransactionReceipt` (ethers has no l1Fee field); `src/engine.ts:980` legs now store `l1_fee` instead of null; `src/config.ts:120` `L1_FEE_USD` reserve (default 0, `:174` range-checked) added to every gas estimate via `src/engine.ts:374` `estGasUsd` (`:380` gasValuer, `:498` / `:531` evalAt, `:675` execute re-check, `:940` requote) and `src/transfer.ts:272`; `.env.example:84` documents how to measure it from `legs.l1_fee` | `test/txsender.test.ts` "mined tx on an OP chain" (gas 1200n incl. L1 1000n) + "raw receipt failure" (L1 = 0, still ok); `test/engine.test.ts` "L1_FEE_USD reserve lowers the estimated net" (net drops exactly $2); `test/infra.test.ts` "L1_FEE_USD defaults to 0" |
+    12	| M2 | Two chains on one MEXC account share balances/wallet but keep separate risk state | Docs only: `ecosystem.config.cjs:7` warning; `.env.example:15` one-account-one-chain note; `README.md` "Running phase 1" section | (docs) |
+    13	| M3 | Transfer sell checked the loss floor on the first quote only, not the firm quote after approval | `src/transfer.ts:493` `holdIfBelowFloor` helper; `:542` first-quote check; `:552` firm-quote re-check (approval gas booked on hold, `:553`) | `test/transfer.test.ts` "sell holds when the FIRM quote falls below the loss floor" (no send, still selling, $1.20 approval gas booked). Fails on the old code (verified by stashing the fix). |
+    14	| M4 | Would-have PnL took MAX(net) and MAX(size) from different rows | `src/kpi.ts:53` window function: the best-net row's own size (ties: bigger size first, conservative) | `test/upgrade-kpi.test.ts` "would-have PnL uses the best row's own size". Fails on the old code. |
+    15	| M5 | Opportunities table grows ~115-275k rows/day; 30-day retention ~1-2 GB | `src/config.ts:74` default 30 -> 7; `src/db.ts:162` `(ts)` index; `.env.example:121` | `test/infra.test.ts` "OPP_RETENTION_DAYS defaults to 7"; `test/upgrade-kpi.test.ts` "opportunities has a (ts) index" |
+    16	| L1 | gasShareOfGross mixed populations (gas over all non-approval trades, gross over ok/paper only) | `src/kpi.ts:67` gas sum now filtered to ok/paper like gross | `test/upgrade-kpi.test.ts` "gasShareOfGross counts gas only on ok/paper trades". Fails on the old code. |
+    17	| L2 | STABLE rebalance ticket named the wrong asset/direction on USDC chains | `src/inventory.ts:95` `stableSymbol` option; `:104` wallet side names the chain stable, MEXC side says "swap to USDT on MEXC" when the wallet stable is not USDT; wallet-side amount converted to stable units; `src/engine.ts:585` caller passes `cfg.chain.stable.symbol` | `test/upgrade-kpi.test.ts` "inventory plan STABLE ticket names the chain stable" (USDC + BSC cases) |
+    18	| L3 | Stored expected_net excluded the approval gas already spent | `src/engine.ts:717` `expectedNet = opp.net - approval gas actually paid`; `:719` stored on the trade row; `:816` the Telegram message shows the same number | `test/engine.test.ts` "expected_net subtracts the approval gas already spent" (two identical runs, $1.20 apart). Fails on the old code. |
+    19	| L4 | Hardcoded etherscan.io link in the live-trade alert | `src/chains.ts:29` `explorer` per chain (`:44` etherscan.io, `:56` basescan.org, `:68` bscscan.com, `:80` arbiscan.io); `:98` `explorerTxUrl`; `src/engine.ts:817` uses it (transfer.ts links stay etherscan.io: transfer is ethereum-only) | `test/upgrade-chain.test.ts` "explorerTxUrl uses the chain's own explorer"; `test/engine.test.ts` profitable-gap test asserts the etherscan link |
+    20	| L5 | SEND_RPC_URL default is Ethereum-mainnet-only (MEV Blocker / Flashbots) | Docs only: `.env.example:29` note (other chains need their own private RPC; startup fails loudly on chain-id mismatch) | (docs) |
+    21	| L7c | STABLE_ADDRESS override did not update stableIsUsdt | `src/chains.ts:92` `stableSymbolFor` (known-address lookup, falls back to the chain default); `src/config.ts:54` derives `stableIsUsdt` from the resolved address | `test/upgrade-chain.test.ts` "STABLE_ADDRESS override also flips stableIsUsdt" (both directions + unknown-address fallback) |
+    22	| L7f | BestOf gasInOutput was never set in transfer mode | `src/transfer.ts:169` set in `tick()` after the stable rate is known (buy token is always the stable) | `test/transfer.test.ts` "transfer mode sets BestOf gasInOutput" (wiring + $3.00 for 150k gas at 10 gwei / $2000 ETH) |
+    23	
+    24	## Rejected (verified, no change)
     25	
-    26	## Deviations from the prompt (and why)
-    27	- **Item 3:** the in-flight tx is persisted in the existing `state` table rather than a new `pending_tx`
-    28	  table. Sends are serialized (nothing new is sent while a tx is unresolved), so there is at most one nonce
-    29	  in flight, and a single record holds all of that nonce's hashes (the tx and its cancels).
-    30	- **Item 4 name:** the helper is `cancelAndConfirm`. It was added for Muse's round-2 review and does what the
-    31	  prompt calls `cancelAndSettle`.
-    32	- **Item 6 sweep:** `openOrders` is swept for the `WATCHLIST` symbols when `STRATEGY=inventory` and
-    33	  `WATCHLIST` is set. With auto-discovery, the watchlist is not known yet when recovery runs, so only the
-    34	  cids recorded on the trade rows are checked.
-    35	- **IOC:** MEXC's docs list `IMMEDIATE_OR_CANCEL` as an order type, and there is no `timeInForce` parameter.
-    36	  But no live symbol lists IOC in `orderTypes`, so closes stay LIMIT plus a confirmed cancel.
+    26	- **L6 — Kyber "public limit 3 rps": CORRECT, no change.** Muse's round-3 review had called this unverified;
+    27	  re-checking found it in Kyber's official docs (kyberswap-documentation,
+    28	  `developer-guide/start-here/rate-limits-and-client-id.md`: "Public rate limits are 3 rps for the
+    29	  Aggregator API"). The code's comment and CHANGES_UPGRADE.md were right.
+    30	- **L7a** (multi-size trigger at 0.7x the net hurdle fires often), **L7b** (pickTip falls back to the CAP
+    31	  when eth_feeHistory fails), **L7d** (no opportunity rows while the stable rate is stale), **L7e**
+    32	  (lowSince is in-memory, a restart restarts the rebalance clock): by design, no change. Tickets
+    33	  themselves are DB-persisted, and the pickTip fallback is fail-safe.
+    34	- **M1 scope note:** the L1-fee estimate side is a reserve knob (`L1_FEE_USD`, default 0), not a live
+    35	  oracle read: at estimate time there is no tx yet to feed `GasPriceOracle.getL1Fee`. The receipt side
+    36	  now measures the real fee, so the reserve can be set from observed `legs.l1_fee` values.
     37	
-    38	## Not verified (no keys here)
-    39	- Whether 0x `buyAmount` is already net of `zeroExFee`.
-    40	- Which asset MEXC charges the buy fee in.
-    41	- 1inch v6 request parameters.
-    42	- Live `transaction.to`. Run `npm run check:0x` once before going live.
+    38	# Changes for Grok's round-2 fix prompt
+    39	
+    40	Defaults are unchanged: `MODE=paper`, `STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`, `MAX_TRADE_USD=50`.
+    41	Nothing was run live. `tsc --noEmit` passes, and `npm test` passes all 83 tests.
+    42	
+    43	Note: Grok reviewed the 57-test version. Muse's round-2 fixes (commit `04b9c84`) had already covered
+    44	part of these items. The lines below are where each item lives now.
+    45	
+    46	| # | Item | Where (file:line) | Tests |
+    47	|---|---|---|---|
+    48	| 1 | Nonce gap after a failed broadcast | `src/dex/txsender.ts:68` `classifySendError`; `:214` a definite rejection rolls back the nonce and returns `rejected`, never `unknown`; `:151` `readyToSend()` refuses while a tx is unresolved and resets a local nonce that ran ahead of the chain; `src/engine.ts:448` calls `readyToSend()` before the MEXC leg | `test/txsender.test.ts` (rejection keeps nonce 5, 5); `test/grok-r2.test.ts` "1) readyToSend"; `test/engine.test.ts` "nonce not ready: the MEXC leg never fires" |
+    49	| 2 | `/start confirm` must not clear a pending tx | `src/commands.ts:55` `makeUnresolvedCheck`: refuses while pending ("outcome still unknown; use /cancelnonce or wait") and resets the nonce when clear; `src/dex/txsender.ts:168` `cancelNonce()` (2x fee, private + public RPC, waits up to 10 min, reports which hash won); `/cancelnonce` registered in `src/main.ts` for both strategies; `src/engine.ts:494` new alert text "Do NOT hedge by hand until the nonce is consumed"; `src/engine.ts:284` `reportResolved` alerts with `executedHash` / `ok` and notes it on the trade row (says so explicitly when there is no receipt) | `test/grok-r2.test.ts` "2) /start confirm is refused while a tx is pending; when clear it resets the nonce" |
+    50	| 3 | Save the pending tx and restore it at startup | `src/dex/txsender.ts:207`: every tx is persisted as in flight when it is signed, BEFORE broadcast, and cleared when mined or rejected. The cancel hash is added too. It lives in the SQLite `state` table (`unresolved_tx`), not a separate `pending_tx` table. Only one tx is ever in flight, because sends are blocked while one is unresolved. On restart `checkUnresolved()` runs inside `recoverExecuting` (`src/recovery.ts:28`, called from `src/main.ts:143`). A pending one triggers a critical pause and an alert, and nothing trades until the nonce is used | `test/grok-r2.test.ts` "3) a tx is recorded as in flight BEFORE broadcast"; `test/txsender.test.ts` "restart with a pending tx"; `test/engine.test.ts` "recovery: a pending DEX tx ... keeps the bot critically paused" |
+    51	| 4 | MEXC order settled after a cancel | `src/engine.ts:48` `cancelAndConfirm` (the "cancelAndSettle" of the prompt): it cancels and re-reads until the order is FILLED / CANCELED / PARTIALLY_CANCELED, otherwise it throws `OrderStillOpenError`. Used in `cexLeg`, where it becomes `UNKNOWN_ORDER_STATE` (critical pause, no unwind), in `closeAtMarket` (`src/engine.ts:590`), in transfer `finishBuy`, and in the transfer MEXC sell | `test/infra.test.ts` "cancelAndConfirm: never reports a still-open order as closed" (cancel throws and stays NEW; late cancel) |
+    52	| 5 | pm2 kill timeout | `ecosystem.config.cjs:15` `kill_timeout: 240000`; `src/main.ts:59` the shutdown waits `TX_TIMEOUT_SEC*2*1000 + 60000`; `src/config.ts:126` caps TX_TIMEOUT_SEC at 80, so the wait (at most 220 s) is always below kill_timeout. SIGINT and SIGTERM are both handled | (config) |
+    53	| 6 | Recovery of open MEXC orders and close orders | `src/db.ts:129` `appendCid` (new column `trades.cids`, a JSON array); `src/engine.ts:458` records the entry cid, and `closeAtMarket` records every close cid BEFORE placing it; `src/recovery.ts:28` looks up every cid, cancels and settles any order that is still open, and reports the final status and qty; `src/recovery.ts:95` + `src/mexc/rest.ts:241` `openOrders` sweep the watched symbols for orders with the bot prefix `arb`. The critical pause is kept | `test/grok-r2.test.ts` "6) recovery cancels a close order that is still open and sweeps open bot orders" |
+    54	| 7 | Unknown approval and silent stalls | `src/engine.ts:390` "approval outcome UNKNOWN, nonce N, hashes …" (no longer "Approval failed"); `src/engine.ts:223` hourly alert when a tx has been unresolved for more than 10 min, with nonce, hashes and a `/cancelnonce` hint | (covered by the engine paths above) |
+    55	| 8 | PERCENT_PRICE_BY_SIDE | `src/mexc/rules.ts`: `priceBand` is parsed from `filters` (default 0.2); `:44` `closePrice` = `min(ask*1.02, ref*(1+0.8*band))` for BUY and `max(bid*0.98, ref*(1-0.8*band))` for SELL, with ref = mid of a fresh book, rounded in the safe direction (with a float epsilon); `:54` `bandProblem`; `src/engine.ts:445` rejects an entry outside the band | `test/grok-r2.test.ts` "8) a 0.5% band clamps the close price", "8) an entry limit outside the band is rejected" |
+    56	| 9 | placeSafely "not found" logic | `src/mexc/rest.ts:234`: null ONLY for parsed MEXC code `-2011`, the text regex is removed and every other error is rethrown; `src/engine.ts:84` looks up over 1, 2, 3 and 4 s, and if still not found after an ambiguous error (5xx / timeout) the result is `UNKNOWN_ORDER_STATE`, never "not placed" | `test/grok-r2.test.ts` "9) ... 'currency does not exist' is rethrown", "9) placeSafely: a 5xx followed by 'not found' is UNKNOWN_ORDER_STATE" |
+    57	| 10a | PnL | `src/engine.ts:562` `stableBalances`: reads until two consecutive reads match (up to about 15 s), otherwise the note says "pnl approximate" | (engine tests) |
+    58	| 10b | Transfer sell without MARKET | `src/transfer.ts:597`: uses the aggressive banded LIMIT plus `cancelAndConfirm` when the symbol has no MARKET | (transfer tests) |
+    59	| 10c | Retry-After | `src/mexc/rest.ts:134` `RateLimitError.retryAfterSec` from the header; `src/main.ts:28` backs off for at least that long | (none) |
+    60	| 10d | 0x firm-quote check | `scripts/check-0x-quote.ts:1`, run with `npm run check:0x`. It signs and sends nothing, and prints only `transaction.to`, `allowanceTarget` and `issues` | not run (no key in this environment) |
+    61	| 10e | Recovery booking | Rows recovered as `one_sided` carry "pnl unknown"; `src/db.ts:142` `unresolvedTrades()`; `/status` lists them; `src/commands.ts:36` `/resolve <id> <pnl>` books the PnL, which then counts in the daily loss budget | `test/grok-r2.test.ts` "10e) /resolve" |
+    62	
+    63	## Deviations from the prompt (and why)
+    64	- **Item 3:** the in-flight tx is persisted in the existing `state` table rather than a new `pending_tx`
+    65	  table. Sends are serialized (nothing new is sent while a tx is unresolved), so there is at most one nonce
+    66	  in flight, and a single record holds all of that nonce's hashes (the tx and its cancels).
+    67	- **Item 4 name:** the helper is `cancelAndConfirm`. It was added for Muse's round-2 review and does what the
+    68	  prompt calls `cancelAndSettle`.
+    69	- **Item 6 sweep:** `openOrders` is swept for the `WATCHLIST` symbols when `STRATEGY=inventory` and
+    70	  `WATCHLIST` is set. With auto-discovery, the watchlist is not known yet when recovery runs, so only the
+    71	  cids recorded on the trade rows are checked.
+    72	- **IOC:** MEXC's docs list `IMMEDIATE_OR_CANCEL` as an order type, and there is no `timeInForce` parameter.
+    73	  But no live symbol lists IOC in `orderTypes`, so closes stay LIMIT plus a confirmed cancel.
+    74	
+    75	## Not verified (no keys here)
+    76	- Whether 0x `buyAmount` is already net of `zeroExFee`.
+    77	- Which asset MEXC charges the buy fee in.
+    78	- 1inch v6 request parameters.
+    79	- Live `transaction.to`. Run `npm run check:0x` once before going live.
 ```
 
 ## `CHANGES_UPGRADE.md`
 
-```md
+```
      1	# Phase-1 upgrade (Grok's UPGRADE_PROMPT): what changed, file:line
      2	
      3	Hard rules kept:
@@ -399,7 +448,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/chains.ts`
 
-```ts
+```
      1	// Per-chain settings. One bot process trades one chain (one pm2 app per chain, each with its own DB_PATH).
      2	//
      3	// Verified 2026-11-21:
@@ -427,72 +476,89 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     25	  dexScreenerId: string;
     26	  /** Matches MEXC coinConfig networkList entries (network / netWork) for this chain. */
     27	  mexcNetwork: RegExp;
-    28	  /** null = one scan per new block (12 s chains); otherwise scan on a timer (ms). */
-    29	  tickMs: number | null;
-    30	}
-    31	
-    32	export const CHAINS: Record<ChainName, ChainProfile> = {
-    33	  ethereum: {
-    34	    name: 'ethereum',
-    35	    chainId: 1,
-    36	    stable: { address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', symbol: 'USDC' },
-    37	    wrappedNative: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
-    38	    nativeMexcSymbol: 'ETHUSDT',
-    39	    kyberName: 'ethereum',
-    40	    dexScreenerId: 'ethereum',
-    41	    mexcNetwork: /^ETH$|ERC20|^Ethereum$/i,
-    42	    tickMs: null,
-    43	  },
-    44	  base: {
-    45	    name: 'base',
-    46	    chainId: 8453,
-    47	    stable: { address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC' },
-    48	    wrappedNative: '0x4200000000000000000000000000000000000006',
-    49	    nativeMexcSymbol: 'ETHUSDT',
-    50	    kyberName: 'base',
-    51	    dexScreenerId: 'base',
-    52	    mexcNetwork: /^BASE$|^Base\b/i,
-    53	    tickMs: 1000, // 200 ms blocks: a timer, not block events
-    54	  },
-    55	  bsc: {
-    56	    name: 'bsc',
-    57	    chainId: 56,
-    58	    stable: { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT' }, // 18 decimals on BSC
-    59	    wrappedNative: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
-    60	    nativeMexcSymbol: 'BNBUSDT',
-    61	    kyberName: 'bsc',
-    62	    dexScreenerId: 'bsc',
-    63	    mexcNetwork: /^BSC$|BEP20|BNB Smart Chain/i,
-    64	    tickMs: 1000,
-    65	  },
-    66	  arbitrum: {
-    67	    name: 'arbitrum',
-    68	    chainId: 42161,
-    69	    stable: { address: '0xaf88d065e77c8cc2239327c5edb3a432268e5831', symbol: 'USDC' }, // native USDC
-    70	    wrappedNative: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',
-    71	    nativeMexcSymbol: 'ETHUSDT',
-    72	    kyberName: 'arbitrum',
-    73	    dexScreenerId: 'arbitrum',
-    74	    mexcNetwork: /^ARB$|Arbitrum One|^ARBITRUM$/i,
-    75	    tickMs: 1000,
-    76	  },
-    77	};
-    78	
-    79	export function chainProfile(name: string): ChainProfile {
-    80	  const c = CHAINS[name.toLowerCase() as ChainName];
-    81	  if (!c) throw new Error(`CHAIN must be one of ${Object.keys(CHAINS).join(', ')}`);
-    82	  return c;
-    83	}
+    28	  /** Block explorer host for transaction links (no https:// prefix). */
+    29	  explorer: string;
+    30	  /** null = one scan per new block (12 s chains); otherwise scan on a timer (ms). */
+    31	  tickMs: number | null;
+    32	}
+    33	
+    34	export const CHAINS: Record<ChainName, ChainProfile> = {
+    35	  ethereum: {
+    36	    name: 'ethereum',
+    37	    chainId: 1,
+    38	    stable: { address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', symbol: 'USDC' },
+    39	    wrappedNative: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+    40	    nativeMexcSymbol: 'ETHUSDT',
+    41	    kyberName: 'ethereum',
+    42	    dexScreenerId: 'ethereum',
+    43	    mexcNetwork: /^ETH$|ERC20|^Ethereum$/i,
+    44	    explorer: 'etherscan.io',
+    45	    tickMs: null,
+    46	  },
+    47	  base: {
+    48	    name: 'base',
+    49	    chainId: 8453,
+    50	    stable: { address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC' },
+    51	    wrappedNative: '0x4200000000000000000000000000000000000006',
+    52	    nativeMexcSymbol: 'ETHUSDT',
+    53	    kyberName: 'base',
+    54	    dexScreenerId: 'base',
+    55	    mexcNetwork: /^BASE$|^Base\b/i,
+    56	    explorer: 'basescan.org',
+    57	    tickMs: 1000, // 200 ms blocks: a timer, not block events
+    58	  },
+    59	  bsc: {
+    60	    name: 'bsc',
+    61	    chainId: 56,
+    62	    stable: { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT' }, // 18 decimals on BSC
+    63	    wrappedNative: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
+    64	    nativeMexcSymbol: 'BNBUSDT',
+    65	    kyberName: 'bsc',
+    66	    dexScreenerId: 'bsc',
+    67	    mexcNetwork: /^BSC$|BEP20|BNB Smart Chain/i,
+    68	    explorer: 'bscscan.com',
+    69	    tickMs: 1000,
+    70	  },
+    71	  arbitrum: {
+    72	    name: 'arbitrum',
+    73	    chainId: 42161,
+    74	    stable: { address: '0xaf88d065e77c8cc2239327c5edb3a432268e5831', symbol: 'USDC' }, // native USDC
+    75	    wrappedNative: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',
+    76	    nativeMexcSymbol: 'ETHUSDT',
+    77	    kyberName: 'arbitrum',
+    78	    dexScreenerId: 'arbitrum',
+    79	    mexcNetwork: /^ARB$|Arbitrum One|^ARBITRUM$/i,
+    80	    explorer: 'arbiscan.io',
+    81	    tickMs: 1000,
+    82	  },
+    83	};
     84	
-    85	/** The coin's MEXC network entry for this chain, if any. */
-    86	export function networkFor<N extends { network: string; netWork?: string }>(chain: ChainProfile, list: N[]): N | undefined {
-    87	  return list.find((n) => chain.mexcNetwork.test(n.netWork ?? '') || chain.mexcNetwork.test(n.network));
-    88	}
+    85	export function chainProfile(name: string): ChainProfile {
+    86	  const c = CHAINS[name.toLowerCase() as ChainName];
+    87	  if (!c) throw new Error(`CHAIN must be one of ${Object.keys(CHAINS).join(', ')}`);
+    88	  return c;
+    89	}
+    90	
+    91	/** Symbol of a known DEX stable address, if it is one of the four chains' stables. */
+    92	export function stableSymbolFor(address: string): 'USDC' | 'USDT' | undefined {
+    93	  const found = Object.values(CHAINS).find((c) => c.stable.address.toLowerCase() === address.toLowerCase());
+    94	  return found?.stable.symbol;
+    95	}
+    96	
+    97	/** Transaction URL on the chain's own explorer (round-3 review, L4: no hardcoded etherscan.io). */
+    98	export function explorerTxUrl(chain: ChainProfile, hash: string): string {
+    99	  return `https://${chain.explorer}/tx/${hash}`;
+   100	}
+   101	
+   102	/** The coin's MEXC network entry for this chain, if any. */
+   103	export function networkFor<N extends { network: string; netWork?: string }>(chain: ChainProfile, list: N[]): N | undefined {
+   104	  return list.find((n) => chain.mexcNetwork.test(n.netWork ?? '') || chain.mexcNetwork.test(n.network));
+   105	}
 ```
 
 ## `src/commands.ts`
 
-```ts
+```
      1	// Telegram command logic shared by both strategies (kept out of main.ts so it can be unit tested).
      2	import type { Db } from './db.js';
      3	import type { Risk } from './risk.js';
@@ -566,9 +632,9 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/config.ts`
 
-```ts
+```
      1	import 'dotenv/config';
-     2	import { chainProfile } from './chains.js';
+     2	import { chainProfile, stableSymbolFor } from './chains.js';
      3	
      4	export type Mode = 'live' | 'paper';
      5	export type AggregatorName = '0x' | '1inch' | 'kyber';
@@ -607,155 +673,166 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     38	    throw new Error('STRATEGY=transfer needs MEXC withdrawals; set ALLOW_WITHDRAWALS=yes only if you accept that risk');
     39	  }
     40	
-    41	  return {
-    42	    mode,
-    43	    // transfer  = scan all MEXC ERC20 tokens, buy on MEXC, withdraw to wallet, sell on DEX
-    44	    // inventory = hold tokens on both sides and trade both legs at the same moment
-    45	    strategy: strategy as 'transfer' | 'inventory',
-    46	    // --- Ethereum ---
-    47	    rpcUrl: str('RPC_URL'),
-    48	    // Private RPC for sending: never the public mempool.
-    49	    sendRpcUrl: str('SEND_RPC_URL', 'https://rpc.mevblocker.io'),
-    50	    privateKey: mode === 'live' ? str('PRIVATE_KEY') : str('PRIVATE_KEY', ''),
-    51	    chain,
-    52	    // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). STABLE_ADDRESS overrides the chain default.
-    53	    usdc: str('STABLE_ADDRESS', str('USDC_ADDRESS', chain.stable.address)).toLowerCase(),
-    54	    stableIsUsdt: chain.stable.symbol === 'USDT',
-    55	    tickMs: num('TICK_MS', chain.tickMs ?? 0),
-    56	    // --- DEX aggregator ---
-    57	    aggregator,
-    58	    aggregators,
-    59	    kyberClientId: str('KYBER_CLIENT_ID', 'mexc-dex-arb'),
-    60	    // Our own quote budget per aggregator (calls per second). 0x Standard ~5 rps; Kyber public 3 rps
-    61	    // (docs.kyberswap.com rate limits); 1inch free 1 rps.
-    62	    quoteRps: { '0x': num('QUOTE_RPS_0X', 4), kyber: num('QUOTE_RPS_KYBER', 3), '1inch': num('QUOTE_RPS_1INCH', 1) },
-    63	    // Multi-size quoting: base size = BASE_TRADE_USD (default MAX_TRADE_USD/2); 0.5x and 2x are tried when the
-    64	    // base-size gross gap reaches MULTISIZE_TRIGGER of the hurdle.
-    65	    baseTradeUsd: num('BASE_TRADE_USD', 0),
-    66	    multiSizeTrigger: num('MULTISIZE_TRIGGER', 0.7),
-    67	    // --- Monitoring ---
-    68	    oppRetentionDays: num('OPP_RETENTION_DAYS', 30),
-    69	    // Paper mode re-quotes both legs after this delay and books THAT net (the first quote overstates profit).
-    70	    paperLatencyMs: num('PAPER_LATENCY_MS', 1000),
-    71	    // --- Inventory ---
-    72	    inventoryPerSideX: num('INVENTORY_PER_SIDE_X', 3), // hold ~3x the trade size per token per side
-    73	    maxTokenSharePct: num('MAX_TOKEN_SHARE_PCT', 50), // token holdings above this % of the portfolio: warn
-    74	    skewK: num('SKEW_K', 0.75), // hurdle *= 1 + SKEW_K * (how much a trade worsens the wallet/MEXC balance)
-    75	    rebalanceAfterMin: num('REBALANCE_AFTER_MIN', 30), // a side below 1x trade size this long: one rebalance ticket
-    76	    zeroExApiKey: str('ZEROX_API_KEY', ''),
-    77	    oneInchApiKey: str('ONEINCH_API_KEY', ''),
-    78	    // --- MEXC ---
-    79	    mexcApiKey: mode === 'live' ? str('MEXC_API_KEY') : str('MEXC_API_KEY', ''),
-    80	    mexcApiSecret: mode === 'live' ? str('MEXC_API_SECRET') : str('MEXC_API_SECRET', ''),
-    81	    // Override / floor only: the bot uses max(this, the symbol's own takerCommission from exchangeInfo).
-    82	    mexcTakerFee: num('MEXC_TAKER_FEE', 0.0005),
-    83	    // USDCUSDT book older than this, or a rate outside 0.99-1.01: no trading.
-    84	    stableRateMaxAgeMs: num('STABLE_RATE_MAX_AGE_MS', 30_000),
-    85	    // --- Telegram ---
-    86	    telegramToken: str('TELEGRAM_BOT_TOKEN', ''),
-    87	    telegramChatId: str('TELEGRAM_CHAT_ID', ''),
-    88	    // Only this Telegram user may send commands (in a private chat with the bot).
-    89	    telegramAdminId: str('TELEGRAM_ADMIN_ID', ''),
-    90	    // --- Watchlist ---
-    91	    watchlist: str('WATCHLIST', '')
-    92	      .split(',')
-    93	      .map((s) => s.trim().toUpperCase())
-    94	      .filter(Boolean),
-    95	    watchlistMax: num('WATCHLIST_MAX', 8),
-    96	    minDexTvlUsd: num('MIN_DEX_TVL_USD', 200_000),
-    97	    minMexcVolumeUsd: num('MIN_MEXC_VOLUME_USD', 500_000),
-    98	    // --- Costs & thresholds ---
-    99	    // Must be small relative to MAX_TRADE_USD: $15 on a $50 trade would need a ~30% gap = only fake gaps pass.
-   100	    // need = max(MIN_PROFIT_USD, MIN_PROFIT_BPS of the size): mostly a percentage, with a small dollar floor.
-   101	    minProfitUsd: num('MIN_PROFIT_USD', 0.25),
-   102	    minProfitBps: num('MIN_PROFIT_BPS', 20),
-   103	    dexSlippageBps: num('DEX_SLIPPAGE_BPS', 30),
-   104	    // The MEXC book walk already uses the worst price reached; this is only a small extra cushion.
-   105	    cexSlippageBps: num('CEX_SLIPPAGE_BPS', 5),
-   106	    // safety = max(SAFETY_MARGIN_USD, SAFETY_MARGIN_BPS of the size)
-   107	    safetyMarginUsd: num('SAFETY_MARGIN_USD', 0),
-   108	    safetyMarginBps: num('SAFETY_MARGIN_BPS', 10),
-   109	    // CAP on the priority fee. The tip actually used is the median of recent blocks' tips (eth_feeHistory).
-   110	    priorityFeeGwei: num('PRIORITY_FEE_GWEI', 1),
-   111	    // --- Risk limits ---
-   112	    maxTradeUsd: num('MAX_TRADE_USD', 50),
-   113	    minTradeUsd: num('MIN_TRADE_USD', 25),
-   114	    maxTradesPerDay: num('MAX_TRADES_PER_DAY', 20),
-   115	    dailyLossLimitUsd: num('DAILY_LOSS_LIMIT_USD', 30),
-   116	    // Skip a trade if losing this % of its size (+ gas) would break the remaining daily loss budget.
-   117	    worstCaseLossPct: num('WORST_CASE_LOSS_PCT', 5),
-   118	    maxGasGwei: num('MAX_GAS_GWEI', 40),
-   119	    maxConsecutiveFails: num('MAX_CONSECUTIVE_FAILS', 3),
-   120	    minEthForGas: num('MIN_ETH_FOR_GAS', 0.01),
-   121	    txTimeoutSec: num('TX_TIMEOUT_SEC', 60),
-   122	    // --- Transfer strategy (scanner) ---
-   123	    scanIntervalSec: num('SCAN_INTERVAL_SEC', 20),
-   124	    scanMinGapPct: num('SCAN_MIN_GAP_PCT', 3), // cheap pre-filter before exact quotes
-   125	    scanMaxGapPct: num('SCAN_MAX_GAP_PCT', 30), // bigger gaps are almost always a wrong token / dead pool
-   126	    scanExactQuotes: num('SCAN_EXACT_QUOTES', 5), // max exact DEX quotes per scan
-   127	    transferDriftBps: num('TRANSFER_DRIFT_BPS', 150), // price-move reserve while withdrawing
-   128	    transferTimeoutMin: num('TRANSFER_TIMEOUT_MIN', 90),
-   129	    maxOpenTransfers: num('MAX_OPEN_TRANSFERS', 1),
-   130	    // After arrival, do not sell automatically if it would lose more than this % of the cost: hold + alert.
-   131	    transferMaxLossPct: num('TRANSFER_MAX_LOSS_PCT', 3),
-   132	    // --- Misc ---
-   133	    dbPath: str('DB_PATH', `data/${chain.name}.sqlite`), // one database per chain
-   134	    envPath: str('ENV_PATH', '.env'),
-   135	  };
-   136	}
-   137	
-   138	export type Config = ReturnType<typeof loadConfig>;
-   139	
-   140	/** Reject settings that would make the bot trade backwards or without limits. */
-   141	export function validateConfig(c: Config): Config {
-   142	  const errs: string[] = [];
-   143	  const range = (name: string, v: number, min: number, max: number) => {
-   144	    if (!(v >= min && v <= max)) errs.push(`${name}=${v} must be between ${min} and ${max}`);
+    41	  // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). STABLE_ADDRESS overrides the chain default.
+    42	  // stableIsUsdt follows the OVERRIDDEN address, not the chain default: pointing STABLE_ADDRESS at a USDT
+    43	  // token on a USDC chain (or vice versa) used to keep the wrong stable rate (round-3 review, L7c).
+    44	  // An address that is none of the four chains' stables falls back to the chain default.
+    45	  const stableAddress = str('STABLE_ADDRESS', str('USDC_ADDRESS', chain.stable.address)).toLowerCase();
+    46	
+    47	  return {
+    48	    mode,
+    49	    // transfer  = scan all MEXC ERC20 tokens, buy on MEXC, withdraw to wallet, sell on DEX
+    50	    // inventory = hold tokens on both sides and trade both legs at the same moment
+    51	    strategy: strategy as 'transfer' | 'inventory',
+    52	    // --- Ethereum ---
+    53	    rpcUrl: str('RPC_URL'),
+    54	    // Private RPC for sending: never the public mempool.
+    55	    sendRpcUrl: str('SEND_RPC_URL', 'https://rpc.mevblocker.io'),
+    56	    privateKey: mode === 'live' ? str('PRIVATE_KEY') : str('PRIVATE_KEY', ''),
+    57	    chain,
+    58	    // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). STABLE_ADDRESS overrides the chain default.
+    59	    usdc: stableAddress,
+    60	    stableIsUsdt: (stableSymbolFor(stableAddress) ?? chain.stable.symbol) === 'USDT',
+    61	    tickMs: num('TICK_MS', chain.tickMs ?? 0),
+    62	    // --- DEX aggregator ---
+    63	    aggregator,
+    64	    aggregators,
+    65	    kyberClientId: str('KYBER_CLIENT_ID', 'mexc-dex-arb'),
+    66	    // Our own quote budget per aggregator (calls per second). 0x Standard ~5 rps; Kyber public 3 rps
+    67	    // (docs.kyberswap.com rate limits); 1inch free 1 rps.
+    68	    quoteRps: { '0x': num('QUOTE_RPS_0X', 4), kyber: num('QUOTE_RPS_KYBER', 3), '1inch': num('QUOTE_RPS_1INCH', 1) },
+    69	    // Multi-size quoting: base size = BASE_TRADE_USD (default MAX_TRADE_USD/2); 0.5x and 2x are tried when the
+    70	    // base-size gross gap reaches MULTISIZE_TRIGGER of the hurdle.
+    71	    baseTradeUsd: num('BASE_TRADE_USD', 0),
+    72	    multiSizeTrigger: num('MULTISIZE_TRIGGER', 0.7),
+    73	    // --- Monitoring ---
+    74	    oppRetentionDays: num('OPP_RETENTION_DAYS', 7),
+    75	    // Paper mode re-quotes both legs after this delay and books THAT net (the first quote overstates profit).
+    76	    paperLatencyMs: num('PAPER_LATENCY_MS', 1000),
+    77	    // --- Inventory ---
+    78	    inventoryPerSideX: num('INVENTORY_PER_SIDE_X', 3), // hold ~3x the trade size per token per side
+    79	    maxTokenSharePct: num('MAX_TOKEN_SHARE_PCT', 50), // token holdings above this % of the portfolio: warn
+    80	    skewK: num('SKEW_K', 0.75), // hurdle *= 1 + SKEW_K * (how much a trade worsens the wallet/MEXC balance)
+    81	    rebalanceAfterMin: num('REBALANCE_AFTER_MIN', 30), // a side below 1x trade size this long: one rebalance ticket
+    82	    zeroExApiKey: str('ZEROX_API_KEY', ''),
+    83	    oneInchApiKey: str('ONEINCH_API_KEY', ''),
+    84	    // --- MEXC ---
+    85	    mexcApiKey: mode === 'live' ? str('MEXC_API_KEY') : str('MEXC_API_KEY', ''),
+    86	    mexcApiSecret: mode === 'live' ? str('MEXC_API_SECRET') : str('MEXC_API_SECRET', ''),
+    87	    // Override / floor only: the bot uses max(this, the symbol's own takerCommission from exchangeInfo).
+    88	    mexcTakerFee: num('MEXC_TAKER_FEE', 0.0005),
+    89	    // USDCUSDT book older than this, or a rate outside 0.99-1.01: no trading.
+    90	    stableRateMaxAgeMs: num('STABLE_RATE_MAX_AGE_MS', 30_000),
+    91	    // --- Telegram ---
+    92	    telegramToken: str('TELEGRAM_BOT_TOKEN', ''),
+    93	    telegramChatId: str('TELEGRAM_CHAT_ID', ''),
+    94	    // Only this Telegram user may send commands (in a private chat with the bot).
+    95	    telegramAdminId: str('TELEGRAM_ADMIN_ID', ''),
+    96	    // --- Watchlist ---
+    97	    watchlist: str('WATCHLIST', '')
+    98	      .split(',')
+    99	      .map((s) => s.trim().toUpperCase())
+   100	      .filter(Boolean),
+   101	    watchlistMax: num('WATCHLIST_MAX', 8),
+   102	    minDexTvlUsd: num('MIN_DEX_TVL_USD', 200_000),
+   103	    minMexcVolumeUsd: num('MIN_MEXC_VOLUME_USD', 500_000),
+   104	    // --- Costs & thresholds ---
+   105	    // Must be small relative to MAX_TRADE_USD: $15 on a $50 trade would need a ~30% gap = only fake gaps pass.
+   106	    // need = max(MIN_PROFIT_USD, MIN_PROFIT_BPS of the size): mostly a percentage, with a small dollar floor.
+   107	    minProfitUsd: num('MIN_PROFIT_USD', 0.25),
+   108	    minProfitBps: num('MIN_PROFIT_BPS', 20),
+   109	    dexSlippageBps: num('DEX_SLIPPAGE_BPS', 30),
+   110	    // The MEXC book walk already uses the worst price reached; this is only a small extra cushion.
+   111	    cexSlippageBps: num('CEX_SLIPPAGE_BPS', 5),
+   112	    // safety = max(SAFETY_MARGIN_USD, SAFETY_MARGIN_BPS of the size)
+   113	    safetyMarginUsd: num('SAFETY_MARGIN_USD', 0),
+   114	    safetyMarginBps: num('SAFETY_MARGIN_BPS', 10),
+   115	    // CAP on the priority fee. The tip actually used is the median of recent blocks' tips (eth_feeHistory).
+   116	    priorityFeeGwei: num('PRIORITY_FEE_GWEI', 1),
+   117	    // OP-stack L1 data fee reserve (USD) added to every gas estimate (round-3 review, M1).
+   118	    // 0 on Ethereum/Arbitrum. On Base, set it to a typical legs.l1_fee from a past trade (usually a few cents):
+   119	    // receipts now record l1_fee, so the value can be measured instead of guessed.
+   120	    l1FeeUsd: num('L1_FEE_USD', 0),
+   121	    // --- Risk limits ---
+   122	    maxTradeUsd: num('MAX_TRADE_USD', 50),
+   123	    minTradeUsd: num('MIN_TRADE_USD', 25),
+   124	    maxTradesPerDay: num('MAX_TRADES_PER_DAY', 20),
+   125	    dailyLossLimitUsd: num('DAILY_LOSS_LIMIT_USD', 30),
+   126	    // Skip a trade if losing this % of its size (+ gas) would break the remaining daily loss budget.
+   127	    worstCaseLossPct: num('WORST_CASE_LOSS_PCT', 5),
+   128	    maxGasGwei: num('MAX_GAS_GWEI', 40),
+   129	    maxConsecutiveFails: num('MAX_CONSECUTIVE_FAILS', 3),
+   130	    minEthForGas: num('MIN_ETH_FOR_GAS', 0.01),
+   131	    txTimeoutSec: num('TX_TIMEOUT_SEC', 60),
+   132	    // --- Transfer strategy (scanner) ---
+   133	    scanIntervalSec: num('SCAN_INTERVAL_SEC', 20),
+   134	    scanMinGapPct: num('SCAN_MIN_GAP_PCT', 3), // cheap pre-filter before exact quotes
+   135	    scanMaxGapPct: num('SCAN_MAX_GAP_PCT', 30), // bigger gaps are almost always a wrong token / dead pool
+   136	    scanExactQuotes: num('SCAN_EXACT_QUOTES', 5), // max exact DEX quotes per scan
+   137	    transferDriftBps: num('TRANSFER_DRIFT_BPS', 150), // price-move reserve while withdrawing
+   138	    transferTimeoutMin: num('TRANSFER_TIMEOUT_MIN', 90),
+   139	    maxOpenTransfers: num('MAX_OPEN_TRANSFERS', 1),
+   140	    // After arrival, do not sell automatically if it would lose more than this % of the cost: hold + alert.
+   141	    transferMaxLossPct: num('TRANSFER_MAX_LOSS_PCT', 3),
+   142	    // --- Misc ---
+   143	    dbPath: str('DB_PATH', `data/${chain.name}.sqlite`), // one database per chain
+   144	    envPath: str('ENV_PATH', '.env'),
    145	  };
-   146	  range('MIN_PROFIT_USD', c.minProfitUsd, 0, 1e6);
-   147	  // A floor above 10% of the trade size means only absurd (fake / dead-pool) gaps could ever pass.
-   148	  if (c.minProfitUsd > c.maxTradeUsd * 0.1) {
-   149	    errs.push(`MIN_PROFIT_USD=${c.minProfitUsd} is more than 10% of MAX_TRADE_USD=${c.maxTradeUsd}: only fake gaps could pass`);
-   150	  }
-   151	  range('MIN_PROFIT_BPS', c.minProfitBps, 0, 10_000);
-   152	  range('SAFETY_MARGIN_BPS', c.safetyMarginBps, 0, 1_000);
-   153	  range('TICK_MS', c.tickMs, 0, 60_000);
-   154	  range('DEX_SLIPPAGE_BPS', c.dexSlippageBps, 1, 500);
-   155	  range('CEX_SLIPPAGE_BPS', c.cexSlippageBps, 0, 500);
-   156	  range('SAFETY_MARGIN_USD', c.safetyMarginUsd, 0, 1e6);
-   157	  range('MEXC_TAKER_FEE', c.mexcTakerFee, 0, 0.01);
-   158	  range('MAX_TRADE_USD', c.maxTradeUsd, 1, 1e7);
-   159	  range('MIN_TRADE_USD', c.minTradeUsd, 1, c.maxTradeUsd);
-   160	  range('MAX_TRADES_PER_DAY', c.maxTradesPerDay, 1, 10_000);
-   161	  range('DAILY_LOSS_LIMIT_USD', c.dailyLossLimitUsd, 0.01, 1e7);
-   162	  range('WORST_CASE_LOSS_PCT', c.worstCaseLossPct, 0, 100);
-   163	  range('MAX_GAS_GWEI', c.maxGasGwei, 0.01, 1000);
-   164	  range('MAX_CONSECUTIVE_FAILS', c.maxConsecutiveFails, 1, 100);
-   165	  // Upper bound keeps the graceful-shutdown wait (2x this + 60 s) below pm2's kill_timeout (240 s).
-   166	  range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 80);
-   167	  range('SCAN_INTERVAL_SEC', c.scanIntervalSec, 5, 3600);
-   168	  range('SCAN_MIN_GAP_PCT', c.scanMinGapPct, 0, c.scanMaxGapPct);
-   169	  range('SCAN_MAX_GAP_PCT', c.scanMaxGapPct, c.scanMinGapPct, 100);
-   170	  range('TRANSFER_DRIFT_BPS', c.transferDriftBps, 0, 5000);
-   171	  range('TRANSFER_TIMEOUT_MIN', c.transferTimeoutMin, 5, 24 * 60);
-   172	  range('TRANSFER_MAX_LOSS_PCT', c.transferMaxLossPct, 0, 100);
-   173	  range('MAX_OPEN_TRANSFERS', c.maxOpenTransfers, 1, 10);
-   174	  if (errs.length) throw new Error(`Invalid config:\n  ${errs.join('\n  ')}`);
-   175	  return c;
-   176	}
-   177	
-   178	/** Every secret value, so the logger can scrub them from any output. */
-   179	export function secretsOf(cfg: Config): string[] {
-   180	  // RPC URLs usually embed a provider API key (Alchemy/Infura), so they are secrets too.
-   181	  return [cfg.privateKey, cfg.mexcApiKey, cfg.mexcApiSecret, cfg.zeroExApiKey, cfg.oneInchApiKey, cfg.telegramToken, cfg.rpcUrl, cfg.sendRpcUrl]
-   182	    .filter((s) => s && s.length >= 8)
-   183	    .flatMap((s) => [s, s.replace(/^0x/, '')]);
-   184	}
+   146	}
+   147	
+   148	export type Config = ReturnType<typeof loadConfig>;
+   149	
+   150	/** Reject settings that would make the bot trade backwards or without limits. */
+   151	export function validateConfig(c: Config): Config {
+   152	  const errs: string[] = [];
+   153	  const range = (name: string, v: number, min: number, max: number) => {
+   154	    if (!(v >= min && v <= max)) errs.push(`${name}=${v} must be between ${min} and ${max}`);
+   155	  };
+   156	  range('MIN_PROFIT_USD', c.minProfitUsd, 0, 1e6);
+   157	  // A floor above 10% of the trade size means only absurd (fake / dead-pool) gaps could ever pass.
+   158	  if (c.minProfitUsd > c.maxTradeUsd * 0.1) {
+   159	    errs.push(`MIN_PROFIT_USD=${c.minProfitUsd} is more than 10% of MAX_TRADE_USD=${c.maxTradeUsd}: only fake gaps could pass`);
+   160	  }
+   161	  range('MIN_PROFIT_BPS', c.minProfitBps, 0, 10_000);
+   162	  range('SAFETY_MARGIN_BPS', c.safetyMarginBps, 0, 1_000);
+   163	  range('TICK_MS', c.tickMs, 0, 60_000);
+   164	  range('DEX_SLIPPAGE_BPS', c.dexSlippageBps, 1, 500);
+   165	  range('CEX_SLIPPAGE_BPS', c.cexSlippageBps, 0, 500);
+   166	  range('SAFETY_MARGIN_USD', c.safetyMarginUsd, 0, 1e6);
+   167	  range('MEXC_TAKER_FEE', c.mexcTakerFee, 0, 0.01);
+   168	  range('MAX_TRADE_USD', c.maxTradeUsd, 1, 1e7);
+   169	  range('MIN_TRADE_USD', c.minTradeUsd, 1, c.maxTradeUsd);
+   170	  range('MAX_TRADES_PER_DAY', c.maxTradesPerDay, 1, 10_000);
+   171	  range('DAILY_LOSS_LIMIT_USD', c.dailyLossLimitUsd, 0.01, 1e7);
+   172	  range('WORST_CASE_LOSS_PCT', c.worstCaseLossPct, 0, 100);
+   173	  range('MAX_GAS_GWEI', c.maxGasGwei, 0.01, 1000);
+   174	  range('L1_FEE_USD', c.l1FeeUsd, 0, 100);
+   175	  range('MAX_CONSECUTIVE_FAILS', c.maxConsecutiveFails, 1, 100);
+   176	  // Upper bound keeps the graceful-shutdown wait (2x this + 60 s) below pm2's kill_timeout (240 s).
+   177	  range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 80);
+   178	  range('SCAN_INTERVAL_SEC', c.scanIntervalSec, 5, 3600);
+   179	  range('SCAN_MIN_GAP_PCT', c.scanMinGapPct, 0, c.scanMaxGapPct);
+   180	  range('SCAN_MAX_GAP_PCT', c.scanMaxGapPct, c.scanMinGapPct, 100);
+   181	  range('TRANSFER_DRIFT_BPS', c.transferDriftBps, 0, 5000);
+   182	  range('TRANSFER_TIMEOUT_MIN', c.transferTimeoutMin, 5, 24 * 60);
+   183	  range('TRANSFER_MAX_LOSS_PCT', c.transferMaxLossPct, 0, 100);
+   184	  range('MAX_OPEN_TRANSFERS', c.maxOpenTransfers, 1, 10);
+   185	  if (errs.length) throw new Error(`Invalid config:\n  ${errs.join('\n  ')}`);
+   186	  return c;
+   187	}
+   188	
+   189	/** Every secret value, so the logger can scrub them from any output. */
+   190	export function secretsOf(cfg: Config): string[] {
+   191	  // RPC URLs usually embed a provider API key (Alchemy/Infura), so they are secrets too.
+   192	  return [cfg.privateKey, cfg.mexcApiKey, cfg.mexcApiSecret, cfg.zeroExApiKey, cfg.oneInchApiKey, cfg.telegramToken, cfg.rpcUrl, cfg.sendRpcUrl]
+   193	    .filter((s) => s && s.length >= 8)
+   194	    .flatMap((s) => [s, s.replace(/^0x/, '')]);
+   195	}
 ```
 
 ## `src/db.ts`
 
-```ts
+```
      1	// SQLite storage: trades and persistent bot state (pause flag, failure streak, ...).
      2	import Database from 'better-sqlite3';
      3	import fs from 'node:fs';
@@ -917,1232 +994,1244 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
    159	      );
    160	      CREATE INDEX IF NOT EXISTS opp_token_ts ON opportunities(token, ts);
    161	      CREATE INDEX IF NOT EXISTS opp_decision_ts ON opportunities(decision, ts);
-   162	      CREATE TABLE IF NOT EXISTS legs (
-   163	        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL, leg TEXT NOT NULL,
-   164	        quoted_price REAL, filled_price REAL, slippage_bps REAL, min_out REAL, real_out REAL,
-   165	        gas_used TEXT, gas_price TEXT, l1_fee TEXT, executed_qty REAL, avg_price REAL, fee REAL, fee_asset TEXT,
-   166	        latency_quote_ms INTEGER, latency_sign_ms INTEGER, latency_inclusion_ms INTEGER, latency_mexc_ack_ms INTEGER
-   167	      );
-   168	      CREATE TABLE IF NOT EXISTS rebalance_tickets (
-   169	        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, token TEXT NOT NULL, side TEXT NOT NULL,
-   170	        asset TEXT NOT NULL, amount REAL NOT NULL, direction TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', closed_ts INTEGER
-   171	      );
-   172	      CREATE TABLE IF NOT EXISTS inventory_snapshots (
-   173	        ts INTEGER NOT NULL, token TEXT NOT NULL, wallet_usd REAL, mexc_usd REAL
-   174	      );
-   175	    `);
-   176	    const cols = new Set((this.db.prepare('PRAGMA table_info(transfers)').all() as { name: string }[]).map((c) => c.name));
-   177	    for (const m of TRANSFER_MIGRATIONS) {
-   178	      const col = m.split(' ')[5];
-   179	      if (!cols.has(col)) this.db.exec(m);
-   180	    }
-   181	  }
-   182	
-   183	  insertTrade(t: TradeRow): number {
-   184	    return Number(this.db
-   185	      .prepare(
-   186	        `INSERT INTO trades (ts, day, mode, symbol, direction, size_usd, qty, buy_price, sell_price, expected_net,
-   187	          cex_fee_usd, gas_usd, pnl_usd, status, dex_tx, cex_order_id, note)
-   188	         VALUES (@ts, @day, @mode, @symbol, @direction, @size_usd, @qty, @buy_price, @sell_price, @expected_net,
-   189	          @cex_fee_usd, @gas_usd, @pnl_usd, @status, @dex_tx, @cex_order_id, @note)`,
-   190	      )
-   191	      .run(t).lastInsertRowid);
-   192	  }
-   193	
-   194	  updateTrade(id: number, fields: Partial<TradeRow>): void {
-   195	    const cols = Object.keys(fields);
-   196	    if (!cols.length) return;
-   197	    this.db.prepare(`UPDATE trades SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...fields, id });
-   198	  }
-   199	
-   200	  appendCid(tradeId: number, cid: string): void {
-   201	    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
-   202	    const list = row?.cids ? (JSON.parse(row.cids) as string[]) : [];
-   203	    list.push(cid);
-   204	    this.db.prepare('UPDATE trades SET cids = ? WHERE id = ?').run(JSON.stringify(list), tradeId);
-   205	  }
-   206	
-   207	  cidsOf(tradeId: number): string[] {
-   208	    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
-   209	    return row?.cids ? (JSON.parse(row.cids) as string[]) : [];
-   210	  }
-   211	
-   212	  insertOpportunities(rows: OpportunityRow[]): void {
-   213	    if (!rows.length) return;
-   214	    const cols = Object.keys(rows[0]);
-   215	    const stmt = this.db.prepare(`INSERT INTO opportunities (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`);
-   216	    this.db.transaction((rs: OpportunityRow[]) => rs.forEach((r) => stmt.run(r)))(rows);
-   217	  }
-   218	
-   219	  pruneOpportunities(olderThanTs: number): number {
-   220	    return Number(this.db.prepare('DELETE FROM opportunities WHERE ts < ?').run(olderThanTs).changes);
-   221	  }
-   222	
-   223	  insertLeg(r: LegRow): void {
-   224	    const cols = Object.keys(r);
-   225	    this.db.prepare(`INSERT INTO legs (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`).run(r);
-   226	  }
-   227	
-   228	  openTicket(t: { token: string; side: string; asset: string; amount: number; direction: string }): number {
-   229	    return Number(
-   230	      this.db
-   231	        .prepare(`INSERT INTO rebalance_tickets (ts, token, side, asset, amount, direction) VALUES (?, ?, ?, ?, ?, ?)`)
-   232	        .run(Date.now(), t.token, t.side, t.asset, t.amount, t.direction).lastInsertRowid,
-   233	    );
-   234	  }
-   235	
-   236	  openTickets(): { id: number; ts: number; token: string; side: string; asset: string; amount: number; direction: string }[] {
-   237	    return this.db.prepare(`SELECT id, ts, token, side, asset, amount, direction FROM rebalance_tickets WHERE status = 'open' ORDER BY id`).all() as never;
-   238	  }
-   239	
-   240	  closeTickets(token: string, side: string): void {
-   241	    this.db.prepare(`UPDATE rebalance_tickets SET status = 'closed', closed_ts = ? WHERE token = ? AND side = ? AND status = 'open'`).run(Date.now(), token, side);
-   242	  }
-   243	
-   244	  insertInventorySnapshot(rows: { ts: number; token: string; wallet_usd: number; mexc_usd: number }[]): void {
-   245	    const stmt = this.db.prepare('INSERT INTO inventory_snapshots (ts, token, wallet_usd, mexc_usd) VALUES (@ts, @token, @wallet_usd, @mexc_usd)');
-   246	    this.db.transaction((rs: typeof rows) => rs.forEach((r) => stmt.run(r)))(rows);
-   247	  }
-   248	
-   249	  /** Raw access for read-only reports. */
-   250	  all<T>(sql: string, ...args: unknown[]): T[] {
-   251	    return this.db.prepare(sql).all(...args) as T[];
-   252	  }
-   253	
-   254	  /** Trades whose real PnL is unknown (one-sided / recovered) and not yet set with /resolve. */
-   255	  unresolvedTrades(): (TradeRow & { id: number })[] {
-   256	    return this.db
-   257	      .prepare(`SELECT * FROM trades WHERE status = 'one_sided' AND (note IS NULL OR note NOT LIKE '%pnl resolved%') AND note LIKE '%pnl unknown%' ORDER BY id`)
-   258	      .all() as (TradeRow & { id: number })[];
-   259	  }
-   260	
-   261	  tradeByDexTx(hash: string): (TradeRow & { id: number }) | undefined {
-   262	    return this.db.prepare('SELECT * FROM trades WHERE dex_tx = ? ORDER BY id DESC LIMIT 1').get(hash) as (TradeRow & { id: number }) | undefined;
-   263	  }
-   264	
-   265	  /** Trades that were in flight when the bot stopped. */
-   266	  executingTrades(): (TradeRow & { id: number })[] {
-   267	    return this.db.prepare(`SELECT * FROM trades WHERE status = 'executing' ORDER BY id`).all() as (TradeRow & { id: number })[];
-   268	  }
-   269	
-   270	  dayStats(day: string, mode: string): { trades: number; pnl: number; gas: number; failed: number } {
-   271	    const r = this.db
-   272	      .prepare(
-   273	        `SELECT SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades,
-   274	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
-   275	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
-   276	         FROM trades WHERE day = ? AND mode = ?`,
-   277	      )
-   278	      .get(day, mode) as { trades: number | null; pnl: number; gas: number; failed: number | null };
-   279	    return { trades: r.trades ?? 0, pnl: r.pnl, gas: r.gas, failed: r.failed ?? 0 };
-   280	  }
-   281	
-   282	  /** Stats since a timestamp, overall and per symbol. */
-   283	  statsSince(sinceTs: number, mode?: string) {
-   284	    const where = mode ? 'ts >= ? AND mode = ?' : 'ts >= ?';
-   285	    const args = mode ? [sinceTs, mode] : [sinceTs];
-   286	    const total = this.db
-   287	      .prepare(
-   288	        `SELECT COALESCE(SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END),0) trades,
-   289	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
-   290	                COALESCE(SUM(cex_fee_usd),0) fees,
-   291	                COALESCE(SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END),0) failed
-   292	         FROM trades WHERE ${where}`,
-   293	      )
-   294	      .get(...args) as { trades: number; pnl: number; gas: number; fees: number; failed: number };
-   295	    const bySymbol = this.db
-   296	      .prepare(
-   297	        `SELECT symbol, SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades, SUM(pnl_usd) pnl, SUM(gas_usd) gas,
-   298	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
-   299	         FROM trades WHERE ${where} GROUP BY symbol ORDER BY pnl DESC`,
-   300	      )
-   301	      .all(...args) as { symbol: string; trades: number; pnl: number; gas: number; failed: number }[];
-   302	    return { total, bySymbol };
-   303	  }
-   304	
-   305	  insertTransfer(t: TransferRow): number {
-   306	    const cols = Object.keys(t).filter((k) => k !== 'id');
-   307	    const r = this.db
-   308	      .prepare(`INSERT INTO transfers (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`)
-   309	      .run(t);
-   310	    return Number(r.lastInsertRowid);
-   311	  }
-   312	
-   313	  updateTransfer(id: number, fields: Partial<TransferRow>): void {
-   314	    const f = { ...fields, updated: Date.now() };
-   315	    const cols = Object.keys(f).filter((k) => k !== 'id');
-   316	    this.db.prepare(`UPDATE transfers SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...f, id });
-   317	  }
-   318	
-   319	  /** Transfers the bot still works on automatically ('stuck' waits for a human: /sell or /clear). */
-   320	  openTransfers(): TransferRow[] {
-   321	    return this.db.prepare(`SELECT * FROM transfers WHERE status IN ('buying','withdrawing','selling') ORDER BY id`).all() as TransferRow[];
-   322	  }
-   323	
-   324	  /** Transfers that hold back new trades (open, and not given up on). */
-   325	  blockingTransfers(): TransferRow[] {
-   326	    return this.openTransfers().filter((t) => t.alerted_timeout < 2);
-   327	  }
-   328	
-   329	  stuckTransfers(): TransferRow[] {
-   330	    return this.db.prepare(`SELECT * FROM transfers WHERE status = 'stuck' ORDER BY id`).all() as TransferRow[];
-   331	  }
-   332	
-   333	  getTransfer(id: number): TransferRow | undefined {
-   334	    return this.db.prepare('SELECT * FROM transfers WHERE id = ?').get(id) as TransferRow | undefined;
-   335	  }
-   336	
-   337	  getState(key: string): string | undefined {
-   338	    return (this.db.prepare('SELECT value FROM state WHERE key = ?').get(key) as { value: string } | undefined)?.value;
-   339	  }
-   340	
-   341	  setState(key: string, value: string): void {
-   342	    this.db.prepare('INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
-   343	  }
-   344	
-   345	  close(): void {
-   346	    this.db.close();
-   347	  }
-   348	}
+   162	      CREATE INDEX IF NOT EXISTS opp_ts ON opportunities(ts);
+   163	      CREATE TABLE IF NOT EXISTS legs (
+   164	        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL, leg TEXT NOT NULL,
+   165	        quoted_price REAL, filled_price REAL, slippage_bps REAL, min_out REAL, real_out REAL,
+   166	        gas_used TEXT, gas_price TEXT, l1_fee TEXT, executed_qty REAL, avg_price REAL, fee REAL, fee_asset TEXT,
+   167	        latency_quote_ms INTEGER, latency_sign_ms INTEGER, latency_inclusion_ms INTEGER, latency_mexc_ack_ms INTEGER
+   168	      );
+   169	      CREATE TABLE IF NOT EXISTS rebalance_tickets (
+   170	        id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, token TEXT NOT NULL, side TEXT NOT NULL,
+   171	        asset TEXT NOT NULL, amount REAL NOT NULL, direction TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', closed_ts INTEGER
+   172	      );
+   173	      CREATE TABLE IF NOT EXISTS inventory_snapshots (
+   174	        ts INTEGER NOT NULL, token TEXT NOT NULL, wallet_usd REAL, mexc_usd REAL
+   175	      );
+   176	    `);
+   177	    const cols = new Set((this.db.prepare('PRAGMA table_info(transfers)').all() as { name: string }[]).map((c) => c.name));
+   178	    for (const m of TRANSFER_MIGRATIONS) {
+   179	      const col = m.split(' ')[5];
+   180	      if (!cols.has(col)) this.db.exec(m);
+   181	    }
+   182	  }
+   183	
+   184	  insertTrade(t: TradeRow): number {
+   185	    return Number(this.db
+   186	      .prepare(
+   187	        `INSERT INTO trades (ts, day, mode, symbol, direction, size_usd, qty, buy_price, sell_price, expected_net,
+   188	          cex_fee_usd, gas_usd, pnl_usd, status, dex_tx, cex_order_id, note)
+   189	         VALUES (@ts, @day, @mode, @symbol, @direction, @size_usd, @qty, @buy_price, @sell_price, @expected_net,
+   190	          @cex_fee_usd, @gas_usd, @pnl_usd, @status, @dex_tx, @cex_order_id, @note)`,
+   191	      )
+   192	      .run(t).lastInsertRowid);
+   193	  }
+   194	
+   195	  updateTrade(id: number, fields: Partial<TradeRow>): void {
+   196	    const cols = Object.keys(fields);
+   197	    if (!cols.length) return;
+   198	    this.db.prepare(`UPDATE trades SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...fields, id });
+   199	  }
+   200	
+   201	  appendCid(tradeId: number, cid: string): void {
+   202	    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
+   203	    const list = row?.cids ? (JSON.parse(row.cids) as string[]) : [];
+   204	    list.push(cid);
+   205	    this.db.prepare('UPDATE trades SET cids = ? WHERE id = ?').run(JSON.stringify(list), tradeId);
+   206	  }
+   207	
+   208	  cidsOf(tradeId: number): string[] {
+   209	    const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
+   210	    return row?.cids ? (JSON.parse(row.cids) as string[]) : [];
+   211	  }
+   212	
+   213	  insertOpportunities(rows: OpportunityRow[]): void {
+   214	    if (!rows.length) return;
+   215	    const cols = Object.keys(rows[0]);
+   216	    const stmt = this.db.prepare(`INSERT INTO opportunities (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`);
+   217	    this.db.transaction((rs: OpportunityRow[]) => rs.forEach((r) => stmt.run(r)))(rows);
+   218	  }
+   219	
+   220	  pruneOpportunities(olderThanTs: number): number {
+   221	    return Number(this.db.prepare('DELETE FROM opportunities WHERE ts < ?').run(olderThanTs).changes);
+   222	  }
+   223	
+   224	  insertLeg(r: LegRow): void {
+   225	    const cols = Object.keys(r);
+   226	    this.db.prepare(`INSERT INTO legs (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`).run(r);
+   227	  }
+   228	
+   229	  openTicket(t: { token: string; side: string; asset: string; amount: number; direction: string }): number {
+   230	    return Number(
+   231	      this.db
+   232	        .prepare(`INSERT INTO rebalance_tickets (ts, token, side, asset, amount, direction) VALUES (?, ?, ?, ?, ?, ?)`)
+   233	        .run(Date.now(), t.token, t.side, t.asset, t.amount, t.direction).lastInsertRowid,
+   234	    );
+   235	  }
+   236	
+   237	  openTickets(): { id: number; ts: number; token: string; side: string; asset: string; amount: number; direction: string }[] {
+   238	    return this.db.prepare(`SELECT id, ts, token, side, asset, amount, direction FROM rebalance_tickets WHERE status = 'open' ORDER BY id`).all() as never;
+   239	  }
+   240	
+   241	  closeTickets(token: string, side: string): void {
+   242	    this.db.prepare(`UPDATE rebalance_tickets SET status = 'closed', closed_ts = ? WHERE token = ? AND side = ? AND status = 'open'`).run(Date.now(), token, side);
+   243	  }
+   244	
+   245	  insertInventorySnapshot(rows: { ts: number; token: string; wallet_usd: number; mexc_usd: number }[]): void {
+   246	    const stmt = this.db.prepare('INSERT INTO inventory_snapshots (ts, token, wallet_usd, mexc_usd) VALUES (@ts, @token, @wallet_usd, @mexc_usd)');
+   247	    this.db.transaction((rs: typeof rows) => rs.forEach((r) => stmt.run(r)))(rows);
+   248	  }
+   249	
+   250	  /** Raw access for read-only reports. */
+   251	  all<T>(sql: string, ...args: unknown[]): T[] {
+   252	    return this.db.prepare(sql).all(...args) as T[];
+   253	  }
+   254	
+   255	  /** Trades whose real PnL is unknown (one-sided / recovered) and not yet set with /resolve. */
+   256	  unresolvedTrades(): (TradeRow & { id: number })[] {
+   257	    return this.db
+   258	      .prepare(`SELECT * FROM trades WHERE status = 'one_sided' AND (note IS NULL OR note NOT LIKE '%pnl resolved%') AND note LIKE '%pnl unknown%' ORDER BY id`)
+   259	      .all() as (TradeRow & { id: number })[];
+   260	  }
+   261	
+   262	  tradeByDexTx(hash: string): (TradeRow & { id: number }) | undefined {
+   263	    return this.db.prepare('SELECT * FROM trades WHERE dex_tx = ? ORDER BY id DESC LIMIT 1').get(hash) as (TradeRow & { id: number }) | undefined;
+   264	  }
+   265	
+   266	  /** Trades that were in flight when the bot stopped. */
+   267	  executingTrades(): (TradeRow & { id: number })[] {
+   268	    return this.db.prepare(`SELECT * FROM trades WHERE status = 'executing' ORDER BY id`).all() as (TradeRow & { id: number })[];
+   269	  }
+   270	
+   271	  dayStats(day: string, mode: string): { trades: number; pnl: number; gas: number; failed: number } {
+   272	    const r = this.db
+   273	      .prepare(
+   274	        `SELECT SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades,
+   275	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
+   276	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
+   277	         FROM trades WHERE day = ? AND mode = ?`,
+   278	      )
+   279	      .get(day, mode) as { trades: number | null; pnl: number; gas: number; failed: number | null };
+   280	    return { trades: r.trades ?? 0, pnl: r.pnl, gas: r.gas, failed: r.failed ?? 0 };
+   281	  }
+   282	
+   283	  /** Stats since a timestamp, overall and per symbol. */
+   284	  statsSince(sinceTs: number, mode?: string) {
+   285	    const where = mode ? 'ts >= ? AND mode = ?' : 'ts >= ?';
+   286	    const args = mode ? [sinceTs, mode] : [sinceTs];
+   287	    const total = this.db
+   288	      .prepare(
+   289	        `SELECT COALESCE(SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END),0) trades,
+   290	                COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
+   291	                COALESCE(SUM(cex_fee_usd),0) fees,
+   292	                COALESCE(SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END),0) failed
+   293	         FROM trades WHERE ${where}`,
+   294	      )
+   295	      .get(...args) as { trades: number; pnl: number; gas: number; fees: number; failed: number };
+   296	    const bySymbol = this.db
+   297	      .prepare(
+   298	        `SELECT symbol, SUM(CASE WHEN status != 'approval' THEN 1 ELSE 0 END) trades, SUM(pnl_usd) pnl, SUM(gas_usd) gas,
+   299	                SUM(CASE WHEN status IN ('one_sided','dex_failed','cex_failed') THEN 1 ELSE 0 END) failed
+   300	         FROM trades WHERE ${where} GROUP BY symbol ORDER BY pnl DESC`,
+   301	      )
+   302	      .all(...args) as { symbol: string; trades: number; pnl: number; gas: number; failed: number }[];
+   303	    return { total, bySymbol };
+   304	  }
+   305	
+   306	  insertTransfer(t: TransferRow): number {
+   307	    const cols = Object.keys(t).filter((k) => k !== 'id');
+   308	    const r = this.db
+   309	      .prepare(`INSERT INTO transfers (${cols.join(',')}) VALUES (${cols.map((c) => '@' + c).join(',')})`)
+   310	      .run(t);
+   311	    return Number(r.lastInsertRowid);
+   312	  }
+   313	
+   314	  updateTransfer(id: number, fields: Partial<TransferRow>): void {
+   315	    const f = { ...fields, updated: Date.now() };
+   316	    const cols = Object.keys(f).filter((k) => k !== 'id');
+   317	    this.db.prepare(`UPDATE transfers SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run({ ...f, id });
+   318	  }
+   319	
+   320	  /** Transfers the bot still works on automatically ('stuck' waits for a human: /sell or /clear). */
+   321	  openTransfers(): TransferRow[] {
+   322	    return this.db.prepare(`SELECT * FROM transfers WHERE status IN ('buying','withdrawing','selling') ORDER BY id`).all() as TransferRow[];
+   323	  }
+   324	
+   325	  /** Transfers that hold back new trades (open, and not given up on). */
+   326	  blockingTransfers(): TransferRow[] {
+   327	    return this.openTransfers().filter((t) => t.alerted_timeout < 2);
+   328	  }
+   329	
+   330	  stuckTransfers(): TransferRow[] {
+   331	    return this.db.prepare(`SELECT * FROM transfers WHERE status = 'stuck' ORDER BY id`).all() as TransferRow[];
+   332	  }
+   333	
+   334	  getTransfer(id: number): TransferRow | undefined {
+   335	    return this.db.prepare('SELECT * FROM transfers WHERE id = ?').get(id) as TransferRow | undefined;
+   336	  }
+   337	
+   338	  getState(key: string): string | undefined {
+   339	    return (this.db.prepare('SELECT value FROM state WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+   340	  }
+   341	
+   342	  setState(key: string, value: string): void {
+   343	    this.db.prepare('INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+   344	  }
+   345	
+   346	  close(): void {
+   347	    this.db.close();
+   348	  }
+   349	}
 ```
 
 ## `src/engine.ts`
 
-```ts
+```
      1	// The trading loop: find the best opportunity each block, confirm it, trade both legs, clean up, account.
      2	import type { Config } from './config.js';
-     3	import { BestOf, QuoteBudgetError, type Aggregator, type Quote, type QuoteRequest } from './dex/aggregator.js';
-     4	import type { GasInfo, TxResult } from './dex/chain.js';
-     5	import type { Book, Order, Side } from './mexc/rest.js';
-     6	import type { Db, OpportunityRow, TradeStatus } from './db.js';
-     7	import type { Risk, RiskEvent } from './risk.js';
-     8	import type { Token } from './watchlist.js';
-     9	import { type Balances, inventoryPlan, inventoryWarnings, portfolioUsd } from './inventory.js';
-    10	import {
-    11	  type Opportunity,
-    12	  evaluateCexBuy,
-    13	  evaluateDexBuy,
-    14	  gasUsd,
-    15	  planCexBuy,
-    16	  planCexBuyQty,
-    17	  threshold,
-    18	  unwindPlan,
-    19	} from './pricing.js';
-    20	import { log, errMsg } from './log.js';
-    21	import { AmbiguousRequestError } from './mexc/rest.js';
-    22	import { bandProblem, closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
-    23	import crypto from 'node:crypto';
-    24	
-    25	/** A close/unwind that only partly filled: `remaining` is what is still open. */
-    26	export class PartialCloseError extends Error {
-    27	  constructor(msg: string, readonly remaining: number) {
-    28	    super(msg);
-    29	  }
-    30	}
-    31	
-    32	/** Unique id we give MEXC orders, so an order can be found even if the request timed out. */
-    33	export const clientId = (tag: string) => `arb${tag}${crypto.randomUUID().replace(/-/g, '')}`.slice(0, 32);
-    34	
-    35	const FINAL_ORDER = new Set(['FILLED', 'CANCELED', 'PARTIALLY_CANCELED']);
-    36	
-    37	/** A cancel could not be confirmed: the order may still be live on MEXC. Never place a second close for it. */
-    38	export class OrderStillOpenError extends Error {
-    39	  constructor(readonly orderId: string, status: string) {
-    40	    super(`MEXC order ${orderId} still ${status} after cancel attempts: it may still fill`);
-    41	  }
-    42	}
-    43	
-    44	/**
-    45	 * Cancel an order and keep checking until MEXC reports a final status (FILLED / CANCELED / PARTIALLY_CANCELED).
-    46	 * Throws OrderStillOpenError if that cannot be confirmed within ~10s.
-    47	 */
-    48	export async function cancelAndConfirm(
-    49	  mexc: Pick<CexApi, 'getOrder' | 'cancelOrder'>,
-    50	  symbol: string,
-    51	  orderId: string,
-    52	  sleep: (ms: number) => Promise<void>,
-    53	): Promise<Order> {
-    54	  let last = '?';
-    55	  for (let i = 0; i < 6; i++) {
-    56	    const o = await mexc.getOrder(symbol, orderId).catch(() => null);
-    57	    if (o) {
-    58	      if (FINAL_ORDER.has(o.status)) return o;
-    59	      last = o.status;
-    60	    }
-    61	    await mexc.cancelOrder(symbol, orderId).catch((e) => log.warn(`cancel ${orderId}: ${errMsg(e)}`));
-    62	    await sleep(500 * (i + 1));
-    63	  }
-    64	  const o = await mexc.getOrder(symbol, orderId).catch(() => null);
-    65	  if (o && FINAL_ORDER.has(o.status)) return o;
-    66	  throw new OrderStillOpenError(orderId, o?.status ?? last);
-    67	}
-    68	
-    69	/**
-    70	 * Place an order; if the request is ambiguous (timeout / 5xx) look it up by client id
-    71	 * instead of assuming it was not placed. Throws UNKNOWN_ORDER_STATE if that is impossible.
-    72	 */
-    73	export async function placeSafely(
-    74	  mexc: Pick<CexApi, 'getOrderByClientId'>,
-    75	  symbol: string,
-    76	  cid: string,
-    77	  place: () => Promise<{ orderId: string }>,
-    78	  sleep: (ms: number) => Promise<void>,
-    79	): Promise<{ orderId: string }> {
-    80	  try {
-    81	    return await place();
-    82	  } catch (e) {
-    83	    if (!(e instanceof AmbiguousRequestError)) throw e; // clearly rejected: nothing was placed
-    84	    // MEXC may take a few seconds to index a just-placed order: look for ~10s (1, 2, 3, 4 s).
-    85	    // MEXC docs: after a 5xx "the execution status is UNKNOWN". So if it is still not found, the state is
-    86	    // UNKNOWN (critical pause, no unwind) - never "not placed", which could double the exposure.
-    87	    for (const wait of [1000, 2000, 3000, 4000]) {
-    88	      await sleep(wait);
-    89	      try {
-    90	        const o = await mexc.getOrderByClientId(symbol, cid);
-    91	        if (o) return { orderId: o.orderId }; // it WAS placed
-    92	      } catch {
-    93	        // lookup failed: try again
-    94	      }
-    95	    }
-    96	    throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
-    97	  }
-    98	}
-    99	import { decimalsOfStep, dhakaDay, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
-   100	
-   101	export const USDC_DECIMALS = 6;
-   102	export { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
-   103	import { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
-   104	const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
-   105	
-   106	// Narrow interfaces so tests can plug in fakes.
-   107	export interface CexApi {
-   108	  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
-   109	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
-   110	  getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
-   111	  myTrades?(symbol: string, orderId: string): Promise<{ price: string; qty: string; quoteQty: string; commission: string; commissionAsset: string }[]>;
-   112	  getOrder(symbol: string, orderId: string): Promise<Order>;
-   113	  cancelOrder(symbol: string, orderId: string): Promise<Order>;
-   114	}
-   115	export interface ChainApi {
-   116	  readonly address: string;
-   117	  gas(): Promise<GasInfo>;
-   118	  approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint>;
-   119	  approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
-   120	  simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
-   121	  send(
-   122	    tx: { to: string; data: string; value?: bigint },
-   123	    gasLimit: bigint,
-   124	    gas: GasInfo,
-   125	    timeoutSec: number,
-   126	    onSigned?: (hash: string, nonce: number) => void,
-   127	  ): Promise<TxResult>;
-   128	  /** Unresolved earlier tx (outcome unknown): no new trades until it is 'clear'. */
-   129	  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean; executedHash?: string; ok?: boolean }>;
-   130	  /** ok only if nothing is unresolved and our next nonce equals the chain's (no gap). */
-   131	  readyToSend?(): Promise<{ ok: boolean; reason?: string }>;
-   132	  readonly unresolved?: { nonce: number; hashes: string[]; since: number; unknown?: boolean } | null;
-   133	}
-   134	export interface Notifier {
-   135	  send(text: string): Promise<void>;
-   136	}
-   137	
-   138	export interface EngineDeps {
-   139	  cfg: Config;
-   140	  mexc: CexApi;
-   141	  chain: ChainApi;
-   142	  agg: Aggregator;
-   143	  db: Db;
-   144	  risk: Risk;
-   145	  tg: Notifier;
-   146	  book: (symbol: string) => Promise<Book>;
-   147	  /** Authoritative book (REST) used for the final check right before trading; defaults to `book`. */
-   148	  freshBook?: (symbol: string) => Promise<Book>;
-   149	  /** total=true: free + locked MEXC balances (for exact PnL); default free (for sizing). */
-   150	  balances: (total?: boolean) => Promise<Balances>;
-   151	  tokens: Token[];
-   152	  sleep?: (ms: number) => Promise<void>;
-   153	  /** Decimals of the DEX stable (read on-chain at startup; 6 for USDC, 18 for BSC USDT). */
-   154	  stableDecimals?: number;
-   155	}
-   156	
-   157	export interface Candidate {
-   158	  token: Token;
-   159	  opp: Opportunity;
-   160	  req: QuoteRequest;
-   161	  spender: string;
-   162	  approvalGas: bigint;
-   163	  tokenUsd: number;
-   164	  /** What gets logged to `opportunities` (decision filled in by tick). */
-   165	  row?: OpportunityRow;
-   166	  /** Hurdle for this candidate (base hurdle, skewed by inventory balance). */
-   167	  need?: number;
-   168	}
-   169	
-   170	const mid = (b: Book) => (b.bids[0][0] + b.asks[0][0]) / 2;
-   171	
-   172	export class Engine {
-   173	  /** Trade row being executed: every MEXC client id is recorded on it before the order is placed. */
-   174	  private currentTradeId: number | null = null;
-   175	  private lastNote = new Map<string, string>();
-   176	  private lastAlert = new Map<string, number>();
-   177	  private sleep: (ms: number) => Promise<void>;
-   178	  lastGasGwei = 0;
-   179	
-   180	  constructor(private d: EngineDeps) {
-   181	    this.sleep = d.sleep ?? realSleep;
-   182	  }
-   183	
-   184	  private get cfg() {
-   185	    return this.d.cfg;
-   186	  }
-   187	  private get live() {
-   188	    return this.cfg.mode === 'live';
-   189	  }
-   190	  private get taker() {
-   191	    return this.live ? this.d.chain.address : PAPER_TAKER;
-   192	  }
-   193	  /** USDT per 1 DEX stable (USDC). 1 on chains whose DEX stable is USDT. Refreshed every tick. */
-   194	  stableRate = 1;
-   195	  private get stableDec() {
-   196	    return this.d.stableDecimals ?? USDC_DECIMALS;
-   197	  }
-   198	  /** Per-symbol taker fee (exchangeInfo), never below the MEXC_TAKER_FEE override. */
-   199	  private fee(t: Token) {
-   200	    return takerFeeFor(t.rules, this.cfg.mexcTakerFee);
-   201	  }
-   202	  private costs(t: Token) {
-   203	    return {
-   204	      takerFee: this.fee(t),
-   205	      cexSlippageBps: this.cfg.cexSlippageBps,
-   206	      safetyMarginUsd: this.cfg.safetyMarginUsd,
-   207	      safetyMarginBps: this.cfg.safetyMarginBps,
-   208	      stableInUsdt: this.stableRate,
-   209	    };
-   210	  }
-   211	  private need(sizeUsd: number) {
-   212	    return threshold(sizeUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
-   213	  }
-   214	
-   215	  /**
-   216	   * USDC is not USDT (MEXC USDCUSDT was ~1.0021). Read the live rate; refuse to trade on a stale or
-   217	   * unreasonable one. Returns an error string, or null when the rate is usable.
-   218	   */
-   219	  async refreshStableRate(): Promise<string | null> {
-   220	    if (this.cfg.stableIsUsdt) {
-   221	      this.stableRate = 1;
-   222	      return null;
-   223	    }
-   224	    const b = await this.d.book('USDCUSDT');
-   225	    if (!b.bids.length || !b.asks.length) return 'USDCUSDT book empty';
-   226	    if (Date.now() - b.ts > this.cfg.stableRateMaxAgeMs) return `USDCUSDT book is ${Math.round((Date.now() - b.ts) / 1000)}s old`;
-   227	    const r = mid(b);
-   228	    if (!(r >= 0.99 && r <= 1.01)) return `USDC/USDT rate ${r} outside 0.99-1.01`;
-   229	    this.stableRate = r;
-   230	    return null;
-   231	  }
-   232	
-   233	  /** Log a status line only when it changes (avoids spamming every block). */
-   234	  private note(key: string, msg: string) {
-   235	    if (this.lastNote.get(key) !== msg) {
-   236	      this.lastNote.set(key, msg);
-   237	      log.info(msg);
-   238	    }
-   239	  }
-   240	
-   241	  async alertThrottled(key: string, text: string, everyMs = 6 * 3600_000) {
-   242	    const last = this.lastAlert.get(key) ?? 0;
-   243	    if (Date.now() - last < everyMs) return;
-   244	    this.lastAlert.set(key, Date.now());
-   245	    await this.d.tg.send(text);
-   246	  }
-   247	
-   248	  /** One scan; executes at most one trade. */
-   249	  async tick(): Promise<void> {
-   250	    const block = this.d.risk.blockReason();
-   251	    if (block) {
-   252	      this.logBlocked('paused', block);
-   253	      return this.note('block', `trading blocked: ${block}`);
-   254	    }
-   255	    this.note('block', 'trading enabled');
-   256	
-   257	    if (this.d.chain.checkUnresolved) {
-   258	      const pending = this.d.chain.unresolved;
-   259	      const u = await this.d.chain.checkUnresolved();
-   260	      if (u.state === 'clear' && pending) await this.reportResolved(pending, u);
-   261	      if (u.state === 'pending') {
-   262	        const p = this.d.chain.unresolved;
-   263	        if (p && Date.now() - p.since > 10 * 60_000) {
-   264	          await this.alertThrottled(
-   265	            'unresolved',
-   266	            `⏳ DEX tx at nonce ${p.nonce} still unresolved after ${Math.round((Date.now() - p.since) / 60_000)} min (${p.hashes.join(', ')}). ` +
-   267	              `No new trades. Send /cancelnonce to replace it with a cancel, or wait.`,
-   268	            3600_000,
-   269	          );
-   270	        }
-   271	        return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or dropped');
-   272	      }
-   273	    }
-   274	    this.note('unresolved', 'no unresolved tx');
-   275	
-   276	    const gas = await this.d.chain.gas();
-   277	    this.lastGasGwei = Number(gas.effective) / 1e9;
-   278	    if (this.lastGasGwei > this.cfg.maxGasGwei) {
-   279	      this.logBlocked('gas', `gas ${this.lastGasGwei.toFixed(2)} gwei > ${this.cfg.maxGasGwei}`);
-   280	      return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > MAX_GAS_GWEI ${this.cfg.maxGasGwei}, waiting`);
-   281	    }
-   282	    this.note('gas', 'gas ok');
-   283	
-   284	    const rateProblem = await this.refreshStableRate();
-   285	    if (rateProblem) return this.note('stable', `no trading: ${rateProblem}`);
-   286	    this.note('stable', 'stable rate ok');
-   287	    const ethUsd = mid(await this.d.book(this.cfg.chain.nativeMexcSymbol));
-   288	    const bal = await this.d.balances();
-   289	    const books = new Map<string, Book>();
-   290	    const prices: Record<string, number> = {};
-   291	    for (const t of this.d.tokens) {
-   292	      try {
-   293	        const b = await this.d.book(t.symbol);
-   294	        if (b.bids.length && b.asks.length) {
-   295	          books.set(t.symbol, b);
-   296	          prices[t.base] = mid(b);
-   297	        }
-   298	      } catch (e) {
-   299	        log.warn(`${t.symbol} book: ${errMsg(e)}`);
-   300	      }
-   301	    }
-   302	
-   303	    if (this.live) {
-   304	      for (const w of inventoryWarnings(bal, this.d.tokens, prices, this.cfg.minTradeUsd, this.cfg.minEthForGas)) {
-   305	        await this.alertThrottled(`inv-${w.key}`, `📦 Inventory: ${w.text}`);
-   306	      }
-   307	    }
-   308	
-   309	    this.inventoryHousekeeping(bal, prices);
-   310	    // BestOf compares aggregators after gas: tell it what gas costs in each output token right now.
-   311	    if (this.d.agg instanceof BestOf) this.d.agg.gasInOutput = this.gasValuer(gas, ethUsd, prices);
-   312	
-   313	    const rows: OpportunityRow[] = [];
-   314	    let best: Candidate | null = null;
-   315	    for (const t of this.d.tokens) {
-   316	      const b = books.get(t.symbol);
-   317	      if (!b) continue;
-   318	      if (!t.depositOk || !t.withdrawOk) {
-   319	        this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
-   320	        continue;
-   321	      }
-   322	      this.note(`susp-${t.base}`, `${t.base}: active`);
-   323	      try {
-   324	        for (const c of await this.candidates(t, b, bal, gas, ethUsd, rows)) {
-   325	          const need = c.need ?? this.need(c.opp.sizeUsd);
-   326	          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(need)})`);
-   327	          const passes = c.opp.net > need;
-   328	          if (c.row) {
-   329	            c.row.decision = passes ? 'trade' : 'below_hurdle';
-   330	            c.row.reason = passes ? null : `net ${c.opp.net.toFixed(4)} <= need ${need.toFixed(4)}`;
-   331	          }
-   332	          if (passes && (!best || c.opp.net > best.opp.net)) best = c;
-   333	        }
-   334	      } catch (e) {
-   335	        if (e instanceof QuoteBudgetError) rows.push(this.blankRow(t, 'rate_limited', errMsg(e)));
-   336	        else log.warn(`${t.base} quote: ${errMsg(e)}`);
-   337	      }
-   338	    }
-   339	    for (const r of rows) if (r.decision === 'trade' && best?.row !== r) r.reason = 'passed, but another candidate was better this tick';
-   340	    this.flushRows(rows);
-   341	    if (best) await this.execute(best, gas, ethUsd);
-   342	  }
-   343	
-   344	  // ---------- opportunity logging ----------
-   345	  private lastBlockedLog = new Map<string, number>();
-   346	
-   347	  private blankRow(t: Token, decision: OpportunityRow['decision'], reason: string | null, direction = '-'): OpportunityRow {
-   348	    return {
-   349	      ts: Date.now(), chain: this.cfg.chain.name, token: t.base, direction, size_usd: null, mexc_bid: null, mexc_ask: null,
-   350	      book_age_ms: null, aggregator: null, dex_out: null, dex_min_out: null, usdc_usdt: this.stableRate, gross_bps: null,
-   351	      fee_bps: this.fee(t) * 10_000, gas_usd: null, net_usd: null, hurdle_usd: null, decision, reason,
-   352	    };
-   353	  }
-   354	
-   355	  /** Paused / gas too high: one row per token, at most once a minute (so the report shows WHY nothing traded). */
-   356	  private logBlocked(decision: 'paused' | 'gas', reason: string) {
-   357	    const last = this.lastBlockedLog.get(decision) ?? 0;
-   358	    if (Date.now() - last < 60_000) return;
-   359	    this.lastBlockedLog.set(decision, Date.now());
-   360	    this.flushRows(this.d.tokens.map((t) => this.blankRow(t, decision, reason)));
-   361	  }
-   362	
-   363	  private flushRows(rows: OpportunityRow[]) {
-   364	    try {
-   365	      this.d.db.insertOpportunities(rows);
-   366	    } catch (e) {
-   367	      log.warn(`opportunity log: ${errMsg(e)}`);
-   368	    }
-   369	  }
-   370	
-   371	  /** Gas units -> output-token base units, so BestOf can compare aggregators after gas. */
-   372	  private gasValuer(gas: GasInfo, ethUsd: number, prices: Record<string, number>) {
-   373	    return (units: bigint, buyToken: string): bigint => {
-   374	      const usdCost = gasUsd(units, gas.effective, ethUsd);
-   375	      if (buyToken.toLowerCase() === this.cfg.usdc) return toUnits(usdCost / this.stableRate, this.stableDec);
-   376	      const t = this.d.tokens.find((x) => x.address === buyToken.toLowerCase());
-   377	      const px = t ? prices[t.base] : undefined;
-   378	      return t && px ? toUnits(usdCost / px, t.decimals) : 0n;
-   379	    };
-   380	  }
-   381	
-   382	  // ---------- inventory (item 5) ----------
-   383	  /** Wallet share of a token's inventory (0..1), or null if there is none. */
-   384	  private walletShare(t: Token, bal: Balances, px: number, dWallet = 0, dMexc = 0): number | null {
-   385	    const w = Math.max(0, (bal.walletToken[t.base] ?? 0) * px + dWallet);
-   386	    const m = Math.max(0, (bal.mexc[t.base] ?? 0) * px + dMexc);
-   387	    return w + m > 0 ? w / (w + m) : null;
-   388	  }
-   389	
-   390	  /**
-   391	   * Skewed hurdle: trades that push a token's inventory further from 50/50 wallet/MEXC need more profit,
-   392	   * trades that restore it need less (x0.8), never below the plain cost-and-safety hurdle's floor.
-   393	   */
-   394	  needFor(t: Token, direction: 'DEX_BUY' | 'CEX_BUY', sizeUsd: number, bal: Balances, px: number): number {
-   395	    const base = this.need(sizeUsd);
-   396	    if (!this.live) return base; // paper balances are synthetic
-   397	    const before = this.walletShare(t, bal, px);
-   398	    const after = direction === 'DEX_BUY' ? this.walletShare(t, bal, px, sizeUsd, -sizeUsd) : this.walletShare(t, bal, px, -sizeUsd, sizeUsd);
-   399	    if (before === null || after === null) return base;
-   400	    const worsening = Math.abs(after - 0.5) - Math.abs(before - 0.5);
-   401	    if (worsening > 0) return base * (1 + this.cfg.skewK * worsening);
-   402	    if (worsening < 0) return Math.max(base * 0.8, this.cfg.minProfitUsd * 0.8);
-   403	    return base;
-   404	  }
-   405	
-   406	  /** An unresolved tx got its outcome: tell the human which tx won, and note it on the trade row. */
-   407	  private async reportResolved(
-   408	    p: { nonce: number; hashes: string[] },
-   409	    u: { executedHash?: string; ok?: boolean; dropped?: boolean },
-   410	  ) {
-   411	    const what = u.executedHash
-   412	      ? `${u.executedHash} was mined (${u.ok ? 'SUCCESS' : 'REVERTED'})${u.executedHash === p.hashes[0] ? ': the ORIGINAL tx executed' : ': the cancel won, the original did NOT execute'}`
-   413	      : u.dropped
-   414	        ? 'no RPC knows the tx any more: it was dropped and never executed'
-   415	        : 'the nonce was used, but no receipt was found for our hashes: check etherscan';
-   416	    await this.d.tg.send(`ℹ️ Nonce ${p.nonce} resolved: ${what}. You may now fix any position by hand, then /start confirm.`);
-   417	    const row = this.d.db.tradeByDexTx(p.hashes[0]);
-   418	    if (row) this.d.db.updateTrade(row.id, { note: `${row.note ?? ''}; dex resolved: ${what}` });
-   419	  }
-   420	
-   421	  /**
-   422	   * Indicative opportunities in both directions for one token, at several sizes:
-   423	   * the base size first; if its gross gap reaches MULTISIZE_TRIGGER of the hurdle, also 0.5x and 2x
-   424	   * (within inventory and MAX_TRADE_USD). The best net per direction is returned. Every evaluation is
-   425	   * added to `rows` (the opportunities log).
-   426	   */
-   427	  async candidates(t: Token, b: Book, bal: Balances, gas: GasInfo, ethUsd: number, rows: OpportunityRow[] = []): Promise<Candidate[]> {
-   428	    const out: Candidate[] = [];
-   429	    const bestBid = b.bids[0][0];
-   430	    const tokenUsd = mid(b);
-   431	    const cexTok = bal.mexc[t.base] ?? 0;
-   432	    const walTok = bal.walletToken[t.base] ?? 0;
-   433	    const base = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
-   434	
-   435	    const capA = Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99);
-   436	    const capB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
-   437	
-   438	    for (const [dir, cap] of [['DEX_BUY', capA], ['CEX_BUY', capB]] as const) {
-   439	      if (cap < this.cfg.minTradeUsd) {
-   440	        rows.push(this.blankRow(t, 'inventory', `max size ${usd(cap)} < MIN_TRADE_USD (not enough ${dir === 'DEX_BUY' ? 'wallet stable / MEXC token' : 'MEXC USDT / wallet token'})`, dir));
-   441	        continue;
-   442	      }
-   443	      const sizes = [Math.max(this.cfg.minTradeUsd, Math.min(base, cap))];
-   444	      const results: Candidate[] = [];
-   445	      const first = await this.evalAt(t, b, bal, gas, ethUsd, dir, sizes[0], rows);
-   446	      if (first) results.push(first);
-   447	      // Multi-size: only worth the extra quotes when the base size is already close to the hurdle.
-   448	      if (first && first.opp.grossUsd >= this.cfg.multiSizeTrigger * (first.need ?? this.need(first.opp.sizeUsd))) {
-   449	        for (const k of [0.5, 2]) {
-   450	          const size = Math.floor(Math.min(sizes[0] * k, cap) * 100) / 100;
-   451	          if (size < this.cfg.minTradeUsd || sizes.includes(size)) continue;
-   452	          sizes.push(size);
-   453	          const c = await this.evalAt(t, b, bal, gas, ethUsd, dir, size, rows);
-   454	          if (c) results.push(c);
-   455	        }
-   456	      }
-   457	      if (results.length) out.push(results.reduce((x, y) => (y.opp.net > x.opp.net ? y : x)));
-   458	    }
-   459	    return out;
-   460	  }
-   461	
-   462	  /** One direction at one size: DEX quote + MEXC book walk -> Candidate (or null), plus its opportunities row. */
-   463	  private async evalAt(
-   464	    t: Token,
-   465	    b: Book,
-   466	    bal: Balances,
-   467	    gas: GasInfo,
-   468	    ethUsd: number,
-   469	    dir: 'DEX_BUY' | 'CEX_BUY',
-   470	    size: number,
-   471	    rows: OpportunityRow[],
-   472	  ): Promise<Candidate | null> {
-   473	    const slippageBps = this.cfg.dexSlippageBps;
-   474	    const tokenUsd = mid(b);
-   475	    const row = this.blankRow(t, 'below_hurdle', null, dir);
-   476	    Object.assign(row, { size_usd: size, mexc_bid: b.bids[0][0], mexc_ask: b.asks[0][0], book_age_ms: Date.now() - b.ts });
-   477	    rows.push(row);
-   478	
-   479	    let c: Candidate | null = null;
-   480	    if (dir === 'DEX_BUY') {
-   481	      // USDC -> token on DEX, token -> USDT on MEXC.
-   482	      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(size, this.stableDec), taker: this.taker, slippageBps };
-   483	      const q = await this.d.agg.price(req);
-   484	      const spender = this.spenderOf(q);
-   485	      const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
-   486	      const opp = evaluateDexBuy({
-   487	        sizeUsd: size,
-   488	        tokensOut: toFloat(q.buyAmount, t.decimals),
-   489	        tokensMin: toFloat(q.minBuyAmount, t.decimals),
-   490	        bids: b.bids,
-   491	        qtyStep: t.qtyStep,
-   492	        gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
-   493	        costs: this.costs(t),
-   494	      });
-   495	      Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, t.decimals), dex_min_out: toFloat(q.minBuyAmount, t.decimals) });
-   496	      if (!opp) {
-   497	        row.decision = 'inventory';
-   498	        row.reason = 'MEXC book too thin for this size';
-   499	        return null;
-   500	      }
-   501	      const problem = orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
-   502	      if (problem || opp.cexQty > (bal.mexc[t.base] ?? 0)) {
-   503	        row.decision = problem ? 'rule' : 'inventory';
-   504	        row.reason = problem ?? 'not enough token on MEXC';
-   505	        this.fillRow(row, opp, size);
-   506	        return null;
-   507	      }
-   508	      c = { token: t, opp, req, spender, approvalGas, tokenUsd };
-   509	    } else {
-   510	      // USDT -> token on MEXC, token -> USDC on DEX.
-   511	      const plan = planCexBuy({ sizeUsd: size, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.fee(t) });
-   512	      if (!plan || plan.tokensToSell > (bal.walletToken[t.base] ?? 0)) {
-   513	        row.decision = 'inventory';
-   514	        row.reason = plan ? 'not enough token in the wallet' : 'MEXC book too thin for this size';
-   515	        return null;
-   516	      }
-   517	      const req = { sellToken: t.address, buyToken: this.cfg.usdc, sellAmount: toUnits(plan.tokensToSell, t.decimals), taker: this.taker, slippageBps };
-   518	      const q = await this.d.agg.price(req);
-   519	      const spender = this.spenderOf(q);
-   520	      const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
-   521	      const opp = evaluateCexBuy({
-   522	        plan,
-   523	        usdcOut: toFloat(q.buyAmount, this.stableDec),
-   524	        usdcMin: toFloat(q.minBuyAmount, this.stableDec),
-   525	        gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
-   526	        costs: this.costs(t),
-   527	      });
-   528	      Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, this.stableDec), dex_min_out: toFloat(q.minBuyAmount, this.stableDec) });
-   529	      const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
-   530	      if (problem) {
-   531	        Object.assign(row, { decision: 'rule', reason: problem });
-   532	        this.fillRow(row, opp, size);
-   533	        return null;
-   534	      }
-   535	      c = { token: t, opp, req, spender, approvalGas, tokenUsd };
-   536	    }
-   537	    c.need = this.needFor(t, dir, size, bal, tokenUsd);
-   538	    c.row = row;
-   539	    this.fillRow(row, c.opp, size, c.need);
-   540	    return c;
-   541	  }
-   542	
-   543	  private fillRow(row: OpportunityRow, opp: Opportunity, size: number, need?: number) {
-   544	    Object.assign(row, {
-   545	      gross_bps: (opp.grossUsd / size) * 10_000,
-   546	      gas_usd: opp.gasUsd,
-   547	      net_usd: opp.net,
-   548	      hurdle_usd: need ?? this.need(size),
-   549	    });
-   550	  }
-   551	
-   552	  /** Hourly inventory snapshot + per-side warnings + rebalance tickets (live only). */
-   553	  private lastSnapshot = 0;
-   554	  private lowSince = new Map<string, number>();
-   555	  private inventoryHousekeeping(bal: Balances, prices: Record<string, number>) {
-   556	    if (!this.live) return;
-   557	    const now = Date.now();
-   558	    if (now - this.lastSnapshot > 3600_000) {
-   559	      this.lastSnapshot = now;
-   560	      try {
-   561	        this.d.db.insertInventorySnapshot(
-   562	          this.d.tokens.filter((t) => prices[t.base]).map((t) => ({
-   563	            ts: now,
-   564	            token: t.base,
-   565	            wallet_usd: (bal.walletToken[t.base] ?? 0) * prices[t.base],
-   566	            mexc_usd: (bal.mexc[t.base] ?? 0) * prices[t.base],
-   567	          })),
-   568	        );
-   569	      } catch (e) {
-   570	        log.warn(`inventory snapshot: ${errMsg(e)}`);
-   571	      }
-   572	    }
-   573	    const trade = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
-   574	    for (const w of inventoryPlan(bal, this.d.tokens, prices, {
-   575	      tradeUsd: trade,
-   576	      perSideX: this.cfg.inventoryPerSideX,
-   577	      maxTokenSharePct: this.cfg.maxTokenSharePct,
-   578	      stableInUsdt: this.stableRate,
-   579	      walletAddress: this.d.chain.address,
-   580	    })) {
-   581	      if (w.kind === 'warning') {
-   582	        void this.alertThrottled(`invplan-${w.key}`, `📦 Inventory: ${w.text}`);
-   583	        continue;
-   584	      }
-   585	      // A side below 1x the trade size for REBALANCE_AFTER_MIN -> ONE ticket (the bot never moves funds).
-   586	      const key = `${w.token}:${w.side}`;
-   587	      if (!w.low) {
-   588	        this.lowSince.delete(key);
-   589	        this.d.db.closeTickets(w.token, w.side);
+     3	import { explorerTxUrl } from './chains.js';
+     4	import { BestOf, QuoteBudgetError, type Aggregator, type Quote, type QuoteRequest } from './dex/aggregator.js';
+     5	import type { GasInfo, TxResult } from './dex/chain.js';
+     6	import type { Book, Order, Side } from './mexc/rest.js';
+     7	import type { Db, OpportunityRow, TradeStatus } from './db.js';
+     8	import type { Risk, RiskEvent } from './risk.js';
+     9	import type { Token } from './watchlist.js';
+    10	import { type Balances, inventoryPlan, inventoryWarnings, portfolioUsd } from './inventory.js';
+    11	import {
+    12	  type Opportunity,
+    13	  evaluateCexBuy,
+    14	  evaluateDexBuy,
+    15	  gasUsd,
+    16	  planCexBuy,
+    17	  planCexBuyQty,
+    18	  threshold,
+    19	  unwindPlan,
+    20	} from './pricing.js';
+    21	import { log, errMsg } from './log.js';
+    22	import { AmbiguousRequestError } from './mexc/rest.js';
+    23	import { bandProblem, closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
+    24	import crypto from 'node:crypto';
+    25	
+    26	/** A close/unwind that only partly filled: `remaining` is what is still open. */
+    27	export class PartialCloseError extends Error {
+    28	  constructor(msg: string, readonly remaining: number) {
+    29	    super(msg);
+    30	  }
+    31	}
+    32	
+    33	/** Unique id we give MEXC orders, so an order can be found even if the request timed out. */
+    34	export const clientId = (tag: string) => `arb${tag}${crypto.randomUUID().replace(/-/g, '')}`.slice(0, 32);
+    35	
+    36	const FINAL_ORDER = new Set(['FILLED', 'CANCELED', 'PARTIALLY_CANCELED']);
+    37	
+    38	/** A cancel could not be confirmed: the order may still be live on MEXC. Never place a second close for it. */
+    39	export class OrderStillOpenError extends Error {
+    40	  constructor(readonly orderId: string, status: string) {
+    41	    super(`MEXC order ${orderId} still ${status} after cancel attempts: it may still fill`);
+    42	  }
+    43	}
+    44	
+    45	/**
+    46	 * Cancel an order and keep checking until MEXC reports a final status (FILLED / CANCELED / PARTIALLY_CANCELED).
+    47	 * Throws OrderStillOpenError if that cannot be confirmed within ~10s.
+    48	 */
+    49	export async function cancelAndConfirm(
+    50	  mexc: Pick<CexApi, 'getOrder' | 'cancelOrder'>,
+    51	  symbol: string,
+    52	  orderId: string,
+    53	  sleep: (ms: number) => Promise<void>,
+    54	): Promise<Order> {
+    55	  let last = '?';
+    56	  for (let i = 0; i < 6; i++) {
+    57	    const o = await mexc.getOrder(symbol, orderId).catch(() => null);
+    58	    if (o) {
+    59	      if (FINAL_ORDER.has(o.status)) return o;
+    60	      last = o.status;
+    61	    }
+    62	    await mexc.cancelOrder(symbol, orderId).catch((e) => log.warn(`cancel ${orderId}: ${errMsg(e)}`));
+    63	    await sleep(500 * (i + 1));
+    64	  }
+    65	  const o = await mexc.getOrder(symbol, orderId).catch(() => null);
+    66	  if (o && FINAL_ORDER.has(o.status)) return o;
+    67	  throw new OrderStillOpenError(orderId, o?.status ?? last);
+    68	}
+    69	
+    70	/**
+    71	 * Place an order; if the request is ambiguous (timeout / 5xx) look it up by client id
+    72	 * instead of assuming it was not placed. Throws UNKNOWN_ORDER_STATE if that is impossible.
+    73	 */
+    74	export async function placeSafely(
+    75	  mexc: Pick<CexApi, 'getOrderByClientId'>,
+    76	  symbol: string,
+    77	  cid: string,
+    78	  place: () => Promise<{ orderId: string }>,
+    79	  sleep: (ms: number) => Promise<void>,
+    80	): Promise<{ orderId: string }> {
+    81	  try {
+    82	    return await place();
+    83	  } catch (e) {
+    84	    if (!(e instanceof AmbiguousRequestError)) throw e; // clearly rejected: nothing was placed
+    85	    // MEXC may take a few seconds to index a just-placed order: look for ~10s (1, 2, 3, 4 s).
+    86	    // MEXC docs: after a 5xx "the execution status is UNKNOWN". So if it is still not found, the state is
+    87	    // UNKNOWN (critical pause, no unwind) - never "not placed", which could double the exposure.
+    88	    for (const wait of [1000, 2000, 3000, 4000]) {
+    89	      await sleep(wait);
+    90	      try {
+    91	        const o = await mexc.getOrderByClientId(symbol, cid);
+    92	        if (o) return { orderId: o.orderId }; // it WAS placed
+    93	      } catch {
+    94	        // lookup failed: try again
+    95	      }
+    96	    }
+    97	    throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
+    98	  }
+    99	}
+   100	import { decimalsOfStep, dhakaDay, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+   101	
+   102	export const USDC_DECIMALS = 6;
+   103	export { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
+   104	import { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
+   105	const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
+   106	
+   107	// Narrow interfaces so tests can plug in fakes.
+   108	export interface CexApi {
+   109	  limitOrder(symbol: string, side: Side, quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
+   110	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
+   111	  getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
+   112	  myTrades?(symbol: string, orderId: string): Promise<{ price: string; qty: string; quoteQty: string; commission: string; commissionAsset: string }[]>;
+   113	  getOrder(symbol: string, orderId: string): Promise<Order>;
+   114	  cancelOrder(symbol: string, orderId: string): Promise<Order>;
+   115	}
+   116	export interface ChainApi {
+   117	  readonly address: string;
+   118	  gas(): Promise<GasInfo>;
+   119	  approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint>;
+   120	  approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
+   121	  simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
+   122	  send(
+   123	    tx: { to: string; data: string; value?: bigint },
+   124	    gasLimit: bigint,
+   125	    gas: GasInfo,
+   126	    timeoutSec: number,
+   127	    onSigned?: (hash: string, nonce: number) => void,
+   128	  ): Promise<TxResult>;
+   129	  /** Unresolved earlier tx (outcome unknown): no new trades until it is 'clear'. */
+   130	  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean; executedHash?: string; ok?: boolean }>;
+   131	  /** ok only if nothing is unresolved and our next nonce equals the chain's (no gap). */
+   132	  readyToSend?(): Promise<{ ok: boolean; reason?: string }>;
+   133	  readonly unresolved?: { nonce: number; hashes: string[]; since: number; unknown?: boolean } | null;
+   134	}
+   135	export interface Notifier {
+   136	  send(text: string): Promise<void>;
+   137	}
+   138	
+   139	export interface EngineDeps {
+   140	  cfg: Config;
+   141	  mexc: CexApi;
+   142	  chain: ChainApi;
+   143	  agg: Aggregator;
+   144	  db: Db;
+   145	  risk: Risk;
+   146	  tg: Notifier;
+   147	  book: (symbol: string) => Promise<Book>;
+   148	  /** Authoritative book (REST) used for the final check right before trading; defaults to `book`. */
+   149	  freshBook?: (symbol: string) => Promise<Book>;
+   150	  /** total=true: free + locked MEXC balances (for exact PnL); default free (for sizing). */
+   151	  balances: (total?: boolean) => Promise<Balances>;
+   152	  tokens: Token[];
+   153	  sleep?: (ms: number) => Promise<void>;
+   154	  /** Decimals of the DEX stable (read on-chain at startup; 6 for USDC, 18 for BSC USDT). */
+   155	  stableDecimals?: number;
+   156	}
+   157	
+   158	export interface Candidate {
+   159	  token: Token;
+   160	  opp: Opportunity;
+   161	  req: QuoteRequest;
+   162	  spender: string;
+   163	  approvalGas: bigint;
+   164	  tokenUsd: number;
+   165	  /** What gets logged to `opportunities` (decision filled in by tick). */
+   166	  row?: OpportunityRow;
+   167	  /** Hurdle for this candidate (base hurdle, skewed by inventory balance). */
+   168	  need?: number;
+   169	}
+   170	
+   171	const mid = (b: Book) => (b.bids[0][0] + b.asks[0][0]) / 2;
+   172	
+   173	export class Engine {
+   174	  /** Trade row being executed: every MEXC client id is recorded on it before the order is placed. */
+   175	  private currentTradeId: number | null = null;
+   176	  private lastNote = new Map<string, string>();
+   177	  private lastAlert = new Map<string, number>();
+   178	  private sleep: (ms: number) => Promise<void>;
+   179	  lastGasGwei = 0;
+   180	
+   181	  constructor(private d: EngineDeps) {
+   182	    this.sleep = d.sleep ?? realSleep;
+   183	  }
+   184	
+   185	  private get cfg() {
+   186	    return this.d.cfg;
+   187	  }
+   188	  private get live() {
+   189	    return this.cfg.mode === 'live';
+   190	  }
+   191	  private get taker() {
+   192	    return this.live ? this.d.chain.address : PAPER_TAKER;
+   193	  }
+   194	  /** USDT per 1 DEX stable (USDC). 1 on chains whose DEX stable is USDT. Refreshed every tick. */
+   195	  stableRate = 1;
+   196	  private get stableDec() {
+   197	    return this.d.stableDecimals ?? USDC_DECIMALS;
+   198	  }
+   199	  /** Per-symbol taker fee (exchangeInfo), never below the MEXC_TAKER_FEE override. */
+   200	  private fee(t: Token) {
+   201	    return takerFeeFor(t.rules, this.cfg.mexcTakerFee);
+   202	  }
+   203	  private costs(t: Token) {
+   204	    return {
+   205	      takerFee: this.fee(t),
+   206	      cexSlippageBps: this.cfg.cexSlippageBps,
+   207	      safetyMarginUsd: this.cfg.safetyMarginUsd,
+   208	      safetyMarginBps: this.cfg.safetyMarginBps,
+   209	      stableInUsdt: this.stableRate,
+   210	    };
+   211	  }
+   212	  private need(sizeUsd: number) {
+   213	    return threshold(sizeUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
+   214	  }
+   215	
+   216	  /**
+   217	   * USDC is not USDT (MEXC USDCUSDT was ~1.0021). Read the live rate; refuse to trade on a stale or
+   218	   * unreasonable one. Returns an error string, or null when the rate is usable.
+   219	   */
+   220	  async refreshStableRate(): Promise<string | null> {
+   221	    if (this.cfg.stableIsUsdt) {
+   222	      this.stableRate = 1;
+   223	      return null;
+   224	    }
+   225	    const b = await this.d.book('USDCUSDT');
+   226	    if (!b.bids.length || !b.asks.length) return 'USDCUSDT book empty';
+   227	    if (Date.now() - b.ts > this.cfg.stableRateMaxAgeMs) return `USDCUSDT book is ${Math.round((Date.now() - b.ts) / 1000)}s old`;
+   228	    const r = mid(b);
+   229	    if (!(r >= 0.99 && r <= 1.01)) return `USDC/USDT rate ${r} outside 0.99-1.01`;
+   230	    this.stableRate = r;
+   231	    return null;
+   232	  }
+   233	
+   234	  /** Log a status line only when it changes (avoids spamming every block). */
+   235	  private note(key: string, msg: string) {
+   236	    if (this.lastNote.get(key) !== msg) {
+   237	      this.lastNote.set(key, msg);
+   238	      log.info(msg);
+   239	    }
+   240	  }
+   241	
+   242	  async alertThrottled(key: string, text: string, everyMs = 6 * 3600_000) {
+   243	    const last = this.lastAlert.get(key) ?? 0;
+   244	    if (Date.now() - last < everyMs) return;
+   245	    this.lastAlert.set(key, Date.now());
+   246	    await this.d.tg.send(text);
+   247	  }
+   248	
+   249	  /** One scan; executes at most one trade. */
+   250	  async tick(): Promise<void> {
+   251	    const block = this.d.risk.blockReason();
+   252	    if (block) {
+   253	      this.logBlocked('paused', block);
+   254	      return this.note('block', `trading blocked: ${block}`);
+   255	    }
+   256	    this.note('block', 'trading enabled');
+   257	
+   258	    if (this.d.chain.checkUnresolved) {
+   259	      const pending = this.d.chain.unresolved;
+   260	      const u = await this.d.chain.checkUnresolved();
+   261	      if (u.state === 'clear' && pending) await this.reportResolved(pending, u);
+   262	      if (u.state === 'pending') {
+   263	        const p = this.d.chain.unresolved;
+   264	        if (p && Date.now() - p.since > 10 * 60_000) {
+   265	          await this.alertThrottled(
+   266	            'unresolved',
+   267	            `⏳ DEX tx at nonce ${p.nonce} still unresolved after ${Math.round((Date.now() - p.since) / 60_000)} min (${p.hashes.join(', ')}). ` +
+   268	              `No new trades. Send /cancelnonce to replace it with a cancel, or wait.`,
+   269	            3600_000,
+   270	          );
+   271	        }
+   272	        return this.note('unresolved', 'an earlier DEX tx is still unresolved: no new trades until it is mined or dropped');
+   273	      }
+   274	    }
+   275	    this.note('unresolved', 'no unresolved tx');
+   276	
+   277	    const gas = await this.d.chain.gas();
+   278	    this.lastGasGwei = Number(gas.effective) / 1e9;
+   279	    if (this.lastGasGwei > this.cfg.maxGasGwei) {
+   280	      this.logBlocked('gas', `gas ${this.lastGasGwei.toFixed(2)} gwei > ${this.cfg.maxGasGwei}`);
+   281	      return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > MAX_GAS_GWEI ${this.cfg.maxGasGwei}, waiting`);
+   282	    }
+   283	    this.note('gas', 'gas ok');
+   284	
+   285	    const rateProblem = await this.refreshStableRate();
+   286	    if (rateProblem) return this.note('stable', `no trading: ${rateProblem}`);
+   287	    this.note('stable', 'stable rate ok');
+   288	    const ethUsd = mid(await this.d.book(this.cfg.chain.nativeMexcSymbol));
+   289	    const bal = await this.d.balances();
+   290	    const books = new Map<string, Book>();
+   291	    const prices: Record<string, number> = {};
+   292	    for (const t of this.d.tokens) {
+   293	      try {
+   294	        const b = await this.d.book(t.symbol);
+   295	        if (b.bids.length && b.asks.length) {
+   296	          books.set(t.symbol, b);
+   297	          prices[t.base] = mid(b);
+   298	        }
+   299	      } catch (e) {
+   300	        log.warn(`${t.symbol} book: ${errMsg(e)}`);
+   301	      }
+   302	    }
+   303	
+   304	    if (this.live) {
+   305	      for (const w of inventoryWarnings(bal, this.d.tokens, prices, this.cfg.minTradeUsd, this.cfg.minEthForGas)) {
+   306	        await this.alertThrottled(`inv-${w.key}`, `📦 Inventory: ${w.text}`);
+   307	      }
+   308	    }
+   309	
+   310	    this.inventoryHousekeeping(bal, prices);
+   311	    // BestOf compares aggregators after gas: tell it what gas costs in each output token right now.
+   312	    if (this.d.agg instanceof BestOf) this.d.agg.gasInOutput = this.gasValuer(gas, ethUsd, prices);
+   313	
+   314	    const rows: OpportunityRow[] = [];
+   315	    let best: Candidate | null = null;
+   316	    for (const t of this.d.tokens) {
+   317	      const b = books.get(t.symbol);
+   318	      if (!b) continue;
+   319	      if (!t.depositOk || !t.withdrawOk) {
+   320	        this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
+   321	        continue;
+   322	      }
+   323	      this.note(`susp-${t.base}`, `${t.base}: active`);
+   324	      try {
+   325	        for (const c of await this.candidates(t, b, bal, gas, ethUsd, rows)) {
+   326	          const need = c.need ?? this.need(c.opp.sizeUsd);
+   327	          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(need)})`);
+   328	          const passes = c.opp.net > need;
+   329	          if (c.row) {
+   330	            c.row.decision = passes ? 'trade' : 'below_hurdle';
+   331	            c.row.reason = passes ? null : `net ${c.opp.net.toFixed(4)} <= need ${need.toFixed(4)}`;
+   332	          }
+   333	          if (passes && (!best || c.opp.net > best.opp.net)) best = c;
+   334	        }
+   335	      } catch (e) {
+   336	        if (e instanceof QuoteBudgetError) rows.push(this.blankRow(t, 'rate_limited', errMsg(e)));
+   337	        else log.warn(`${t.base} quote: ${errMsg(e)}`);
+   338	      }
+   339	    }
+   340	    for (const r of rows) if (r.decision === 'trade' && best?.row !== r) r.reason = 'passed, but another candidate was better this tick';
+   341	    this.flushRows(rows);
+   342	    if (best) await this.execute(best, gas, ethUsd);
+   343	  }
+   344	
+   345	  // ---------- opportunity logging ----------
+   346	  private lastBlockedLog = new Map<string, number>();
+   347	
+   348	  private blankRow(t: Token, decision: OpportunityRow['decision'], reason: string | null, direction = '-'): OpportunityRow {
+   349	    return {
+   350	      ts: Date.now(), chain: this.cfg.chain.name, token: t.base, direction, size_usd: null, mexc_bid: null, mexc_ask: null,
+   351	      book_age_ms: null, aggregator: null, dex_out: null, dex_min_out: null, usdc_usdt: this.stableRate, gross_bps: null,
+   352	      fee_bps: this.fee(t) * 10_000, gas_usd: null, net_usd: null, hurdle_usd: null, decision, reason,
+   353	    };
+   354	  }
+   355	
+   356	  /** Paused / gas too high: one row per token, at most once a minute (so the report shows WHY nothing traded). */
+   357	  private logBlocked(decision: 'paused' | 'gas', reason: string) {
+   358	    const last = this.lastBlockedLog.get(decision) ?? 0;
+   359	    if (Date.now() - last < 60_000) return;
+   360	    this.lastBlockedLog.set(decision, Date.now());
+   361	    this.flushRows(this.d.tokens.map((t) => this.blankRow(t, decision, reason)));
+   362	  }
+   363	
+   364	  private flushRows(rows: OpportunityRow[]) {
+   365	    try {
+   366	      this.d.db.insertOpportunities(rows);
+   367	    } catch (e) {
+   368	      log.warn(`opportunity log: ${errMsg(e)}`);
+   369	    }
+   370	  }
+   371	
+   372	  /** Gas units -> output-token base units, so BestOf can compare aggregators after gas. */
+   373	  /** Gas estimate in USD, including the OP-stack L1 data fee reserve (0 on Ethereum/Arbitrum). */
+   374	  private estGasUsd(units: bigint, gas: GasInfo, ethUsd: number): number {
+   375	    return gasUsd(units, gas.effective, ethUsd) + this.cfg.l1FeeUsd;
+   376	  }
+   377	
+   378	  private gasValuer(gas: GasInfo, ethUsd: number, prices: Record<string, number>) {
+   379	    return (units: bigint, buyToken: string): bigint => {
+   380	      const usdCost = this.estGasUsd(units, gas, ethUsd);
+   381	      if (buyToken.toLowerCase() === this.cfg.usdc) return toUnits(usdCost / this.stableRate, this.stableDec);
+   382	      const t = this.d.tokens.find((x) => x.address === buyToken.toLowerCase());
+   383	      const px = t ? prices[t.base] : undefined;
+   384	      return t && px ? toUnits(usdCost / px, t.decimals) : 0n;
+   385	    };
+   386	  }
+   387	
+   388	  // ---------- inventory (item 5) ----------
+   389	  /** Wallet share of a token's inventory (0..1), or null if there is none. */
+   390	  private walletShare(t: Token, bal: Balances, px: number, dWallet = 0, dMexc = 0): number | null {
+   391	    const w = Math.max(0, (bal.walletToken[t.base] ?? 0) * px + dWallet);
+   392	    const m = Math.max(0, (bal.mexc[t.base] ?? 0) * px + dMexc);
+   393	    return w + m > 0 ? w / (w + m) : null;
+   394	  }
+   395	
+   396	  /**
+   397	   * Skewed hurdle: trades that push a token's inventory further from 50/50 wallet/MEXC need more profit,
+   398	   * trades that restore it need less (x0.8), never below the plain cost-and-safety hurdle's floor.
+   399	   */
+   400	  needFor(t: Token, direction: 'DEX_BUY' | 'CEX_BUY', sizeUsd: number, bal: Balances, px: number): number {
+   401	    const base = this.need(sizeUsd);
+   402	    if (!this.live) return base; // paper balances are synthetic
+   403	    const before = this.walletShare(t, bal, px);
+   404	    const after = direction === 'DEX_BUY' ? this.walletShare(t, bal, px, sizeUsd, -sizeUsd) : this.walletShare(t, bal, px, -sizeUsd, sizeUsd);
+   405	    if (before === null || after === null) return base;
+   406	    const worsening = Math.abs(after - 0.5) - Math.abs(before - 0.5);
+   407	    if (worsening > 0) return base * (1 + this.cfg.skewK * worsening);
+   408	    if (worsening < 0) return Math.max(base * 0.8, this.cfg.minProfitUsd * 0.8);
+   409	    return base;
+   410	  }
+   411	
+   412	  /** An unresolved tx got its outcome: tell the human which tx won, and note it on the trade row. */
+   413	  private async reportResolved(
+   414	    p: { nonce: number; hashes: string[] },
+   415	    u: { executedHash?: string; ok?: boolean; dropped?: boolean },
+   416	  ) {
+   417	    const what = u.executedHash
+   418	      ? `${u.executedHash} was mined (${u.ok ? 'SUCCESS' : 'REVERTED'})${u.executedHash === p.hashes[0] ? ': the ORIGINAL tx executed' : ': the cancel won, the original did NOT execute'}`
+   419	      : u.dropped
+   420	        ? 'no RPC knows the tx any more: it was dropped and never executed'
+   421	        : 'the nonce was used, but no receipt was found for our hashes: check etherscan';
+   422	    await this.d.tg.send(`ℹ️ Nonce ${p.nonce} resolved: ${what}. You may now fix any position by hand, then /start confirm.`);
+   423	    const row = this.d.db.tradeByDexTx(p.hashes[0]);
+   424	    if (row) this.d.db.updateTrade(row.id, { note: `${row.note ?? ''}; dex resolved: ${what}` });
+   425	  }
+   426	
+   427	  /**
+   428	   * Indicative opportunities in both directions for one token, at several sizes:
+   429	   * the base size first; if its gross gap reaches MULTISIZE_TRIGGER of the hurdle, also 0.5x and 2x
+   430	   * (within inventory and MAX_TRADE_USD). The best net per direction is returned. Every evaluation is
+   431	   * added to `rows` (the opportunities log).
+   432	   */
+   433	  async candidates(t: Token, b: Book, bal: Balances, gas: GasInfo, ethUsd: number, rows: OpportunityRow[] = []): Promise<Candidate[]> {
+   434	    const out: Candidate[] = [];
+   435	    const bestBid = b.bids[0][0];
+   436	    const tokenUsd = mid(b);
+   437	    const cexTok = bal.mexc[t.base] ?? 0;
+   438	    const walTok = bal.walletToken[t.base] ?? 0;
+   439	    const base = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
+   440	
+   441	    const capA = Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99);
+   442	    const capB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
+   443	
+   444	    for (const [dir, cap] of [['DEX_BUY', capA], ['CEX_BUY', capB]] as const) {
+   445	      if (cap < this.cfg.minTradeUsd) {
+   446	        rows.push(this.blankRow(t, 'inventory', `max size ${usd(cap)} < MIN_TRADE_USD (not enough ${dir === 'DEX_BUY' ? 'wallet stable / MEXC token' : 'MEXC USDT / wallet token'})`, dir));
+   447	        continue;
+   448	      }
+   449	      const sizes = [Math.max(this.cfg.minTradeUsd, Math.min(base, cap))];
+   450	      const results: Candidate[] = [];
+   451	      const first = await this.evalAt(t, b, bal, gas, ethUsd, dir, sizes[0], rows);
+   452	      if (first) results.push(first);
+   453	      // Multi-size: only worth the extra quotes when the base size is already close to the hurdle.
+   454	      if (first && first.opp.grossUsd >= this.cfg.multiSizeTrigger * (first.need ?? this.need(first.opp.sizeUsd))) {
+   455	        for (const k of [0.5, 2]) {
+   456	          const size = Math.floor(Math.min(sizes[0] * k, cap) * 100) / 100;
+   457	          if (size < this.cfg.minTradeUsd || sizes.includes(size)) continue;
+   458	          sizes.push(size);
+   459	          const c = await this.evalAt(t, b, bal, gas, ethUsd, dir, size, rows);
+   460	          if (c) results.push(c);
+   461	        }
+   462	      }
+   463	      if (results.length) out.push(results.reduce((x, y) => (y.opp.net > x.opp.net ? y : x)));
+   464	    }
+   465	    return out;
+   466	  }
+   467	
+   468	  /** One direction at one size: DEX quote + MEXC book walk -> Candidate (or null), plus its opportunities row. */
+   469	  private async evalAt(
+   470	    t: Token,
+   471	    b: Book,
+   472	    bal: Balances,
+   473	    gas: GasInfo,
+   474	    ethUsd: number,
+   475	    dir: 'DEX_BUY' | 'CEX_BUY',
+   476	    size: number,
+   477	    rows: OpportunityRow[],
+   478	  ): Promise<Candidate | null> {
+   479	    const slippageBps = this.cfg.dexSlippageBps;
+   480	    const tokenUsd = mid(b);
+   481	    const row = this.blankRow(t, 'below_hurdle', null, dir);
+   482	    Object.assign(row, { size_usd: size, mexc_bid: b.bids[0][0], mexc_ask: b.asks[0][0], book_age_ms: Date.now() - b.ts });
+   483	    rows.push(row);
+   484	
+   485	    let c: Candidate | null = null;
+   486	    if (dir === 'DEX_BUY') {
+   487	      // USDC -> token on DEX, token -> USDT on MEXC.
+   488	      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(size, this.stableDec), taker: this.taker, slippageBps };
+   489	      const q = await this.d.agg.price(req);
+   490	      const spender = this.spenderOf(q);
+   491	      const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
+   492	      const opp = evaluateDexBuy({
+   493	        sizeUsd: size,
+   494	        tokensOut: toFloat(q.buyAmount, t.decimals),
+   495	        tokensMin: toFloat(q.minBuyAmount, t.decimals),
+   496	        bids: b.bids,
+   497	        qtyStep: t.qtyStep,
+   498	        gasUsd: this.estGasUsd(q.gas + approvalGas, gas, ethUsd),
+   499	        costs: this.costs(t),
+   500	      });
+   501	      Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, t.decimals), dex_min_out: toFloat(q.minBuyAmount, t.decimals) });
+   502	      if (!opp) {
+   503	        row.decision = 'inventory';
+   504	        row.reason = 'MEXC book too thin for this size';
+   505	        return null;
+   506	      }
+   507	      const problem = orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
+   508	      if (problem || opp.cexQty > (bal.mexc[t.base] ?? 0)) {
+   509	        row.decision = problem ? 'rule' : 'inventory';
+   510	        row.reason = problem ?? 'not enough token on MEXC';
+   511	        this.fillRow(row, opp, size);
+   512	        return null;
+   513	      }
+   514	      c = { token: t, opp, req, spender, approvalGas, tokenUsd };
+   515	    } else {
+   516	      // USDT -> token on MEXC, token -> USDC on DEX.
+   517	      const plan = planCexBuy({ sizeUsd: size, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.fee(t) });
+   518	      if (!plan || plan.tokensToSell > (bal.walletToken[t.base] ?? 0)) {
+   519	        row.decision = 'inventory';
+   520	        row.reason = plan ? 'not enough token in the wallet' : 'MEXC book too thin for this size';
+   521	        return null;
+   522	      }
+   523	      const req = { sellToken: t.address, buyToken: this.cfg.usdc, sellAmount: toUnits(plan.tokensToSell, t.decimals), taker: this.taker, slippageBps };
+   524	      const q = await this.d.agg.price(req);
+   525	      const spender = this.spenderOf(q);
+   526	      const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
+   527	      const opp = evaluateCexBuy({
+   528	        plan,
+   529	        usdcOut: toFloat(q.buyAmount, this.stableDec),
+   530	        usdcMin: toFloat(q.minBuyAmount, this.stableDec),
+   531	        gasUsd: this.estGasUsd(q.gas + approvalGas, gas, ethUsd),
+   532	        costs: this.costs(t),
+   533	      });
+   534	      Object.assign(row, { aggregator: q.source ?? this.d.agg.name, dex_out: toFloat(q.buyAmount, this.stableDec), dex_min_out: toFloat(q.minBuyAmount, this.stableDec) });
+   535	      const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
+   536	      if (problem) {
+   537	        Object.assign(row, { decision: 'rule', reason: problem });
+   538	        this.fillRow(row, opp, size);
+   539	        return null;
+   540	      }
+   541	      c = { token: t, opp, req, spender, approvalGas, tokenUsd };
+   542	    }
+   543	    c.need = this.needFor(t, dir, size, bal, tokenUsd);
+   544	    c.row = row;
+   545	    this.fillRow(row, c.opp, size, c.need);
+   546	    return c;
+   547	  }
+   548	
+   549	  private fillRow(row: OpportunityRow, opp: Opportunity, size: number, need?: number) {
+   550	    Object.assign(row, {
+   551	      gross_bps: (opp.grossUsd / size) * 10_000,
+   552	      gas_usd: opp.gasUsd,
+   553	      net_usd: opp.net,
+   554	      hurdle_usd: need ?? this.need(size),
+   555	    });
+   556	  }
+   557	
+   558	  /** Hourly inventory snapshot + per-side warnings + rebalance tickets (live only). */
+   559	  private lastSnapshot = 0;
+   560	  private lowSince = new Map<string, number>();
+   561	  private inventoryHousekeeping(bal: Balances, prices: Record<string, number>) {
+   562	    if (!this.live) return;
+   563	    const now = Date.now();
+   564	    if (now - this.lastSnapshot > 3600_000) {
+   565	      this.lastSnapshot = now;
+   566	      try {
+   567	        this.d.db.insertInventorySnapshot(
+   568	          this.d.tokens.filter((t) => prices[t.base]).map((t) => ({
+   569	            ts: now,
+   570	            token: t.base,
+   571	            wallet_usd: (bal.walletToken[t.base] ?? 0) * prices[t.base],
+   572	            mexc_usd: (bal.mexc[t.base] ?? 0) * prices[t.base],
+   573	          })),
+   574	        );
+   575	      } catch (e) {
+   576	        log.warn(`inventory snapshot: ${errMsg(e)}`);
+   577	      }
+   578	    }
+   579	    const trade = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
+   580	    for (const w of inventoryPlan(bal, this.d.tokens, prices, {
+   581	      tradeUsd: trade,
+   582	      perSideX: this.cfg.inventoryPerSideX,
+   583	      maxTokenSharePct: this.cfg.maxTokenSharePct,
+   584	      stableInUsdt: this.stableRate,
+   585	      stableSymbol: this.cfg.chain.stable.symbol,
+   586	      walletAddress: this.d.chain.address,
+   587	    })) {
+   588	      if (w.kind === 'warning') {
+   589	        void this.alertThrottled(`invplan-${w.key}`, `📦 Inventory: ${w.text}`);
    590	        continue;
    591	      }
-   592	      const since = this.lowSince.get(key) ?? now;
-   593	      this.lowSince.set(key, since);
-   594	      const already = this.d.db.openTickets().some((x) => x.token === w.token && x.side === w.side);
-   595	      if (!already && now - since >= this.cfg.rebalanceAfterMin * 60_000) {
-   596	        this.d.db.openTicket({ token: w.token, side: w.side, asset: w.asset, amount: w.amount, direction: w.direction });
-   597	        void this.d.tg.send(`🎫 Rebalance ticket: ${w.direction}: ${w.amount.toFixed(4)} ${w.asset}. (${w.side} side of ${w.token} has been low for ${this.cfg.rebalanceAfterMin} min.) The bot never moves funds itself.`);
+   592	      // A side below 1x the trade size for REBALANCE_AFTER_MIN -> ONE ticket (the bot never moves funds).
+   593	      const key = `${w.token}:${w.side}`;
+   594	      if (!w.low) {
+   595	        this.lowSince.delete(key);
+   596	        this.d.db.closeTickets(w.token, w.side);
+   597	        continue;
    598	      }
-   599	    }
-   600	  }
-   601	
-   602	  private spenderOf(q: Quote): string {
-   603	    if (q.spender) return q.spender;
-   604	    if (this.d.agg.name === '0x') return ZEROX_ALLOWANCE_HOLDER;
-   605	    throw new Error('aggregator did not return a spender');
-   606	  }
-   607	
-   608	  /** Re-check with a firm quote + simulation, then trade both legs at once. */
-   609	  async execute(c: Candidate, gas: GasInfo, ethUsd: number): Promise<void> {
-   610	    const { token: t } = c;
-   611	    this.currentTradeId = null;
-   612	    if (!this.live) return this.recordPaper(c, gas, ethUsd);
-   613	
-   614	    let approvalCostWei = 0n;
-   615	    const skip = async (why: string) => {
-   616	      log.info(`${t.base} skip: ${why}`);
-   617	      if (approvalCostWei > 0n) {
-   618	        // The approval gas was really spent; book it so PnL and the loss limit stay honest.
-   619	        const g = (Number(approvalCostWei) / 1e18) * ethUsd;
-   620	        this.record(c, 'approval', { pnl: -g, gas: g, note: `approval, then skipped: ${why}` });
-   621	      }
-   622	    };
-   623	
-   624	    // 0) Worst case must fit in what is left of today's loss budget.
-   625	    const worst = (c.opp.sizeUsd * this.cfg.worstCaseLossPct) / 100 + c.opp.gasUsd;
-   626	    const budget = this.d.risk.remainingLossBudget();
-   627	    if (worst > budget) return skip(`worst case ${usd(worst)} > remaining daily loss budget ${usd(budget)}`);
-   628	
-   629	    // Snapshot BEFORE the approval, so approval gas is part of the measured PnL.
-   630	    const before = await this.d.balances(true);
-   631	
-   632	    // 1) Exact approval (never unlimited).
-   633	    if (c.approvalGas > 0n) {
-   634	      const r = await this.d.chain.approveExact(c.req.sellToken, c.spender, c.req.sellAmount, gas);
-   635	      approvalCostWei = r.gasCostWei;
-   636	      if (r.unknown) {
-   637	        const u = this.d.chain.unresolved;
-   638	        await skip('approval outcome unknown');
-   639	        await this.d.tg.send(
-   640	          `⚠️ ${t.base}: approval outcome UNKNOWN (nonce ${u?.nonce ?? '?'}, ${u?.hashes.join(', ') ?? r.hash}). No trade was made. ` +
-   641	            `New txs wait until it resolves; /cancelnonce replaces it.`,
-   642	        );
-   643	        return;
-   644	      }
-   645	      if (!r.ok) {
-   646	        await skip(`approval failed (${r.reason})`);
-   647	        await this.d.tg.send(`⚠️ Approval failed for ${t.base}: ${r.reason} ${r.hash ?? ''}`);
-   648	        return;
-   649	      }
-   650	    }
-   651	
-   652	    // 2) Firm quote + simulation (eth_call). Abort on any doubt.
-   653	    let firm: Quote;
-   654	    let gasEst: bigint;
-   655	    const tQuote = Date.now();
-   656	    try {
-   657	      firm = await this.d.agg.quote(c.req);
-   658	      if (!firm.tx) return skip('firm quote has no transaction');
-   659	      gasEst = await this.d.chain.simulate(firm.tx);
-   660	    } catch (e) {
-   661	      return skip(`simulation/quote failed: ${errMsg(e)}`);
-   662	    }
-   663	    const tx = firm.tx;
-   664	    const quoteMs = Date.now() - tQuote;
-   665	
-   666	    // 3) Re-evaluate with a fresh REST book, firm amounts and simulated gas.
-   667	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
-   668	    const g = gasUsd(gasEst, gas.effective, ethUsd);
-   669	    let opp: Opportunity | null;
-   670	    if (c.opp.direction === 'DEX_BUY') {
-   671	      opp = evaluateDexBuy({
-   672	        sizeUsd: c.opp.sizeUsd,
-   673	        tokensOut: toFloat(firm.buyAmount, t.decimals),
-   674	        tokensMin: toFloat(firm.minBuyAmount, t.decimals),
-   675	        bids: b.bids,
-   676	        qtyStep: t.qtyStep,
-   677	        gasUsd: g,
-   678	        costs: this.costs(t),
-   679	      });
-   680	    } else {
-   681	      // Same quantity as quoted on the DEX, priced against the fresh MEXC book.
-   682	      const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.fee(t));
-   683	      opp = plan
-   684	        ? evaluateCexBuy({
-   685	            plan,
-   686	            usdcOut: toFloat(firm.buyAmount, this.stableDec),
-   687	            usdcMin: toFloat(firm.minBuyAmount, this.stableDec),
-   688	            gasUsd: g,
-   689	            costs: this.costs(t),
-   690	          })
-   691	        : null;
-   692	    }
-   693	    const need = c.need ?? this.need(c.opp.sizeUsd); // the inventory-skewed hurdle from the scan
-   694	    if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
-   695	    // MEXC symbol rules on the FINAL numbers, before anything is sent: a rejected MEXC leg after a sent DEX tx = one-sided.
-   696	    const side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
-   697	    const problem = orderProblem(t.rules, side, opp.cexQty, opp.cexLimitPrice) ?? bandProblem(t.rules, side, opp.cexLimitPrice, mid(b));
-   698	    if (problem) return skip(`MEXC would reject the order: ${problem}`);
-   699	
-   700	    // The CEX leg must never fire if the DEX tx cannot get the next valid nonce.
-   701	    if (this.d.chain.readyToSend) {
-   702	      const ready = await this.d.chain.readyToSend();
-   703	      if (!ready.ok) return skip(`DEX side not ready to send: ${ready.reason}`);
-   704	    }
-   705	
-   706	    // 4) Persist the trade as 'executing' BEFORE anything is sent: if the bot dies now, startup sees it.
-   707	    const cid = clientId('t');
-   708	    const tradeId = this.record({ ...c, opp }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
-   709	    this.currentTradeId = tradeId;
-   710	    this.d.db.appendCid(tradeId, cid);
-   711	
-   712	    // Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
-   713	    // the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
-   714	    log.info(`${t.base} EXECUTE ${opp.direction} size ${usd(opp.sizeUsd)} expected ${usd(opp.net)}`);
-   715	    const tLegs = Date.now();
-   716	    let signMs: number | null = null;
-   717	    const [cexR, dexR] = await Promise.allSettled([
-   718	      this.cexLeg(t, opp, cid),
-   719	      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash, nonce) => {
-   720	        signMs = Date.now() - tLegs;
-   721	        this.d.db.updateTrade(tradeId, { dex_tx: hash, note: `client order id ${cid}; nonce ${nonce}` });
-   722	      }),
-   723	    ]);
-   724	
-   725	    const dex: TxResult = dexR.status === 'fulfilled' ? dexR.value : { ok: false, gasCostWei: 0n, reason: errMsg(dexR.reason) };
-   726	    let cexFilled = 0;
-   727	    let orderId: string | null = null;
-   728	    let cexUnknown = false;
-   729	    if (cexR.status === 'fulfilled') {
-   730	      cexFilled = cexR.value.filled;
-   731	      orderId = cexR.value.orderId;
-   732	    } else if (String((cexR.reason as Error)?.message ?? '').startsWith('UNKNOWN_ORDER_STATE')) {
-   733	      cexUnknown = true;
-   734	      this.d.risk.pause('MEXC order state unknown', true);
-   735	      await this.d.tg.send(`🚨 ${t.base}: MEXC order state unknown after placing. Trading PAUSED. Check MEXC manually.\n${errMsg(cexR.reason)}`);
-   736	    } else {
-   737	      log.warn(`${t.base} MEXC leg failed: ${errMsg(cexR.reason)}`);
-   738	    }
-   739	
-   740	    // 5) One-sided? Close the open position at market right away.
-   741	    let status: TradeStatus = 'ok';
-   742	    const notes: string[] = [];
-   743	    if (!dex.ok) notes.push(`DEX: ${dex.reason}`);
-   744	    if (dex.unknown) {
-   745	      // We cannot tell if the swap executed. Unwinding could DOUBLE the position. Stop and ask a human.
-   746	      this.d.risk.pause(`DEX tx unknown ${dex.hash}`, true);
-   747	      await this.d.tg.send(
-   748	        `🚨 ${t.base}: DEX tx ${dex.hash} outcome UNKNOWN (not mined, cancel not confirmed). MEXC filled ${cexFilled}/${opp.cexQty}.\n` +
-   749	          `NOT unwinding automatically. Trading PAUSED.\nDo NOT hedge by hand until the nonce is consumed - the bot will alert you. (/cancelnonce replaces it.)`,
-   750	      );
-   751	    }
-   752	    const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.fee(t), t.qtyStep);
-   753	    if (cexUnknown || dex.unknown) {
-   754	      status = 'one_sided';
-   755	      notes.push('pnl unknown'); // the measured balance change may not include the final outcome yet
-   756	    } else if (unwind) {
-   757	      status = 'one_sided';
-   758	      const qty = unwind.qty.toFixed(decimalsOfStep(t.qtyStep));
-   759	      try {
-   760	        const r = await this.closeAtMarket(t, unwind.side, qty);
-   761	        if (r.dust) {
-   762	          notes.push(`unwind ${unwind.side} ${qty} not sent: ${r.dust}`);
-   763	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base}: leftover ${unwind.side} ${qty} is below MEXC minimums (${r.dust}). Left as dust; fix inventory by hand.`);
-   764	        } else {
-   765	          notes.push(`unwind ${unwind.side} ${qty} (${r.orderId}, filled ${r.filled})`);
-   766	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base} ${opp.direction}\n${unwind.reason}\nClosed: MEXC ${unwind.side} ${r.filled} ${t.base}`);
-   767	        }
-   768	      } catch (e) {
-   769	        const remaining = e instanceof PartialCloseError ? e.remaining : Number(qty);
-   770	        if (e instanceof OrderStillOpenError) notes.push(`close order ${e.orderId} may still be live on MEXC: cancel it by hand`);
-   771	        this.d.risk.pause(`unwind failed for ${t.base}`, true);
-   772	        notes.push(`UNWIND FAILED: ${errMsg(e)}`);
-   773	        await this.d.tg.send(
-   774	          `🚨 ONE-SIDED FILL ${t.base} and the market close FAILED: ${errMsg(e)}\n` +
-   775	            `Still open: MEXC ${unwind.side} ${remaining} ${t.base} needed.\nTrading PAUSED. Close it manually, then /start confirm.`,
-   776	        );
-   777	      }
-   778	    } else if (!dex.ok) {
-   779	      status = 'dex_failed'; // nothing filled on either side
-   780	    }
-   781	
-   782	    // 6) Exact PnL = change in total value of everything the trade touched, at pre-trade prices.
-   783	    //    Orders are closed (filled/cancelled) by now; free + locked balances avoid counting held funds as lost.
-   784	    const { balances: after, stable } = await this.stableBalances(t, c.tokenUsd, ethUsd);
-   785	    if (!stable) notes.push('pnl approximate (balances still changing after 15 s)');
-   786	    const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd, this.stableRate) - portfolioUsd(before, t, c.tokenUsd, ethUsd, this.stableRate);
-   787	    const gasPaid = (Number(dex.gasCostWei + approvalCostWei) / 1e18) * ethUsd;
-   788	    this.d.db.updateTrade(tradeId, {
-   789	      status,
-   790	      pnl_usd: pnl,
-   791	      gas_usd: gasPaid,
-   792	      dex_tx: dex.hash ?? null,
-   793	      cex_order_id: orderId ?? cid,
-   794	      note: [`client order id ${cid}`, ...notes].join('; '),
-   795	    });
-   796	
-   797	    const dexIsBuy = opp.direction === 'DEX_BUY';
-   798	    await this.d.tg.send(
-   799	      [
-   800	        `${status === 'ok' ? '✅' : '⚠️'} LIVE ${t.base} ${opp.direction} [${status}]`,
-   801	        `Buy  ${dexIsBuy ? 'DEX ' : 'MEXC'} @ ${opp.buyPrice.toPrecision(6)}`,
-   802	        `Sell ${dexIsBuy ? 'MEXC' : 'DEX '} @ ${opp.sellPrice.toPrecision(6)}`,
-   803	        `Qty ${opp.cexQty} ${t.base} | size ${usd(opp.sizeUsd)}`,
-   804	        `MEXC fee ${usd(opp.cexFeeUsd)} | Gas ${usd(gasPaid)}`,
-   805	        `Expected ${usd(opp.net)} | Net PnL ${usd(pnl)}`,
-   806	        dex.hash ? `https://etherscan.io/tx/${dex.hash}` : '',
-   807	        notes.length ? `Notes: ${notes.join('; ')}` : '',
-   808	      ]
-   809	        .filter(Boolean)
-   810	        .join('\n'),
-   811	    );
-   812	    await this.recordLegs(tradeId, t, opp, firm, before, after, dex, cexR.status === 'fulfilled' ? cexR.value : null, {
-   813	      quoteMs,
-   814	      signMs,
-   815	    }).catch((e) => log.warn(`legs: ${errMsg(e)}`));
-   816	    this.currentTradeId = null;
-   817	    await this.handleRisk(this.d.risk.afterTrade(status));
-   818	  }
-   819	
-   820	  /** Read balances until two reads in a row give the same value (settled), for at most ~15 s. */
-   821	  private async stableBalances(t: Token, tokenUsd: number, ethUsd: number): Promise<{ balances: Balances; stable: boolean }> {
-   822	    let prev = await this.d.balances(true);
-   823	    for (let i = 0; i < 6; i++) {
-   824	      await this.sleep(2500);
-   825	      const cur = await this.d.balances(true);
-   826	      if (Math.abs(portfolioUsd(cur, t, tokenUsd, ethUsd, this.stableRate) - portfolioUsd(prev, t, tokenUsd, ethUsd, this.stableRate)) < 1e-6) return { balances: cur, stable: true };
-   827	      prev = cur;
-   828	    }
-   829	    return { balances: prev, stable: false };
-   830	  }
-   831	
-   832	  /**
-   833	   * Close a position on MEXC now with an aggressive LIMIT 2% through the book, for BOTH sides.
-   834	   * (No MEXC spot symbol offers IMMEDIATE_OR_CANCEL, and some have no MARKET; LIMIT works everywhere.)
-   835	   * Reads the order back and never assumes it filled. Below MEXC minimums -> returns `dust`, sends nothing.
-   836	   */
-   837	  async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number; dust?: string }> {
-   838	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
-   839	    // 2% through the book, but inside the symbol's PERCENT_PRICE_BY_SIDE band (some are 0.5% - 2%).
-   840	    const pxNum = closePrice({ ...t.rules, priceDecimals: t.priceDecimals }, side, { bid: b.bids[0][0], ask: b.asks[0][0] });
-   841	    const dust = orderProblem(t.rules, side, Number(qty), pxNum);
-   842	    if (dust) return { orderId: '', filled: 0, dust };
-   843	    const px = pxNum.toFixed(t.priceDecimals);
-   844	    const cid = clientId('c');
-   845	    if (this.currentTradeId !== null) this.d.db.appendCid(this.currentTradeId, cid); // before placing (crash safety)
-   846	    const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, side, qty, px, cid), this.sleep);
-   847	    await this.sleep(1500);
-   848	    let o = await this.d.mexc.getOrder(t.symbol, orderId);
-   849	    if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
-   850	    const filled = Number(o.executedQty);
-   851	    if (filled < Number(qty) * 0.999) {
-   852	      const remaining = Number((Number(qty) - filled).toFixed(decimalsOfStep(t.qtyStep)));
-   853	      throw new PartialCloseError(`close ${side} only filled ${filled}/${qty}, ${remaining} remaining`, remaining);
-   854	    }
-   855	    return { orderId, filled };
-   856	  }
-   857	
-   858	  /** MEXC marketable limit order; cancels any unfilled rest. Returns filled quantity. */
-   859	  async cexLeg(t: Token, opp: Opportunity, cid = clientId('t')): Promise<{ orderId: string; filled: number; ackMs: number }> {
-   860	    const side: Side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
-   861	    const qty = opp.cexQty.toFixed(decimalsOfStep(t.qtyStep));
-   862	    const f = 10 ** t.priceDecimals;
-   863	    const px = side === 'SELL' ? Math.floor(opp.cexLimitPrice * f) / f : Math.ceil(opp.cexLimitPrice * f) / f;
-   864	    const tPlace = Date.now();
-   865	    const { orderId } = await placeSafely(
-   866	      this.d.mexc,
-   867	      t.symbol,
-   868	      cid,
-   869	      () => this.d.mexc.limitOrder(t.symbol, side, qty, px.toFixed(t.priceDecimals), cid),
-   870	      this.sleep,
-   871	    );
-   872	    const ackMs = Date.now() - tPlace;
-   873	    log.info(`MEXC ${side} ${qty} ${t.symbol} @ ${px} id=${orderId}`);
-   874	    await this.sleep(1500);
-   875	
-   876	    const read = async (): Promise<Order> => {
-   877	      for (let i = 0; i < 3; i++) {
-   878	        try {
-   879	          return await this.d.mexc.getOrder(t.symbol, orderId);
-   880	        } catch (e) {
-   881	          log.warn(`getOrder retry: ${errMsg(e)}`);
-   882	          await this.sleep(1000);
-   883	        }
-   884	      }
-   885	      throw new Error(`UNKNOWN_ORDER_STATE ${orderId}`);
-   886	    };
-   887	    let o = await read();
-   888	    if (o.status !== 'FILLED') {
-   889	      try {
-   890	        o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
-   891	      } catch (e) {
-   892	        // The order may still fill later: its state is unknown, so no unwind may be based on it.
-   893	        if (e instanceof OrderStillOpenError) throw new Error(`UNKNOWN_ORDER_STATE ${e.message}`);
-   894	        throw e;
+   599	      const since = this.lowSince.get(key) ?? now;
+   600	      this.lowSince.set(key, since);
+   601	      const already = this.d.db.openTickets().some((x) => x.token === w.token && x.side === w.side);
+   602	      if (!already && now - since >= this.cfg.rebalanceAfterMin * 60_000) {
+   603	        this.d.db.openTicket({ token: w.token, side: w.side, asset: w.asset, amount: w.amount, direction: w.direction });
+   604	        void this.d.tg.send(`🎫 Rebalance ticket: ${w.direction}: ${w.amount.toFixed(4)} ${w.asset}. (${w.side} side of ${w.token} has been low for ${this.cfg.rebalanceAfterMin} min.) The bot never moves funds itself.`);
+   605	      }
+   606	    }
+   607	  }
+   608	
+   609	  private spenderOf(q: Quote): string {
+   610	    if (q.spender) return q.spender;
+   611	    if (this.d.agg.name === '0x') return ZEROX_ALLOWANCE_HOLDER;
+   612	    throw new Error('aggregator did not return a spender');
+   613	  }
+   614	
+   615	  /** Re-check with a firm quote + simulation, then trade both legs at once. */
+   616	  async execute(c: Candidate, gas: GasInfo, ethUsd: number): Promise<void> {
+   617	    const { token: t } = c;
+   618	    this.currentTradeId = null;
+   619	    if (!this.live) return this.recordPaper(c, gas, ethUsd);
+   620	
+   621	    let approvalCostWei = 0n;
+   622	    const skip = async (why: string) => {
+   623	      log.info(`${t.base} skip: ${why}`);
+   624	      if (approvalCostWei > 0n) {
+   625	        // The approval gas was really spent; book it so PnL and the loss limit stay honest.
+   626	        const g = (Number(approvalCostWei) / 1e18) * ethUsd;
+   627	        this.record(c, 'approval', { pnl: -g, gas: g, note: `approval, then skipped: ${why}` });
+   628	      }
+   629	    };
+   630	
+   631	    // 0) Worst case must fit in what is left of today's loss budget.
+   632	    const worst = (c.opp.sizeUsd * this.cfg.worstCaseLossPct) / 100 + c.opp.gasUsd;
+   633	    const budget = this.d.risk.remainingLossBudget();
+   634	    if (worst > budget) return skip(`worst case ${usd(worst)} > remaining daily loss budget ${usd(budget)}`);
+   635	
+   636	    // Snapshot BEFORE the approval, so approval gas is part of the measured PnL.
+   637	    const before = await this.d.balances(true);
+   638	
+   639	    // 1) Exact approval (never unlimited).
+   640	    if (c.approvalGas > 0n) {
+   641	      const r = await this.d.chain.approveExact(c.req.sellToken, c.spender, c.req.sellAmount, gas);
+   642	      approvalCostWei = r.gasCostWei;
+   643	      if (r.unknown) {
+   644	        const u = this.d.chain.unresolved;
+   645	        await skip('approval outcome unknown');
+   646	        await this.d.tg.send(
+   647	          `⚠️ ${t.base}: approval outcome UNKNOWN (nonce ${u?.nonce ?? '?'}, ${u?.hashes.join(', ') ?? r.hash}). No trade was made. ` +
+   648	            `New txs wait until it resolves; /cancelnonce replaces it.`,
+   649	        );
+   650	        return;
+   651	      }
+   652	      if (!r.ok) {
+   653	        await skip(`approval failed (${r.reason})`);
+   654	        await this.d.tg.send(`⚠️ Approval failed for ${t.base}: ${r.reason} ${r.hash ?? ''}`);
+   655	        return;
+   656	      }
+   657	    }
+   658	
+   659	    // 2) Firm quote + simulation (eth_call). Abort on any doubt.
+   660	    let firm: Quote;
+   661	    let gasEst: bigint;
+   662	    const tQuote = Date.now();
+   663	    try {
+   664	      firm = await this.d.agg.quote(c.req);
+   665	      if (!firm.tx) return skip('firm quote has no transaction');
+   666	      gasEst = await this.d.chain.simulate(firm.tx);
+   667	    } catch (e) {
+   668	      return skip(`simulation/quote failed: ${errMsg(e)}`);
+   669	    }
+   670	    const tx = firm.tx;
+   671	    const quoteMs = Date.now() - tQuote;
+   672	
+   673	    // 3) Re-evaluate with a fresh REST book, firm amounts and simulated gas.
+   674	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
+   675	    const g = this.estGasUsd(gasEst, gas, ethUsd);
+   676	    let opp: Opportunity | null;
+   677	    if (c.opp.direction === 'DEX_BUY') {
+   678	      opp = evaluateDexBuy({
+   679	        sizeUsd: c.opp.sizeUsd,
+   680	        tokensOut: toFloat(firm.buyAmount, t.decimals),
+   681	        tokensMin: toFloat(firm.minBuyAmount, t.decimals),
+   682	        bids: b.bids,
+   683	        qtyStep: t.qtyStep,
+   684	        gasUsd: g,
+   685	        costs: this.costs(t),
+   686	      });
+   687	    } else {
+   688	      // Same quantity as quoted on the DEX, priced against the fresh MEXC book.
+   689	      const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.fee(t));
+   690	      opp = plan
+   691	        ? evaluateCexBuy({
+   692	            plan,
+   693	            usdcOut: toFloat(firm.buyAmount, this.stableDec),
+   694	            usdcMin: toFloat(firm.minBuyAmount, this.stableDec),
+   695	            gasUsd: g,
+   696	            costs: this.costs(t),
+   697	          })
+   698	        : null;
+   699	    }
+   700	    const need = c.need ?? this.need(c.opp.sizeUsd); // the inventory-skewed hurdle from the scan
+   701	    if (!opp || opp.net <= need) return skip(`profit fell to ${usd(opp?.net ?? 0)} after firm quote (need ${usd(need)})`);
+   702	    // MEXC symbol rules on the FINAL numbers, before anything is sent: a rejected MEXC leg after a sent DEX tx = one-sided.
+   703	    const side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
+   704	    const problem = orderProblem(t.rules, side, opp.cexQty, opp.cexLimitPrice) ?? bandProblem(t.rules, side, opp.cexLimitPrice, mid(b));
+   705	    if (problem) return skip(`MEXC would reject the order: ${problem}`);
+   706	
+   707	    // The CEX leg must never fire if the DEX tx cannot get the next valid nonce.
+   708	    if (this.d.chain.readyToSend) {
+   709	      const ready = await this.d.chain.readyToSend();
+   710	      if (!ready.ok) return skip(`DEX side not ready to send: ${ready.reason}`);
+   711	    }
+   712	
+   713	    // 4) Persist the trade as 'executing' BEFORE anything is sent: if the bot dies now, startup sees it.
+   714	    // The approval gas was already spent (and sits inside the balance-based PnL below), so the stored
+   715	    // expectation must not promise it back: expected = re-checked net minus approval gas actually paid.
+   716	    // (Round-3 review, L3: otherwise realized-minus-expected shows a drag equal to the approval gas.)
+   717	    const expectedNet = opp.net - (Number(approvalCostWei) / 1e18) * ethUsd;
+   718	    const cid = clientId('t');
+   719	    const tradeId = this.record({ ...c, opp: { ...opp, net: expectedNet } }, 'executing', { pnl: 0, gas: 0, orderId: cid, note: `client order id ${cid}` });
+   720	    this.currentTradeId = tradeId;
+   721	    this.d.db.appendCid(tradeId, cid);
+   722	
+   723	    // Both legs are sent together. They do NOT complete together: the MEXC order fills in ~1.5s,
+   724	    // the DEX tx needs 12-60s to be mined. If the DEX side fails in between, step 5 unwinds on MEXC.
+   725	    log.info(`${t.base} EXECUTE ${opp.direction} size ${usd(opp.sizeUsd)} expected ${usd(opp.net)}`);
+   726	    const tLegs = Date.now();
+   727	    let signMs: number | null = null;
+   728	    const [cexR, dexR] = await Promise.allSettled([
+   729	      this.cexLeg(t, opp, cid),
+   730	      this.d.chain.send(tx, (gasEst * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash, nonce) => {
+   731	        signMs = Date.now() - tLegs;
+   732	        this.d.db.updateTrade(tradeId, { dex_tx: hash, note: `client order id ${cid}; nonce ${nonce}` });
+   733	      }),
+   734	    ]);
+   735	
+   736	    const dex: TxResult = dexR.status === 'fulfilled' ? dexR.value : { ok: false, gasCostWei: 0n, reason: errMsg(dexR.reason) };
+   737	    let cexFilled = 0;
+   738	    let orderId: string | null = null;
+   739	    let cexUnknown = false;
+   740	    if (cexR.status === 'fulfilled') {
+   741	      cexFilled = cexR.value.filled;
+   742	      orderId = cexR.value.orderId;
+   743	    } else if (String((cexR.reason as Error)?.message ?? '').startsWith('UNKNOWN_ORDER_STATE')) {
+   744	      cexUnknown = true;
+   745	      this.d.risk.pause('MEXC order state unknown', true);
+   746	      await this.d.tg.send(`🚨 ${t.base}: MEXC order state unknown after placing. Trading PAUSED. Check MEXC manually.\n${errMsg(cexR.reason)}`);
+   747	    } else {
+   748	      log.warn(`${t.base} MEXC leg failed: ${errMsg(cexR.reason)}`);
+   749	    }
+   750	
+   751	    // 5) One-sided? Close the open position at market right away.
+   752	    let status: TradeStatus = 'ok';
+   753	    const notes: string[] = [];
+   754	    if (!dex.ok) notes.push(`DEX: ${dex.reason}`);
+   755	    if (dex.unknown) {
+   756	      // We cannot tell if the swap executed. Unwinding could DOUBLE the position. Stop and ask a human.
+   757	      this.d.risk.pause(`DEX tx unknown ${dex.hash}`, true);
+   758	      await this.d.tg.send(
+   759	        `🚨 ${t.base}: DEX tx ${dex.hash} outcome UNKNOWN (not mined, cancel not confirmed). MEXC filled ${cexFilled}/${opp.cexQty}.\n` +
+   760	          `NOT unwinding automatically. Trading PAUSED.\nDo NOT hedge by hand until the nonce is consumed - the bot will alert you. (/cancelnonce replaces it.)`,
+   761	      );
+   762	    }
+   763	    const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.fee(t), t.qtyStep);
+   764	    if (cexUnknown || dex.unknown) {
+   765	      status = 'one_sided';
+   766	      notes.push('pnl unknown'); // the measured balance change may not include the final outcome yet
+   767	    } else if (unwind) {
+   768	      status = 'one_sided';
+   769	      const qty = unwind.qty.toFixed(decimalsOfStep(t.qtyStep));
+   770	      try {
+   771	        const r = await this.closeAtMarket(t, unwind.side, qty);
+   772	        if (r.dust) {
+   773	          notes.push(`unwind ${unwind.side} ${qty} not sent: ${r.dust}`);
+   774	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base}: leftover ${unwind.side} ${qty} is below MEXC minimums (${r.dust}). Left as dust; fix inventory by hand.`);
+   775	        } else {
+   776	          notes.push(`unwind ${unwind.side} ${qty} (${r.orderId}, filled ${r.filled})`);
+   777	          await this.d.tg.send(`⚠️ ONE-SIDED FILL ${t.base} ${opp.direction}\n${unwind.reason}\nClosed: MEXC ${unwind.side} ${r.filled} ${t.base}`);
+   778	        }
+   779	      } catch (e) {
+   780	        const remaining = e instanceof PartialCloseError ? e.remaining : Number(qty);
+   781	        if (e instanceof OrderStillOpenError) notes.push(`close order ${e.orderId} may still be live on MEXC: cancel it by hand`);
+   782	        this.d.risk.pause(`unwind failed for ${t.base}`, true);
+   783	        notes.push(`UNWIND FAILED: ${errMsg(e)}`);
+   784	        await this.d.tg.send(
+   785	          `🚨 ONE-SIDED FILL ${t.base} and the market close FAILED: ${errMsg(e)}\n` +
+   786	            `Still open: MEXC ${unwind.side} ${remaining} ${t.base} needed.\nTrading PAUSED. Close it manually, then /start confirm.`,
+   787	        );
+   788	      }
+   789	    } else if (!dex.ok) {
+   790	      status = 'dex_failed'; // nothing filled on either side
+   791	    }
+   792	
+   793	    // 6) Exact PnL = change in total value of everything the trade touched, at pre-trade prices.
+   794	    //    Orders are closed (filled/cancelled) by now; free + locked balances avoid counting held funds as lost.
+   795	    const { balances: after, stable } = await this.stableBalances(t, c.tokenUsd, ethUsd);
+   796	    if (!stable) notes.push('pnl approximate (balances still changing after 15 s)');
+   797	    const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd, this.stableRate) - portfolioUsd(before, t, c.tokenUsd, ethUsd, this.stableRate);
+   798	    const gasPaid = (Number(dex.gasCostWei + approvalCostWei) / 1e18) * ethUsd;
+   799	    this.d.db.updateTrade(tradeId, {
+   800	      status,
+   801	      pnl_usd: pnl,
+   802	      gas_usd: gasPaid,
+   803	      dex_tx: dex.hash ?? null,
+   804	      cex_order_id: orderId ?? cid,
+   805	      note: [`client order id ${cid}`, ...notes].join('; '),
+   806	    });
+   807	
+   808	    const dexIsBuy = opp.direction === 'DEX_BUY';
+   809	    await this.d.tg.send(
+   810	      [
+   811	        `${status === 'ok' ? '✅' : '⚠️'} LIVE ${t.base} ${opp.direction} [${status}]`,
+   812	        `Buy  ${dexIsBuy ? 'DEX ' : 'MEXC'} @ ${opp.buyPrice.toPrecision(6)}`,
+   813	        `Sell ${dexIsBuy ? 'MEXC' : 'DEX '} @ ${opp.sellPrice.toPrecision(6)}`,
+   814	        `Qty ${opp.cexQty} ${t.base} | size ${usd(opp.sizeUsd)}`,
+   815	        `MEXC fee ${usd(opp.cexFeeUsd)} | Gas ${usd(gasPaid)}`,
+   816	        `Expected ${usd(expectedNet)} | Net PnL ${usd(pnl)}`,
+   817	        dex.hash ? explorerTxUrl(this.cfg.chain, dex.hash) : '',
+   818	        notes.length ? `Notes: ${notes.join('; ')}` : '',
+   819	      ]
+   820	        .filter(Boolean)
+   821	        .join('\n'),
+   822	    );
+   823	    await this.recordLegs(tradeId, t, opp, firm, before, after, dex, cexR.status === 'fulfilled' ? cexR.value : null, {
+   824	      quoteMs,
+   825	      signMs,
+   826	    }).catch((e) => log.warn(`legs: ${errMsg(e)}`));
+   827	    this.currentTradeId = null;
+   828	    await this.handleRisk(this.d.risk.afterTrade(status));
+   829	  }
+   830	
+   831	  /** Read balances until two reads in a row give the same value (settled), for at most ~15 s. */
+   832	  private async stableBalances(t: Token, tokenUsd: number, ethUsd: number): Promise<{ balances: Balances; stable: boolean }> {
+   833	    let prev = await this.d.balances(true);
+   834	    for (let i = 0; i < 6; i++) {
+   835	      await this.sleep(2500);
+   836	      const cur = await this.d.balances(true);
+   837	      if (Math.abs(portfolioUsd(cur, t, tokenUsd, ethUsd, this.stableRate) - portfolioUsd(prev, t, tokenUsd, ethUsd, this.stableRate)) < 1e-6) return { balances: cur, stable: true };
+   838	      prev = cur;
+   839	    }
+   840	    return { balances: prev, stable: false };
+   841	  }
+   842	
+   843	  /**
+   844	   * Close a position on MEXC now with an aggressive LIMIT 2% through the book, for BOTH sides.
+   845	   * (No MEXC spot symbol offers IMMEDIATE_OR_CANCEL, and some have no MARKET; LIMIT works everywhere.)
+   846	   * Reads the order back and never assumes it filled. Below MEXC minimums -> returns `dust`, sends nothing.
+   847	   */
+   848	  async closeAtMarket(t: Token, side: Side, qty: string): Promise<{ orderId: string; filled: number; dust?: string }> {
+   849	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
+   850	    // 2% through the book, but inside the symbol's PERCENT_PRICE_BY_SIDE band (some are 0.5% - 2%).
+   851	    const pxNum = closePrice({ ...t.rules, priceDecimals: t.priceDecimals }, side, { bid: b.bids[0][0], ask: b.asks[0][0] });
+   852	    const dust = orderProblem(t.rules, side, Number(qty), pxNum);
+   853	    if (dust) return { orderId: '', filled: 0, dust };
+   854	    const px = pxNum.toFixed(t.priceDecimals);
+   855	    const cid = clientId('c');
+   856	    if (this.currentTradeId !== null) this.d.db.appendCid(this.currentTradeId, cid); // before placing (crash safety)
+   857	    const { orderId } = await placeSafely(this.d.mexc, t.symbol, cid, () => this.d.mexc.limitOrder(t.symbol, side, qty, px, cid), this.sleep);
+   858	    await this.sleep(1500);
+   859	    let o = await this.d.mexc.getOrder(t.symbol, orderId);
+   860	    if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
+   861	    const filled = Number(o.executedQty);
+   862	    if (filled < Number(qty) * 0.999) {
+   863	      const remaining = Number((Number(qty) - filled).toFixed(decimalsOfStep(t.qtyStep)));
+   864	      throw new PartialCloseError(`close ${side} only filled ${filled}/${qty}, ${remaining} remaining`, remaining);
+   865	    }
+   866	    return { orderId, filled };
+   867	  }
+   868	
+   869	  /** MEXC marketable limit order; cancels any unfilled rest. Returns filled quantity. */
+   870	  async cexLeg(t: Token, opp: Opportunity, cid = clientId('t')): Promise<{ orderId: string; filled: number; ackMs: number }> {
+   871	    const side: Side = opp.direction === 'DEX_BUY' ? 'SELL' : 'BUY';
+   872	    const qty = opp.cexQty.toFixed(decimalsOfStep(t.qtyStep));
+   873	    const f = 10 ** t.priceDecimals;
+   874	    const px = side === 'SELL' ? Math.floor(opp.cexLimitPrice * f) / f : Math.ceil(opp.cexLimitPrice * f) / f;
+   875	    const tPlace = Date.now();
+   876	    const { orderId } = await placeSafely(
+   877	      this.d.mexc,
+   878	      t.symbol,
+   879	      cid,
+   880	      () => this.d.mexc.limitOrder(t.symbol, side, qty, px.toFixed(t.priceDecimals), cid),
+   881	      this.sleep,
+   882	    );
+   883	    const ackMs = Date.now() - tPlace;
+   884	    log.info(`MEXC ${side} ${qty} ${t.symbol} @ ${px} id=${orderId}`);
+   885	    await this.sleep(1500);
+   886	
+   887	    const read = async (): Promise<Order> => {
+   888	      for (let i = 0; i < 3; i++) {
+   889	        try {
+   890	          return await this.d.mexc.getOrder(t.symbol, orderId);
+   891	        } catch (e) {
+   892	          log.warn(`getOrder retry: ${errMsg(e)}`);
+   893	          await this.sleep(1000);
+   894	        }
    895	      }
-   896	    }
-   897	    return { orderId, filled: Number(o.executedQty), ackMs };
-   898	  }
-   899	
-   900	  /**
-   901	   * Paper realism: wait PAPER_LATENCY_MS, re-quote the DEX and re-read the MEXC book, and book THAT net.
-   902	   * The first quote overstates profit (in live trading, prices move while both legs are sent).
-   903	   */
-   904	  private async recordPaper(c: Candidate, gas: GasInfo, ethUsd: number) {
-   905	    const { token: t, opp } = c;
-   906	    await this.sleep(this.cfg.paperLatencyMs);
-   907	    let requoted: number;
-   908	    try {
-   909	      requoted = (await this.requote(c, gas, ethUsd)) ?? -opp.gasUsd;
-   910	    } catch (e) {
-   911	      log.warn(`paper re-quote ${t.base}: ${errMsg(e)}`);
-   912	      requoted = -opp.gasUsd; // cannot re-quote: assume the worst sensible case (gas spent, nothing earned)
-   913	    }
-   914	    const id = this.record(c, 'paper', { pnl: requoted, gas: opp.gasUsd });
-   915	    this.d.db.updateTrade(id, { requoted_net: requoted });
-   916	    await this.d.tg.send(
-   917	      `📝 PAPER ${t.base} ${opp.direction}\nBuy @ ${opp.buyPrice.toPrecision(6)} | Sell @ ${opp.sellPrice.toPrecision(6)}\n` +
-   918	        `Qty ${opp.cexQty} | size ${usd(opp.sizeUsd)} | fee ${usd(opp.cexFeeUsd)} | gas ${usd(opp.gasUsd)}\n` +
-   919	        `Net ${usd(opp.net)} at first quote, ${usd(requoted)} after ${this.cfg.paperLatencyMs} ms re-quote (booked)`,
-   920	    );
-   921	    await this.handleRisk(this.d.risk.afterTrade('paper'));
-   922	  }
-   923	
-   924	  /** Same trade, fresh prices: DEX re-quote + fresh MEXC book. Returns the new net (null if it no longer fills). */
-   925	  private async requote(c: Candidate, gas: GasInfo, ethUsd: number): Promise<number | null> {
-   926	    const t = c.token;
-   927	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
-   928	    const q = await this.d.agg.price(c.req);
-   929	    const g = gasUsd(q.gas + c.approvalGas, gas.effective, ethUsd);
-   930	    if (c.opp.direction === 'DEX_BUY') {
-   931	      const o = evaluateDexBuy({
-   932	        sizeUsd: c.opp.sizeUsd,
-   933	        tokensOut: toFloat(q.buyAmount, t.decimals),
-   934	        tokensMin: toFloat(q.minBuyAmount, t.decimals),
-   935	        bids: b.bids,
-   936	        qtyStep: t.qtyStep,
-   937	        gasUsd: g,
-   938	        costs: this.costs(t),
-   939	      });
-   940	      return o?.net ?? null;
-   941	    }
-   942	    const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.fee(t));
-   943	    if (!plan) return null;
-   944	    return evaluateCexBuy({ plan, usdcOut: toFloat(q.buyAmount, this.stableDec), usdcMin: toFloat(q.minBuyAmount, this.stableDec), gasUsd: g, costs: this.costs(t) }).net;
-   945	  }
-   946	
-   947	  /** One `legs` row per leg: quoted vs filled price, gas, MEXC fills and fee (myTrades), latency per stage. */
-   948	  private async recordLegs(
-   949	    tradeId: number,
-   950	    t: Token,
-   951	    opp: Opportunity,
-   952	    firm: Quote,
-   953	    before: Balances,
-   954	    after: Balances,
-   955	    dex: TxResult,
-   956	    cex: { orderId: string; filled: number; ackMs: number } | null,
-   957	    lat: { quoteMs: number; signMs: number | null },
-   958	  ) {
-   959	    const dexBuy = opp.direction === 'DEX_BUY';
-   960	    const tokDelta = (after.walletToken[t.base] ?? 0) - (before.walletToken[t.base] ?? 0);
-   961	    const stableDelta = (after.walletUsdc - before.walletUsdc) * this.stableRate;
-   962	    // DEX: buy = USDT-value spent per token received; sell = USDT-value received per token sold.
-   963	    const dexQuoted = dexBuy ? opp.buyPrice : opp.sellPrice;
-   964	    const dexFilled = dex.ok && tokDelta !== 0 ? Math.abs(stableDelta / tokDelta) : null;
-   965	    const slip = (q: number, f: number | null, buy: boolean) => (f === null || !q ? null : ((buy ? f - q : q - f) / q) * 10_000);
-   966	    this.d.db.insertLeg({
-   967	      trade_id: tradeId, leg: 'dex', quoted_price: dexQuoted, filled_price: dexFilled, slippage_bps: slip(dexQuoted, dexFilled, dexBuy),
-   968	      min_out: toFloat(firm.minBuyAmount, dexBuy ? t.decimals : this.stableDec), real_out: dexBuy ? tokDelta : after.walletUsdc - before.walletUsdc,
-   969	      gas_used: dex.gasUsed?.toString() ?? null, gas_price: dex.gasPrice?.toString() ?? null, l1_fee: null,
-   970	      executed_qty: null, avg_price: null, fee: null, fee_asset: null,
-   971	      latency_quote_ms: lat.quoteMs, latency_sign_ms: lat.signMs, latency_inclusion_ms: dex.inclusionMs ?? null, latency_mexc_ack_ms: null,
-   972	    });
-   973	    if (!cex) return;
-   974	    let qty = cex.filled;
-   975	    let avg: number | null = null;
-   976	    let fee: number | null = null;
-   977	    let feeAsset: string | null = null;
-   978	    if (this.d.mexc.myTrades && cex.filled > 0) {
-   979	      const fills = await this.d.mexc.myTrades(t.symbol, cex.orderId);
-   980	      qty = fills.reduce((a, f) => a + Number(f.qty), 0);
-   981	      const quote = fills.reduce((a, f) => a + Number(f.quoteQty), 0);
-   982	      avg = qty > 0 ? quote / qty : null;
-   983	      fee = fills.reduce((a, f) => a + Number(f.commission), 0);
-   984	      feeAsset = fills[0]?.commissionAsset ?? null;
-   985	    }
-   986	    const cexQuoted = dexBuy ? opp.sellPrice : opp.buyPrice;
-   987	    this.d.db.insertLeg({
-   988	      trade_id: tradeId, leg: 'mexc', quoted_price: cexQuoted, filled_price: avg, slippage_bps: slip(cexQuoted, avg, !dexBuy),
-   989	      min_out: null, real_out: null, gas_used: null, gas_price: null, l1_fee: null,
-   990	      executed_qty: qty, avg_price: avg, fee, fee_asset: feeAsset,
-   991	      latency_quote_ms: null, latency_sign_ms: null, latency_inclusion_ms: null, latency_mexc_ack_ms: cex.ackMs,
-   992	    });
-   993	  }
-   994	
-   995	  private record(
-   996	    c: Candidate,
-   997	    status: TradeStatus,
-   998	    r: { pnl: number; gas: number; dexTx?: string; orderId?: string | null; note?: string | null },
-   999	  ): number {
-  1000	    const now = Date.now();
-  1001	    return this.d.db.insertTrade({
-  1002	      ts: now,
-  1003	      day: dhakaDay(now),
-  1004	      mode: this.cfg.mode,
-  1005	      symbol: c.token.base,
-  1006	      direction: c.opp.direction,
-  1007	      size_usd: c.opp.sizeUsd,
-  1008	      qty: c.opp.cexQty,
-  1009	      buy_price: c.opp.buyPrice,
-  1010	      sell_price: c.opp.sellPrice,
-  1011	      expected_net: c.opp.net,
-  1012	      cex_fee_usd: status === 'approval' ? 0 : c.opp.cexFeeUsd,
-  1013	      gas_usd: r.gas,
-  1014	      pnl_usd: r.pnl,
-  1015	      status,
-  1016	      dex_tx: r.dexTx ?? null,
-  1017	      cex_order_id: r.orderId ?? null,
-  1018	      note: r.note ?? null,
-  1019	    });
-  1020	  }
-  1021	
-  1022	  private async handleRisk(events: RiskEvent[]) {
-  1023	    for (const e of events) {
-  1024	      if (e.kind === 'loss_limit') await this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). Trading STOPPED. Send /start to resume.`);
-  1025	      if (e.kind === 'fail_streak') await this.d.tg.send(`🛑 ${e.count} failed trades in a row. Trading PAUSED. Check logs, then /start.`);
-  1026	      if (e.kind === 'trade_limit') await this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}). Resumes tomorrow (Dhaka time).`);
-  1027	    }
-  1028	  }
-  1029	}
+   896	      throw new Error(`UNKNOWN_ORDER_STATE ${orderId}`);
+   897	    };
+   898	    let o = await read();
+   899	    if (o.status !== 'FILLED') {
+   900	      try {
+   901	        o = await cancelAndConfirm(this.d.mexc, t.symbol, orderId, this.sleep);
+   902	      } catch (e) {
+   903	        // The order may still fill later: its state is unknown, so no unwind may be based on it.
+   904	        if (e instanceof OrderStillOpenError) throw new Error(`UNKNOWN_ORDER_STATE ${e.message}`);
+   905	        throw e;
+   906	      }
+   907	    }
+   908	    return { orderId, filled: Number(o.executedQty), ackMs };
+   909	  }
+   910	
+   911	  /**
+   912	   * Paper realism: wait PAPER_LATENCY_MS, re-quote the DEX and re-read the MEXC book, and book THAT net.
+   913	   * The first quote overstates profit (in live trading, prices move while both legs are sent).
+   914	   */
+   915	  private async recordPaper(c: Candidate, gas: GasInfo, ethUsd: number) {
+   916	    const { token: t, opp } = c;
+   917	    await this.sleep(this.cfg.paperLatencyMs);
+   918	    let requoted: number;
+   919	    try {
+   920	      requoted = (await this.requote(c, gas, ethUsd)) ?? -opp.gasUsd;
+   921	    } catch (e) {
+   922	      log.warn(`paper re-quote ${t.base}: ${errMsg(e)}`);
+   923	      requoted = -opp.gasUsd; // cannot re-quote: assume the worst sensible case (gas spent, nothing earned)
+   924	    }
+   925	    const id = this.record(c, 'paper', { pnl: requoted, gas: opp.gasUsd });
+   926	    this.d.db.updateTrade(id, { requoted_net: requoted });
+   927	    await this.d.tg.send(
+   928	      `📝 PAPER ${t.base} ${opp.direction}\nBuy @ ${opp.buyPrice.toPrecision(6)} | Sell @ ${opp.sellPrice.toPrecision(6)}\n` +
+   929	        `Qty ${opp.cexQty} | size ${usd(opp.sizeUsd)} | fee ${usd(opp.cexFeeUsd)} | gas ${usd(opp.gasUsd)}\n` +
+   930	        `Net ${usd(opp.net)} at first quote, ${usd(requoted)} after ${this.cfg.paperLatencyMs} ms re-quote (booked)`,
+   931	    );
+   932	    await this.handleRisk(this.d.risk.afterTrade('paper'));
+   933	  }
+   934	
+   935	  /** Same trade, fresh prices: DEX re-quote + fresh MEXC book. Returns the new net (null if it no longer fills). */
+   936	  private async requote(c: Candidate, gas: GasInfo, ethUsd: number): Promise<number | null> {
+   937	    const t = c.token;
+   938	    const b = await (this.d.freshBook ?? this.d.book)(t.symbol);
+   939	    const q = await this.d.agg.price(c.req);
+   940	    const g = this.estGasUsd(q.gas + c.approvalGas, gas, ethUsd);
+   941	    if (c.opp.direction === 'DEX_BUY') {
+   942	      const o = evaluateDexBuy({
+   943	        sizeUsd: c.opp.sizeUsd,
+   944	        tokensOut: toFloat(q.buyAmount, t.decimals),
+   945	        tokensMin: toFloat(q.minBuyAmount, t.decimals),
+   946	        bids: b.bids,
+   947	        qtyStep: t.qtyStep,
+   948	        gasUsd: g,
+   949	        costs: this.costs(t),
+   950	      });
+   951	      return o?.net ?? null;
+   952	    }
+   953	    const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.fee(t));
+   954	    if (!plan) return null;
+   955	    return evaluateCexBuy({ plan, usdcOut: toFloat(q.buyAmount, this.stableDec), usdcMin: toFloat(q.minBuyAmount, this.stableDec), gasUsd: g, costs: this.costs(t) }).net;
+   956	  }
+   957	
+   958	  /** One `legs` row per leg: quoted vs filled price, gas, MEXC fills and fee (myTrades), latency per stage. */
+   959	  private async recordLegs(
+   960	    tradeId: number,
+   961	    t: Token,
+   962	    opp: Opportunity,
+   963	    firm: Quote,
+   964	    before: Balances,
+   965	    after: Balances,
+   966	    dex: TxResult,
+   967	    cex: { orderId: string; filled: number; ackMs: number } | null,
+   968	    lat: { quoteMs: number; signMs: number | null },
+   969	  ) {
+   970	    const dexBuy = opp.direction === 'DEX_BUY';
+   971	    const tokDelta = (after.walletToken[t.base] ?? 0) - (before.walletToken[t.base] ?? 0);
+   972	    const stableDelta = (after.walletUsdc - before.walletUsdc) * this.stableRate;
+   973	    // DEX: buy = USDT-value spent per token received; sell = USDT-value received per token sold.
+   974	    const dexQuoted = dexBuy ? opp.buyPrice : opp.sellPrice;
+   975	    const dexFilled = dex.ok && tokDelta !== 0 ? Math.abs(stableDelta / tokDelta) : null;
+   976	    const slip = (q: number, f: number | null, buy: boolean) => (f === null || !q ? null : ((buy ? f - q : q - f) / q) * 10_000);
+   977	    this.d.db.insertLeg({
+   978	      trade_id: tradeId, leg: 'dex', quoted_price: dexQuoted, filled_price: dexFilled, slippage_bps: slip(dexQuoted, dexFilled, dexBuy),
+   979	      min_out: toFloat(firm.minBuyAmount, dexBuy ? t.decimals : this.stableDec), real_out: dexBuy ? tokDelta : after.walletUsdc - before.walletUsdc,
+   980	      gas_used: dex.gasUsed?.toString() ?? null, gas_price: dex.gasPrice?.toString() ?? null, l1_fee: dex.l1FeeWei?.toString() ?? null,
+   981	      executed_qty: null, avg_price: null, fee: null, fee_asset: null,
+   982	      latency_quote_ms: lat.quoteMs, latency_sign_ms: lat.signMs, latency_inclusion_ms: dex.inclusionMs ?? null, latency_mexc_ack_ms: null,
+   983	    });
+   984	    if (!cex) return;
+   985	    let qty = cex.filled;
+   986	    let avg: number | null = null;
+   987	    let fee: number | null = null;
+   988	    let feeAsset: string | null = null;
+   989	    if (this.d.mexc.myTrades && cex.filled > 0) {
+   990	      const fills = await this.d.mexc.myTrades(t.symbol, cex.orderId);
+   991	      qty = fills.reduce((a, f) => a + Number(f.qty), 0);
+   992	      const quote = fills.reduce((a, f) => a + Number(f.quoteQty), 0);
+   993	      avg = qty > 0 ? quote / qty : null;
+   994	      fee = fills.reduce((a, f) => a + Number(f.commission), 0);
+   995	      feeAsset = fills[0]?.commissionAsset ?? null;
+   996	    }
+   997	    const cexQuoted = dexBuy ? opp.sellPrice : opp.buyPrice;
+   998	    this.d.db.insertLeg({
+   999	      trade_id: tradeId, leg: 'mexc', quoted_price: cexQuoted, filled_price: avg, slippage_bps: slip(cexQuoted, avg, !dexBuy),
+  1000	      min_out: null, real_out: null, gas_used: null, gas_price: null, l1_fee: null,
+  1001	      executed_qty: qty, avg_price: avg, fee, fee_asset: feeAsset,
+  1002	      latency_quote_ms: null, latency_sign_ms: null, latency_inclusion_ms: null, latency_mexc_ack_ms: cex.ackMs,
+  1003	    });
+  1004	  }
+  1005	
+  1006	  private record(
+  1007	    c: Candidate,
+  1008	    status: TradeStatus,
+  1009	    r: { pnl: number; gas: number; dexTx?: string; orderId?: string | null; note?: string | null },
+  1010	  ): number {
+  1011	    const now = Date.now();
+  1012	    return this.d.db.insertTrade({
+  1013	      ts: now,
+  1014	      day: dhakaDay(now),
+  1015	      mode: this.cfg.mode,
+  1016	      symbol: c.token.base,
+  1017	      direction: c.opp.direction,
+  1018	      size_usd: c.opp.sizeUsd,
+  1019	      qty: c.opp.cexQty,
+  1020	      buy_price: c.opp.buyPrice,
+  1021	      sell_price: c.opp.sellPrice,
+  1022	      expected_net: c.opp.net,
+  1023	      cex_fee_usd: status === 'approval' ? 0 : c.opp.cexFeeUsd,
+  1024	      gas_usd: r.gas,
+  1025	      pnl_usd: r.pnl,
+  1026	      status,
+  1027	      dex_tx: r.dexTx ?? null,
+  1028	      cex_order_id: r.orderId ?? null,
+  1029	      note: r.note ?? null,
+  1030	    });
+  1031	  }
+  1032	
+  1033	  private async handleRisk(events: RiskEvent[]) {
+  1034	    for (const e of events) {
+  1035	      if (e.kind === 'loss_limit') await this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). Trading STOPPED. Send /start to resume.`);
+  1036	      if (e.kind === 'fail_streak') await this.d.tg.send(`🛑 ${e.count} failed trades in a row. Trading PAUSED. Check logs, then /start.`);
+  1037	      if (e.kind === 'trade_limit') await this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}). Resumes tomorrow (Dhaka time).`);
+  1038	    }
+  1039	  }
+  1040	}
 ```
 
 ## `src/inventory.ts`
 
-```ts
+```
      1	// Balances on both sides and rebalancing alerts. The bot never moves funds itself.
      2	import type { Chain } from './dex/chain.js';
      3	import type { MexcRest } from './mexc/rest.js';
@@ -2237,38 +2326,45 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     92	  b: Balances,
     93	  tokens: Token[],
     94	  prices: Record<string, number>,
-    95	  o: { tradeUsd: number; perSideX: number; maxTokenSharePct: number; stableInUsdt?: number; walletAddress?: string },
+    95	  o: { tradeUsd: number; perSideX: number; maxTokenSharePct: number; stableInUsdt?: number; walletAddress?: string; stableSymbol?: string },
     96	): PlanItem[] {
     97	  const out: PlanItem[] = [];
     98	  const target = o.tradeUsd * o.perSideX;
     99	  const toWallet = `withdraw MEXC→wallet${o.walletAddress ? ` ${o.walletAddress}` : ''} (in the MEXC app)`;
    100	  const toMexc = 'deposit wallet→MEXC';
-   101	  let tokenUsd = 0;
-   102	  for (const t of tokens) {
-   103	    const px = prices[t.base];
-   104	    if (!px) continue;
-   105	    const w = (b.walletToken[t.base] ?? 0) * px;
-   106	    const m = (b.mexc[t.base] ?? 0) * px;
-   107	    tokenUsd += w + m;
-   108	    out.push({ kind: 'side', token: t.base, side: 'wallet', low: w < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - w, m)) / px, direction: toWallet });
-   109	    out.push({ kind: 'side', token: t.base, side: 'mexc', low: m < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - m, w)) / px, direction: toMexc });
-   110	  }
-   111	  const walletStable = b.walletUsdc * (o.stableInUsdt ?? 1);
-   112	  const mexcStable = b.mexc.USDT ?? 0;
-   113	  out.push({ kind: 'side', token: 'STABLE', side: 'wallet', low: walletStable < o.tradeUsd, asset: 'USDC/USDT', amount: Math.max(0, Math.min(target - walletStable, mexcStable)), direction: toWallet });
-   114	  out.push({ kind: 'side', token: 'STABLE', side: 'mexc', low: mexcStable < o.tradeUsd, asset: 'USDT', amount: Math.max(0, Math.min(target - mexcStable, walletStable)), direction: toMexc });
-   115	
-   116	  const total = tokenUsd + walletStable + mexcStable;
-   117	  if (total > 0 && (tokenUsd / total) * 100 > o.maxTokenSharePct) {
-   118	    out.push({ kind: 'warning', key: 'token-share', text: `tokens are ${((tokenUsd / total) * 100).toFixed(0)}% of the portfolio (max ${o.maxTokenSharePct}%): token price moves now dominate PnL` });
-   119	  }
-   120	  return out;
-   121	}
+   101	  // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). The wallet side needs
+   102	  // that stable, not MEXC's USDT: withdrawing USDT to the wallet does not give it USDC, and
+   103	  // topping up MEXC from a USDC wallet needs a swap to USDT on MEXC (round-3 review, L2).
+   104	  const stable = o.stableSymbol;
+   105	  const toWalletStable = stable ? `withdraw ${stable} MEXC→wallet${o.walletAddress ? ` ${o.walletAddress}` : ''} (in the MEXC app)` : toWallet;
+   106	  const toMexcStable = stable && stable !== 'USDT' ? `deposit ${stable} wallet→MEXC (swap to USDT on MEXC)` : toMexc;
+   107	  let tokenUsd = 0;
+   108	  for (const t of tokens) {
+   109	    const px = prices[t.base];
+   110	    if (!px) continue;
+   111	    const w = (b.walletToken[t.base] ?? 0) * px;
+   112	    const m = (b.mexc[t.base] ?? 0) * px;
+   113	    tokenUsd += w + m;
+   114	    out.push({ kind: 'side', token: t.base, side: 'wallet', low: w < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - w, m)) / px, direction: toWallet });
+   115	    out.push({ kind: 'side', token: t.base, side: 'mexc', low: m < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - m, w)) / px, direction: toMexc });
+   116	  }
+   117	  const walletStable = b.walletUsdc * (o.stableInUsdt ?? 1);
+   118	  const mexcStable = b.mexc.USDT ?? 0;
+   119	  // Wallet-side amount is in stable units (USDT amount / the USDC-USDT rate); MEXC side is USDT.
+   120	  out.push({ kind: 'side', token: 'STABLE', side: 'wallet', low: walletStable < o.tradeUsd, asset: stable ?? 'USDC/USDT', amount: Math.max(0, Math.min(target - walletStable, mexcStable)) / (o.stableInUsdt ?? 1), direction: toWalletStable });
+   121	  out.push({ kind: 'side', token: 'STABLE', side: 'mexc', low: mexcStable < o.tradeUsd, asset: 'USDT', amount: Math.max(0, Math.min(target - mexcStable, walletStable)), direction: toMexcStable });
+   122	
+   123	  const total = tokenUsd + walletStable + mexcStable;
+   124	  if (total > 0 && (tokenUsd / total) * 100 > o.maxTokenSharePct) {
+   125	    out.push({ kind: 'warning', key: 'token-share', text: `tokens are ${((tokenUsd / total) * 100).toFixed(0)}% of the portfolio (max ${o.maxTokenSharePct}%): token price moves now dominate PnL` });
+   126	  }
+   127	  return out;
+   128	}
 ```
 
 ## `src/kpi.ts`
 
-```ts
+```
      1	// Phase-1 KPIs from the `opportunities`, `trades` and `inventory_snapshots` tables.
      2	// Answers "is this worth running?" with the bot's own data (daily Telegram summary and `npm run report`).
      3	import type { Db } from './db.js';
@@ -2315,91 +2411,96 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     44	  );
     45	  // Would-have PnL: at most one trade per token+direction per minute (the best net in that minute),
     46	  // traded if its net (already after fee, gas, slippage and safety) beats the hurdle.
-    47	  const wouldHave = [20, 30, 40, 60].map((h) => {
-    48	    const r = q<{ trades: number; pnl: number | null }>(
-    49	      `SELECT COUNT(*) trades, SUM(best) pnl FROM (
-    50	         SELECT MAX(net_usd) best, MAX(size_usd) size FROM opportunities
-    51	         WHERE ts >= ? AND net_usd IS NOT NULL AND size_usd > 0
-    52	         GROUP BY token, direction, ts / 60000
-    53	       ) WHERE best >= size * ? / 10000.0`,
-    54	      sinceTs,
-    55	      h,
-    56	    )[0];
-    57	    return { hurdle_bps: h, trades: r?.trades ?? 0, pnl: r?.pnl ?? 0 };
-    58	  });
-    59	  const t = q<{ n: number; diff: number | null; gas: number | null; gross: number | null; one_sided: number | null }>(
-    60	    `SELECT COUNT(*) n,
-    61	            AVG(CASE WHEN status IN ('ok','paper') THEN pnl_usd - expected_net END) diff,
-    62	            SUM(gas_usd) gas,
-    63	            SUM(CASE WHEN status IN ('ok','paper') THEN pnl_usd + gas_usd + cex_fee_usd END) gross,
-    64	            SUM(CASE WHEN status = 'one_sided' THEN 1 ELSE 0 END) one_sided
-    65	     FROM trades WHERE ts >= ? AND mode = ? AND status != 'approval'`,
-    66	    sinceTs,
-    67	    mode,
-    68	  )[0];
-    69	  const inventorySkew = q<{ token: string; wallet_share: number }>(
-    70	    `SELECT token, wallet_usd / NULLIF(wallet_usd + mexc_usd, 0) wallet_share FROM inventory_snapshots s
-    71	     WHERE ts = (SELECT MAX(ts) FROM inventory_snapshots WHERE token = s.token)`,
-    72	  );
-    73	  return {
-    74	    opportunitiesPerToken,
-    75	    decisions,
-    76	    minutesAbove,
-    77	    histogram,
-    78	    byHourDhaka,
-    79	    wouldHave,
-    80	    realizedMinusExpected: t?.n ? t.diff : null,
-    81	    gasShareOfGross: t?.gross ? (t.gas ?? 0) / t.gross : null,
-    82	    oneSidedRate: t?.n ? (t.one_sided ?? 0) / t.n : null,
-    83	    inventorySkew,
-    84	  };
-    85	}
-    86	
-    87	const bar = (n: number, max: number) => '█'.repeat(max > 0 ? Math.max(n > 0 ? 1 : 0, Math.round((n / max) * 12)) : 0);
-    88	
-    89	export function formatKpis(k: Kpis): string {
-    90	  const lines: string[] = ['— Opportunities —'];
-    91	  if (!k.opportunitiesPerToken.length) lines.push('  none logged yet');
-    92	  for (const o of k.opportunitiesPerToken) lines.push(`  ${o.token}: ${o.n} quotes, best gross ${o.best_gross_bps?.toFixed(1) ?? '-'} bps`);
-    93	  lines.push(`  decisions: ${k.decisions.map((d) => `${d.decision} ${d.n}`).join(', ') || '-'}`);
-    94	  lines.push(`  minutes with gross gap ≥20/35/50 bps: ${k.minutesAbove.map((m) => m.minutes).join(' / ')}`);
-    95	  const tokens = [...new Set(k.histogram.map((h) => h.token))];
-    96	  if (tokens.length) lines.push('— Gross gap histogram (bps) —');
-    97	  for (const tok of tokens) {
-    98	    const rows = BUCKETS.map((b) => k.histogram.find((h) => h.token === tok && h.bucket === b)?.n ?? 0);
-    99	    const max = Math.max(...rows);
-   100	    lines.push(`  ${tok}: ${BUCKETS.map((b, i) => `${b}:${rows[i]}${bar(rows[i], max)}`).join(' ')}`);
-   101	  }
-   102	  if (k.byHourDhaka.length) {
-   103	    lines.push(`— Minutes ≥20 bps by hour (Dhaka) — ${k.byHourDhaka.map((h) => `${String(h.hour).padStart(2, '0')}h:${h.minutes_above_20}`).join(' ')}`);
-   104	  }
-   105	  lines.push(`— Would-have PnL — ${k.wouldHave.map((w) => `${w.hurdle_bps}bps: ${w.trades} trades ${usd(w.pnl)}`).join(' | ')}`);
-   106	  lines.push(
-   107	    `— Execution — realized−expected ${k.realizedMinusExpected === null ? '-' : usd(k.realizedMinusExpected)} per trade, ` +
-   108	      `gas share ${k.gasShareOfGross === null ? '-' : `${(k.gasShareOfGross * 100).toFixed(0)}%`}, ` +
-   109	      `one-sided ${k.oneSidedRate === null ? '-' : `${(k.oneSidedRate * 100).toFixed(0)}%`}`,
-   110	  );
-   111	  if (k.inventorySkew.length) {
-   112	    lines.push(`— Inventory (wallet share) — ${k.inventorySkew.map((s) => `${s.token} ${(s.wallet_share * 100).toFixed(0)}%`).join(', ')}`);
-   113	  }
-   114	  return lines.join('\n');
-   115	}
-   116	
-   117	/** CSV of opportunities per token and Dhaka hour, for spreadsheets. */
-   118	export function opportunitiesCsv(db: Db, sinceTs: number): string {
-   119	  const rows = db.all<{ token: string; hour: number; n: number; max_gross_bps: number | null; minutes_above_20: number }>(
-   120	    `SELECT token, ((ts / 3600000) + ${DHAKA_H}) % 24 hour, COUNT(*) n, MAX(gross_bps) max_gross_bps,
-   121	            COUNT(DISTINCT CASE WHEN gross_bps >= 20 THEN ts / 60000 END) minutes_above_20
-   122	     FROM opportunities WHERE ts >= ? GROUP BY token, hour ORDER BY token, hour`,
-   123	    sinceTs,
-   124	  );
-   125	  return ['token,hour_dhaka,quotes,max_gross_bps,minutes_above_20', ...rows.map((r) => `${r.token},${r.hour},${r.n},${r.max_gross_bps ?? ''},${r.minutes_above_20}`)].join('\n');
-   126	}
+    47	  // The hurdle uses the BEST row's own size: MAX(net) and MAX(size) from different rows would
+    48	  // make the hurdle stricter than the chosen trade's own (round-3 review, M4).
+    49	  const wouldHave = [20, 30, 40, 60].map((h) => {
+    50	    const r = q<{ trades: number; pnl: number | null }>(
+    51	      `SELECT COUNT(*) trades, SUM(best) pnl FROM (
+    52	         SELECT net_usd best, size_usd size FROM (
+    53	           SELECT net_usd, size_usd, ROW_NUMBER() OVER (
+    54	             PARTITION BY token, direction, ts / 60000 ORDER BY net_usd DESC, size_usd DESC
+    55	           ) rn FROM opportunities
+    56	           WHERE ts >= ? AND net_usd IS NOT NULL AND size_usd > 0
+    57	         ) WHERE rn = 1
+    58	       ) WHERE best >= size * ? / 10000.0`,
+    59	      sinceTs,
+    60	      h,
+    61	    )[0];
+    62	    return { hurdle_bps: h, trades: r?.trades ?? 0, pnl: r?.pnl ?? 0 };
+    63	  });
+    64	  const t = q<{ n: number; diff: number | null; gas: number | null; gross: number | null; one_sided: number | null }>(
+    65	    `SELECT COUNT(*) n,
+    66	            AVG(CASE WHEN status IN ('ok','paper') THEN pnl_usd - expected_net END) diff,
+    67	            SUM(CASE WHEN status IN ('ok','paper') THEN gas_usd ELSE 0 END) gas,
+    68	            SUM(CASE WHEN status IN ('ok','paper') THEN pnl_usd + gas_usd + cex_fee_usd END) gross,
+    69	            SUM(CASE WHEN status = 'one_sided' THEN 1 ELSE 0 END) one_sided
+    70	     FROM trades WHERE ts >= ? AND mode = ? AND status != 'approval'`,
+    71	    sinceTs,
+    72	    mode,
+    73	  )[0];
+    74	  const inventorySkew = q<{ token: string; wallet_share: number }>(
+    75	    `SELECT token, wallet_usd / NULLIF(wallet_usd + mexc_usd, 0) wallet_share FROM inventory_snapshots s
+    76	     WHERE ts = (SELECT MAX(ts) FROM inventory_snapshots WHERE token = s.token)`,
+    77	  );
+    78	  return {
+    79	    opportunitiesPerToken,
+    80	    decisions,
+    81	    minutesAbove,
+    82	    histogram,
+    83	    byHourDhaka,
+    84	    wouldHave,
+    85	    realizedMinusExpected: t?.n ? t.diff : null,
+    86	    gasShareOfGross: t?.gross ? (t.gas ?? 0) / t.gross : null,
+    87	    oneSidedRate: t?.n ? (t.one_sided ?? 0) / t.n : null,
+    88	    inventorySkew,
+    89	  };
+    90	}
+    91	
+    92	const bar = (n: number, max: number) => '█'.repeat(max > 0 ? Math.max(n > 0 ? 1 : 0, Math.round((n / max) * 12)) : 0);
+    93	
+    94	export function formatKpis(k: Kpis): string {
+    95	  const lines: string[] = ['— Opportunities —'];
+    96	  if (!k.opportunitiesPerToken.length) lines.push('  none logged yet');
+    97	  for (const o of k.opportunitiesPerToken) lines.push(`  ${o.token}: ${o.n} quotes, best gross ${o.best_gross_bps?.toFixed(1) ?? '-'} bps`);
+    98	  lines.push(`  decisions: ${k.decisions.map((d) => `${d.decision} ${d.n}`).join(', ') || '-'}`);
+    99	  lines.push(`  minutes with gross gap ≥20/35/50 bps: ${k.minutesAbove.map((m) => m.minutes).join(' / ')}`);
+   100	  const tokens = [...new Set(k.histogram.map((h) => h.token))];
+   101	  if (tokens.length) lines.push('— Gross gap histogram (bps) —');
+   102	  for (const tok of tokens) {
+   103	    const rows = BUCKETS.map((b) => k.histogram.find((h) => h.token === tok && h.bucket === b)?.n ?? 0);
+   104	    const max = Math.max(...rows);
+   105	    lines.push(`  ${tok}: ${BUCKETS.map((b, i) => `${b}:${rows[i]}${bar(rows[i], max)}`).join(' ')}`);
+   106	  }
+   107	  if (k.byHourDhaka.length) {
+   108	    lines.push(`— Minutes ≥20 bps by hour (Dhaka) — ${k.byHourDhaka.map((h) => `${String(h.hour).padStart(2, '0')}h:${h.minutes_above_20}`).join(' ')}`);
+   109	  }
+   110	  lines.push(`— Would-have PnL — ${k.wouldHave.map((w) => `${w.hurdle_bps}bps: ${w.trades} trades ${usd(w.pnl)}`).join(' | ')}`);
+   111	  lines.push(
+   112	    `— Execution — realized−expected ${k.realizedMinusExpected === null ? '-' : usd(k.realizedMinusExpected)} per trade, ` +
+   113	      `gas share ${k.gasShareOfGross === null ? '-' : `${(k.gasShareOfGross * 100).toFixed(0)}%`}, ` +
+   114	      `one-sided ${k.oneSidedRate === null ? '-' : `${(k.oneSidedRate * 100).toFixed(0)}%`}`,
+   115	  );
+   116	  if (k.inventorySkew.length) {
+   117	    lines.push(`— Inventory (wallet share) — ${k.inventorySkew.map((s) => `${s.token} ${(s.wallet_share * 100).toFixed(0)}%`).join(', ')}`);
+   118	  }
+   119	  return lines.join('\n');
+   120	}
+   121	
+   122	/** CSV of opportunities per token and Dhaka hour, for spreadsheets. */
+   123	export function opportunitiesCsv(db: Db, sinceTs: number): string {
+   124	  const rows = db.all<{ token: string; hour: number; n: number; max_gross_bps: number | null; minutes_above_20: number }>(
+   125	    `SELECT token, ((ts / 3600000) + ${DHAKA_H}) % 24 hour, COUNT(*) n, MAX(gross_bps) max_gross_bps,
+   126	            COUNT(DISTINCT CASE WHEN gross_bps >= 20 THEN ts / 60000 END) minutes_above_20
+   127	     FROM opportunities WHERE ts >= ? GROUP BY token, hour ORDER BY token, hour`,
+   128	    sinceTs,
+   129	  );
+   130	  return ['token,hour_dhaka,quotes,max_gross_bps,minutes_above_20', ...rows.map((r) => `${r.token},${r.hour},${r.n},${r.max_gross_bps ?? ''},${r.minutes_above_20}`)].join('\n');
+   131	}
 ```
 
 ## `src/log.ts`
 
-```ts
+```
      1	// Console logger that scrubs secrets (private key, API keys, bot token) from every line.
      2	
      3	let secrets: string[] = [];
@@ -2444,7 +2545,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/main.ts`
 
-```ts
+```
      1	// Entry point. Wires everything together, runs one scan per Ethereum block.
      2	import fs from 'node:fs';
      3	import { loadConfig, secretsOf, validateConfig } from './config.js';
@@ -2842,7 +2943,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/pricing.ts`
 
-```ts
+```
      1	// Pure profit math. No I/O, so it is fully unit tested.
      2	//
      3	// net = sell value - buy value - MEXC taker fee - gas - slippage (both sides) - safety margin
@@ -3092,7 +3193,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/recovery.ts`
 
-```ts
+```
      1	// Startup recovery after a crash/restart in the middle of a trade.
      2	import type { Db } from './db.js';
      3	import type { Risk } from './risk.js';
@@ -3216,7 +3317,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/report.ts`
 
-```ts
+```
      1	// npm run report -- [hours] [mode] [--csv]   e.g. `npm run report -- 168 paper`
      2	// With --csv: opportunities per token and Dhaka hour, as CSV (for a spreadsheet).
      3	import 'dotenv/config';
@@ -3235,7 +3336,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/risk.ts`
 
-```ts
+```
      1	// Risk limits: daily trade count, daily loss limit, failure streak, manual kill switch.
      2	// All state lives in SQLite, so a restart (pm2) never resets the limits.
      3	import type { Db, TradeStatus } from './db.js';
@@ -3333,7 +3434,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/scanner.ts`
 
-```ts
+```
      1	// Continuously scans EVERY MEXC USDT pair whose coin is an Ethereum (ERC20) token,
      2	// and finds tokens that are cheaper on MEXC than on Ethereum DEXs.
      3	//
@@ -3445,7 +3546,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/summary.ts`
 
-```ts
+```
      1	import type { Db } from './db.js';
      2	import { usd } from './util.js';
      3	import { computeKpis, formatKpis } from './kpi.js';
@@ -3475,7 +3576,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/telegram.ts`
 
-```ts
+```
      1	// Telegram alerts + commands (/stop, /start, /status, ...).
      2	// Commands are obeyed only from the admin user, in a private chat with the bot.
      3	import { log, errMsg, redact } from './log.js';
@@ -3585,7 +3686,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/transfer.ts`
 
-```ts
+```
      1	// TRANSFER strategy: scan all MEXC ERC20 tokens -> buy the one that is cheaper on MEXC ->
      2	// withdraw it to the hot wallet -> sell it on an Ethereum DEX.
      3	//
@@ -3600,697 +3701,719 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     12	//  - If arrival-time price would lose more than TRANSFER_MAX_LOSS_PCT, the tokens are held (alert).
     13	//  - An unknown on-chain outcome pauses trading instead of retrying.
     14	import type { Config } from './config.js';
-    15	import type { Aggregator, Quote } from './dex/aggregator.js';
-    16	import { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
-    17	import type { GasInfo, TxResult } from './dex/chain.js';
-    18	import type { Book, CoinConfig, Order, SymbolInfo, WithdrawRecord } from './mexc/rest.js';
-    19	import { AmbiguousRequestError } from './mexc/rest.js';
-    20	import type { Db, TransferRow } from './db.js';
-    21	import type { Risk } from './risk.js';
-    22	import type { Notifier } from './engine.js';
-    23	import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine.js';
-    24	import { closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
-    25	import { type Gap, type ScanToken, dexPrices, findGaps, loadUniverse } from './scanner.js';
-    26	import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
-    27	import { log, errMsg } from './log.js';
-    28	import { decimalsOfStep, dhakaDay, floorToStep, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
-    29	
-    30	const APPROVE_GAS = 60_000n;
-    31	const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
-    32	const SELL_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000]; // after attempt 1, 2, 3; attempt 4 -> stuck
-    33	const MAX_SELL_ATTEMPTS = 4;
-    34	const FALSE_GAP_COOLDOWN_MS = 10 * 60_000;
-    35	
-    36	export interface TransferMexc {
-    37	  exchangeInfo(): Promise<SymbolInfo[]>;
-    38	  tickers24h(): Promise<{ symbol: string; quoteVolume: string; lastPrice: string }[]>;
-    39	  coinConfigs(): Promise<CoinConfig[]>;
-    40	  bookTickers(): Promise<Map<string, { bid: number; ask: number }>>;
-    41	  depth(symbol: string, limit?: number): Promise<Book>;
-    42	  balances(): Promise<Record<string, number>>;
-    43	  limitOrder(symbol: string, side: 'BUY' | 'SELL', quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
-    44	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
-    45	  getOrder(symbol: string, orderId: string): Promise<Order>;
-    46	  getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
-    47	  cancelOrder(symbol: string, orderId: string): Promise<Order>;
-    48	  withdraw(p: { coin: string; netWork: string; address: string; amount: string; contractAddress?: string; withdrawOrderId?: string }): Promise<string>;
-    49	  findWithdraw(coin: string, sinceTs: number, ref: { id?: string | null; withdrawOrderId?: string }): Promise<WithdrawRecord | null>;
-    50	}
-    51	export interface TransferChain {
-    52	  readonly address: string;
-    53	  gas(): Promise<GasInfo>;
-    54	  decimals(token: string): Promise<number>;
-    55	  tokenBalance(token: string): Promise<bigint>;
-    56	  approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
-    57	  simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
-    58	  send(
-    59	    tx: { to: string; data: string; value?: bigint },
-    60	    gasLimit: bigint,
-    61	    gas: GasInfo,
-    62	    timeoutSec: number,
-    63	    onSigned?: (hash: string, nonce: number) => void,
-    64	  ): Promise<TxResult>;
-    65	  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean }>;
-    66	  receipt?(hash: string): Promise<{ status: number | null } | null>;
-    67	}
-    68	
-    69	export interface TransferDeps {
-    70	  cfg: Config;
-    71	  mexc: TransferMexc;
-    72	  chain: TransferChain;
-    73	  agg: Aggregator;
-    74	  db: Db;
-    75	  risk: Risk;
-    76	  tg: Notifier;
-    77	  dexPricesFn?: typeof dexPrices;
-    78	  sleep?: (ms: number) => Promise<void>;
-    79	  now?: () => number;
-    80	}
-    81	
-    82	interface Candidate {
-    83	  gap: Gap;
-    84	  plan: NonNullable<ReturnType<typeof planCexBuy>>;
-    85	  ev: ReturnType<typeof evaluateTransfer>;
-    86	  decimals: number;
-    87	}
-    88	
-    89	const WITHDRAW_FAILED = new Set([8, 9]); // FAILED, CANCEL
-    90	const WITHDRAW_MANUAL = 10;
-    91	const buyCid = (id: number) => `arb${id}b`;
-    92	const withdrawCid = (id: number) => `arb${id}w`;
-    93	
-    94	export class TransferEngine {
-    95	  universe: ScanToken[] = [];
-    96	  private universeTs = 0;
-    97	  private lastNote = new Map<string, string>();
-    98	  private cooldown = new Map<string, number>(); // token -> skip exact quotes until
-    99	  private alerted = new Set<string>();
-   100	  private sleep: (ms: number) => Promise<void>;
-   101	  private now: () => number;
-   102	  lastGasGwei = 0;
-   103	  lastTopGaps: Gap[] = [];
-   104	
-   105	  constructor(private d: TransferDeps) {
-   106	    this.sleep = d.sleep ?? realSleep;
-   107	    this.now = d.now ?? Date.now;
-   108	  }
-   109	
-   110	  private get cfg() {
-   111	    return this.d.cfg;
-   112	  }
-   113	  private get live() {
-   114	    return this.cfg.mode === 'live';
-   115	  }
-   116	  /** USDT per USDC, from MEXC USDCUSDT (refreshed every tick). */
-   117	  stableRate = 1;
-   118	  private fee(base: string) {
-   119	    return takerFeeFor(this.universe.find((t) => t.base === base)?.rules, this.cfg.mexcTakerFee);
-   120	  }
-   121	  private costs(base: string) {
-   122	    return {
-   123	      takerFee: this.fee(base),
-   124	      cexSlippageBps: this.cfg.cexSlippageBps,
-   125	      safetyMarginUsd: this.cfg.safetyMarginUsd,
-   126	      safetyMarginBps: this.cfg.safetyMarginBps,
-   127	      stableInUsdt: this.stableRate,
-   128	    };
-   129	  }
-   130	  private note(key: string, msg: string) {
-   131	    if (this.lastNote.get(key) !== msg) {
-   132	      this.lastNote.set(key, msg);
-   133	      log.info(msg);
-   134	    }
-   135	  }
-   136	  /** Telegram once per key (per process). */
-   137	  private async alertOnce(key: string, text: string) {
-   138	    if (this.alerted.has(key)) return;
-   139	    this.alerted.add(key);
-   140	    await this.d.tg.send(text);
-   141	  }
-   142	  private reload(row: TransferRow): TransferRow {
-   143	    return this.d.db.getTransfer(row.id!)!;
-   144	  }
-   145	
-   146	  async refreshUniverse(force = false): Promise<void> {
-   147	    if (!force && this.now() - this.universeTs < 10 * 60_000) return;
-   148	    this.universe = await loadUniverse(this.d.mexc, { minVolumeUsd: this.cfg.minMexcVolumeUsd, only: this.cfg.watchlist });
-   149	    this.universeTs = this.now();
-   150	    log.info(`scanner universe: ${this.universe.length} MEXC ERC20 tokens (deposit+withdraw open, volume >= $${this.cfg.minMexcVolumeUsd})`);
-   151	  }
-   152	
-   153	  /** One scan cycle. Always advances open transfers first. */
-   154	  async tick(): Promise<void> {
-   155	    const gas = await this.d.chain.gas();
-   156	    this.lastGasGwei = Number(gas.effective) / 1e9;
-   157	    const tickers = await this.d.mexc.bookTickers();
-   158	    const eth = tickers.get('ETHUSDT');
-   159	    if (!eth) throw new Error('no ETHUSDT ticker');
-   160	    const ethUsd = (eth.bid + eth.ask) / 2;
-   161	    const st = tickers.get('USDCUSDT');
-   162	    const rate = st ? (st.bid + st.ask) / 2 : NaN;
-   163	    if (!(rate >= 0.99 && rate <= 1.01)) return this.note('stable', `no trading: USDC/USDT rate ${rate} unusable`);
-   164	    this.stableRate = rate;
-   165	
-   166	    // An earlier DEX tx with unknown outcome blocks every new send (same nonce rule as the inventory engine).
-   167	    let txBlocked = false;
-   168	    if (this.d.chain.checkUnresolved) {
-   169	      const u = await this.d.chain.checkUnresolved();
-   170	      if (u.dropped) await this.d.tg.send('ℹ️ An unresolved DEX tx was dropped by every RPC (never mined); its nonce is free again.');
-   171	      txBlocked = u.state === 'pending';
-   172	      if (txBlocked) await this.alertOnce('unresolved-tx', '⏳ An earlier DEX tx is still unresolved: no DEX sales or new trades until it is mined or dropped.');
-   173	      else this.alerted.delete('unresolved-tx');
-   174	    }
-   175	
-   176	    for (const row of this.d.db.openTransfers()) {
-   177	      if (txBlocked && row.status === 'selling') continue; // would only be refused
-   178	      try {
-   179	        await this.advance(row, gas, ethUsd);
-   180	      } catch (e) {
-   181	        log.error(`transfer #${row.id} ${row.base}: ${errMsg(e)}`);
-   182	      }
-   183	    }
-   184	
-   185	    await this.refreshUniverse();
-   186	    const dex = await (this.d.dexPricesFn ?? dexPrices)(this.universe.map((t) => t.address));
-   187	    const now = this.now();
-   188	    const gaps = findGaps(this.universe, tickers, dex, {
-   189	      minTvlUsd: this.cfg.minDexTvlUsd,
-   190	      minGapPct: this.cfg.scanMinGapPct,
-   191	      maxGapPct: this.cfg.scanMaxGapPct,
-   192	    });
-   193	    this.lastTopGaps = gaps.slice(0, 5);
-   194	    this.note(
-   195	      'gaps',
-   196	      gaps.length
-   197	        ? `scan: ${gaps.length} gaps >= ${this.cfg.scanMinGapPct}%: ${gaps.slice(0, 5).map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ')}`
-   198	        : `scan: ${this.universe.length} tokens, no gap >= ${this.cfg.scanMinGapPct}%`,
-   199	    );
-   200	
-   201	    const block = this.d.risk.blockReason();
-   202	    if (block) return this.note('block', `new trades blocked: ${block}`);
-   203	    this.note('block', 'new trades enabled');
-   204	    if (txBlocked) return;
-   205	    if (this.d.db.blockingTransfers().length >= this.cfg.maxOpenTransfers) return this.note('open', 'waiting for open transfer to finish');
-   206	    this.note('open', 'no open transfer');
-   207	    if (this.lastGasGwei > this.cfg.maxGasGwei) return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > ${this.cfg.maxGasGwei}, no new trades`);
-   208	    this.note('gas', 'gas ok');
-   209	
-   210	    // Skip tokens whose exact quote recently showed the gap was not real, so they cannot starve the rest.
-   211	    // Never two transfers of the same token at once (they would share one wallet balance), even after
-   212	    // an old one stopped blocking because of a long withdrawal.
-   213	    const busyTokens = new Set([...this.d.db.openTransfers(), ...this.d.db.stuckTransfers()].map((t) => t.base));
-   214	    const fresh = gaps.filter((g) => (this.cooldown.get(g.token.base) ?? 0) <= now && !busyTokens.has(g.token.base));
-   215	    if (!fresh.length) return;
-   216	
-   217	    const usdt = this.live ? ((await this.d.mexc.balances()).USDT ?? 0) : 1e12;
-   218	    let best: Candidate | null = null;
-   219	    for (const g of fresh.slice(0, this.cfg.scanExactQuotes)) {
-   220	      try {
-   221	        const c = await this.evaluate(g, gas, ethUsd, usdt);
-   222	        if (!c) {
-   223	          this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
-   224	          continue;
-   225	        }
-   226	        const need = threshold(c.ev.costUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
-   227	        log.info(`${g.token.base}: gap ${g.gapPct.toFixed(2)}%, size ${usd(c.ev.costUsd)}, exact net ${usd(c.ev.net)} (need ${usd(need)})`);
-   228	        if (c.ev.net <= need) this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
-   229	        else if (!best || c.ev.net > best.ev.net) best = c;
-   230	      } catch (e) {
-   231	        log.warn(`${g.token.base} evaluate: ${errMsg(e)}`);
-   232	        this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
-   233	      }
-   234	    }
-   235	    if (!best) return;
-   236	    if (!this.live) return this.recordPaper(best);
-   237	    await this.start(best, gas, ethUsd);
-   238	  }
-   239	
-   240	  /** Exact, size-specific numbers: MEXC depth walk + withdraw fee + aggregator quote + gas + drift reserve. */
-   241	  async evaluate(g: Gap, gas: GasInfo, ethUsd: number, usdt: number): Promise<Candidate | null> {
-   242	    const size = Math.min(this.cfg.maxTradeUsd, usdt * 0.99);
-   243	    if (size < this.cfg.minTradeUsd) {
-   244	      this.note('usdt', `MEXC USDT too low for a trade (${usd(usdt)})`);
-   245	      return null;
-   246	    }
-   247	    const t = g.token;
-   248	    const book = await this.d.mexc.depth(t.symbol, 20);
-   249	    const plan = planCexBuy({ sizeUsd: size, asks: book.asks, qtyStep: t.qtyStep, takerFee: this.fee(t.base) });
-   250	    if (!plan || plan.tokensToSell < t.withdrawMin) return null;
-   251	    const arriving = plan.tokensToSell - t.withdrawFee;
-   252	    if (arriving <= 0) return null;
-   253	    const decimals = await this.d.chain.decimals(t.address);
-   254	    const q = await this.d.agg.price({
-   255	      sellToken: t.address,
-   256	      buyToken: this.cfg.usdc,
-   257	      sellAmount: toUnits(arriving, decimals),
-   258	      taker: this.live ? this.d.chain.address : PAPER_TAKER,
-   259	      slippageBps: this.cfg.dexSlippageBps,
-   260	    });
-   261	    const ev = evaluateTransfer({
-   262	      plan,
-   263	      withdrawFeeTokens: t.withdrawFee,
-   264	      usdcOut: toFloat(q.buyAmount, USDC_DECIMALS),
-   265	      usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
-   266	      gasUsd: gasUsd(q.gas + APPROVE_GAS, gas.effective, ethUsd),
-   267	      driftBps: this.cfg.transferDriftBps,
-   268	      costs: this.costs(t.base),
-   269	    });
-   270	    return { gap: g, plan, ev, decimals };
-   271	  }
-   272	
-   273	  private async recordPaper(c: Candidate) {
-   274	    const t = c.gap.token;
-   275	    const now = this.now();
-   276	    this.d.db.insertTrade({
-   277	      ts: now, day: dhakaDay(now), mode: 'paper', symbol: t.base, direction: 'TRANSFER',
-   278	      size_usd: c.ev.costUsd, qty: c.plan.qty, buy_price: c.ev.buyPrice, sell_price: c.ev.sellPrice,
-   279	      expected_net: c.ev.net, cex_fee_usd: c.ev.cexFeeUsd + c.ev.withdrawFeeUsd, gas_usd: c.ev.gasUsd,
-   280	      pnl_usd: c.ev.net, status: 'paper', dex_tx: null, cex_order_id: null, note: `gap ${c.gap.gapPct.toFixed(2)}%`,
-   281	    });
-   282	    await this.d.tg.send(
-   283	      `📝 PAPER TRANSFER ${t.base}: buy MEXC @ ${c.ev.buyPrice.toPrecision(6)} -> sell DEX @ ${c.ev.sellPrice.toPrecision(6)}\n` +
-   284	        `Size ${usd(c.ev.costUsd)} | fees ${usd(c.ev.cexFeeUsd + c.ev.withdrawFeeUsd)} | gas ${usd(c.ev.gasUsd)} | drift reserve ${usd(c.ev.driftUsd)}\nNet ${usd(c.ev.net)}`,
-   285	    );
-   286	    this.d.risk.afterTrade('paper');
-   287	    this.cooldown.set(t.base, this.now() + FALSE_GAP_COOLDOWN_MS); // one paper trade per gap
-   288	  }
-   289	
-   290	  /** Create the persisted transfer and run its first steps right away. */
-   291	  private async start(c: Candidate, gas: GasInfo, ethUsd: number) {
-   292	    const t = c.gap.token;
-   293	    const now = this.now();
-   294	    const id = this.d.db.insertTransfer({
-   295	      ts: now, updated: now, base: t.base, symbol: t.symbol, address: t.address, decimals: c.decimals,
-   296	      net_work: t.netWork, qty_step: t.qtyStep, price_decimals: t.priceDecimals, status: 'buying',
-   297	      buy_qty: c.plan.qty, cost_usd: c.ev.costUsd, buy_order_id: null, withdraw_amount: null, withdraw_id: null,
-   298	      wallet_before: null, received: null, usdc_out: null, gas_usd: 0, expected_net: c.ev.net, pnl: null,
-   299	      sell_attempts: 0, alerted_timeout: 0, note: null, withdraw_fee: t.withdrawFee, next_try: 0, force_sell: 0, hold_alerted: 0, sell_tx: null,
-   300	    });
-   301	    log.info(`transfer #${id} ${t.base}: START gap ${c.gap.gapPct.toFixed(2)}% expected ${usd(c.ev.net)}`);
-   302	    const row = this.d.db.getTransfer(id)!;
-   303	    try {
-   304	      await this.buy(row, c.plan.worst * (1 + this.cfg.cexSlippageBps / 10_000));
-   305	    } catch (e) {
-   306	      if (String((e as Error).message).startsWith('UNKNOWN_ORDER_STATE')) {
-   307	        this.d.risk.pause(`MEXC buy state unknown for transfer #${id}`, true);
-   308	        await this.d.tg.send(`🚨 TRANSFER #${id} ${t.base}: MEXC buy state unknown (${errMsg(e)}). Trading PAUSED; the bot keeps looking for the order.`);
-   309	        return;
-   310	      }
-   311	      const now2 = this.reload(row);
-   312	      if (now2.buy_order_id) {
-   313	        log.warn(`transfer #${id}: error after the buy was placed (${errMsg(e)}); continuing next scan`);
-   314	        return;
-   315	      }
-   316	      return this.fail(now2, `MEXC buy rejected: ${errMsg(e)}`, 0, false);
-   317	    }
-   318	    const next = this.d.db.getTransfer(id)!;
-   319	    if (next.status === 'withdrawing') await this.advance(next, gas, ethUsd);
-   320	  }
-   321	
-   322	  /** Move one transfer forward as far as it can go right now. */
-   323	  async advance(row: TransferRow, gas: GasInfo, ethUsd: number): Promise<void> {
-   324	    if (row.status === 'buying') {
-   325	      if (!row.buy_order_id) {
-   326	        // Crashed or timed out while placing: find the order by our client id, never guess.
-   327	        const o = await this.d.mexc.getOrderByClientId(row.symbol, buyCid(row.id!));
-   328	        if (!o) return this.fail(row, 'MEXC buy was never placed', 0, false);
-   329	        this.d.db.updateTransfer(row.id!, { buy_order_id: o.orderId });
-   330	        row = this.reload(row);
-   331	      }
-   332	      await this.finishBuy(row);
-   333	      row = this.reload(row);
-   334	      if (row.status !== 'withdrawing') return;
-   335	    }
-   336	    if (row.status === 'withdrawing') return this.withdrawStep(row, gas, ethUsd);
-   337	    if (row.status === 'selling') return this.sellStep(row, gas, ethUsd);
-   338	  }
-   339	
-   340	  private async buy(row: TransferRow, limitPrice: number) {
-   341	    const f = 10 ** row.price_decimals;
-   342	    const px = (Math.ceil(limitPrice * f) / f).toFixed(row.price_decimals);
-   343	    const qty = row.buy_qty.toFixed(decimalsOfStep(row.qty_step));
-   344	    const cid = buyCid(row.id!);
-   345	    const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, () => this.d.mexc.limitOrder(row.symbol, 'BUY', qty, px, cid), this.sleep);
-   346	    this.d.db.updateTransfer(row.id!, { buy_order_id: orderId });
-   347	    log.info(`transfer #${row.id} MEXC BUY ${qty} ${row.base} @ ${px} id=${orderId}`);
-   348	    await this.sleep(1500);
-   349	    await this.finishBuy(this.reload(row));
-   350	  }
-   351	
-   352	  private async finishBuy(row: TransferRow) {
-   353	    let o = await this.d.mexc.getOrder(row.symbol, row.buy_order_id!);
-   354	    if (o.status !== 'FILLED') {
-   355	      try {
-   356	        o = await cancelAndConfirm(this.d.mexc, row.symbol, row.buy_order_id!, this.sleep);
-   357	      } catch (e) {
-   358	        log.warn(`transfer #${row.id}: ${errMsg(e)}; checking again next scan`);
-   359	        return; // still 'buying': the order is re-read next tick, never assumed
-   360	      }
-   361	    }
-   362	    const filled = Number(o.executedQty);
-   363	    const cost = Number(o.cummulativeQuoteQty);
-   364	    if (filled <= 0) return this.fail(row, 'MEXC buy did not fill (price moved)', 0, false);
-   365	    this.d.db.updateTransfer(row.id!, { status: 'withdrawing', buy_qty: filled, cost_usd: cost });
-   366	  }
-   367	
-   368	  private async withdrawStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
-   369	    const since = row.ts - 60_000;
-   370	
-   371	    if (!row.withdraw_id) {
-   372	      if (row.withdraw_amount) {
-   373	        // A request was sent before but its result was lost (timeout / restart). Look it up; NEVER resend.
-   374	        const rec = await this.d.mexc.findWithdraw(row.base, since, { withdrawOrderId: withdrawCid(row.id!) });
-   375	        if (rec) {
-   376	          this.d.db.updateTransfer(row.id!, { withdraw_id: rec.id });
-   377	          return;
-   378	        }
-   379	        if (this.now() - row.updated > 10 * 60_000) {
-   380	          this.d.db.updateTransfer(row.id!, { status: 'stuck', note: 'withdraw request outcome unknown' });
-   381	          await this.d.tg.send(
-   382	            `🚨 TRANSFER #${row.id} ${row.base}: withdraw request was sent but MEXC shows no record after 10 min.\n` +
-   383	              `Check MEXC withdraw history. If nothing went out: /sell ${row.id} is NOT right (tokens are on MEXC), sell them on MEXC by hand, then /clear ${row.id}.`,
-   384	          );
-   385	        }
-   386	        return;
-   387	      }
-   388	
-   389	      const free = (await this.d.mexc.balances())[row.base] ?? 0;
-   390	      const amount = floorToStep(Math.min(free, row.buy_qty * (1 - this.fee(row.base))), row.qty_step);
-   391	      const amountStr = amount.toFixed(decimalsOfStep(row.qty_step));
-   392	      const min = this.universe.find((t) => t.base === row.base)?.withdrawMin ?? 0;
-   393	      if (amount <= 0 || amount < min) {
-   394	        const proceeds = amount > 0 ? await this.sellOnMexc(row, amountStr) : 0;
-   395	        return this.fail(row, `amount ${amountStr} below MEXC withdraw minimum ${min}; sold back on MEXC`, proceeds - row.cost_usd);
-   396	      }
-   397	      const before = await this.d.chain.tokenBalance(row.address);
-   398	      // Persist BEFORE sending, so a crash during the request can never cause a second withdrawal.
-   399	      this.d.db.updateTransfer(row.id!, { withdraw_amount: amountStr, wallet_before: before.toString() });
-   400	      try {
-   401	        const id = await this.d.mexc.withdraw({
-   402	          coin: row.base,
-   403	          netWork: row.net_work,
-   404	          address: this.d.chain.address, // ONLY ever our own hot wallet
-   405	          amount: amountStr,
-   406	          contractAddress: row.address,
-   407	          withdrawOrderId: withdrawCid(row.id!),
-   408	        });
-   409	        this.d.db.updateTransfer(row.id!, { withdraw_id: id });
-   410	        await this.d.tg.send(`📤 TRANSFER #${row.id} ${row.base}: bought ${row.buy_qty} on MEXC for ${usd(row.cost_usd)}, withdrawing ${amountStr} to wallet`);
-   411	      } catch (e) {
-   412	        if (e instanceof AmbiguousRequestError) {
-   413	          log.warn(`transfer #${row.id} withdraw request ambiguous, will look it up: ${errMsg(e)}`);
-   414	          return; // next tick: findWithdraw by withdrawOrderId
-   415	        }
-   416	        // Clearly rejected: nothing left MEXC. Close the position there instead.
-   417	        this.d.db.updateTransfer(row.id!, { withdraw_amount: null });
-   418	        const proceeds = await this.sellOnMexc(row, amountStr);
-   419	        return this.fail(this.reload(row), `withdraw rejected: ${errMsg(e)}; sold back on MEXC`, proceeds - row.cost_usd);
-   420	      }
-   421	      return;
-   422	    }
-   423	
-   424	    const rec = await this.d.mexc.findWithdraw(row.base, since, { id: row.withdraw_id, withdrawOrderId: withdrawCid(row.id!) }).catch(() => undefined);
-   425	    const bal = await this.d.chain.tokenBalance(row.address);
-   426	    const diff = bal - BigInt(row.wallet_before ?? '0');
-   427	    // Fee actually charged by MEXC (history) beats the configured one.
-   428	    const fee = rec?.transactionFee !== undefined && rec.transactionFee !== '' ? Number(rec.transactionFee) : row.withdraw_fee;
-   429	    const expected = toUnits(Math.max(0, Number(row.withdraw_amount) - fee), row.decimals);
-   430	
-   431	    // Arrival needs BOTH: MEXC says SUCCESS and the wallet grew by (almost) the expected amount.
-   432	    // A balance change alone could be an unrelated deposit / airdrop.
-   433	    if (rec?.status === 7 && diff > 0n && diff * 100n < expected * 98n) {
-   434	      await this.alertOnce(
-   435	        `wshort-${row.id}`,
-   436	        `⚠️ TRANSFER #${row.id} ${row.base}: MEXC says SUCCESS but the wallet only grew by ${toFloat(diff, row.decimals)} (expected ~${toFloat(expected, row.decimals)}). Waiting; check the wallet.`,
-   437	      );
-   438	    }
-   439	    if (rec?.status === 7 && diff > 0n && diff * 100n >= expected * 98n) {
-   440	      // Sell what was withdrawn, never more (extra balance may belong to something else).
-   441	      const received = diff > (expected * 102n) / 100n ? expected : diff;
-   442	      this.d.db.updateTransfer(row.id!, { status: 'selling', received: received.toString() });
-   443	      log.info(`transfer #${row.id} ${row.base}: ${toFloat(received, row.decimals)} arrived in wallet`);
-   444	      return this.sellStep(this.reload(row), gas, ethUsd);
-   445	    }
-   446	    if (rec && WITHDRAW_FAILED.has(rec.status) && diff <= 0n) {
-   447	      // Funds go back to the MEXC account; sell there once they are visible.
-   448	      const free = (await this.d.mexc.balances())[row.base] ?? 0;
-   449	      if (free < Number(row.withdraw_amount) * 0.99) {
-   450	        return this.alertOnce(`wfail-${row.id}`, `⚠️ TRANSFER #${row.id} ${row.base}: MEXC withdrawal ${rec.status === 8 ? 'FAILED' : 'CANCELLED'}; waiting for the tokens to return to MEXC`);
-   451	      }
-   452	      await this.d.tg.send(`⚠️ TRANSFER #${row.id} ${row.base}: withdrawal ${rec.status === 8 ? 'FAILED' : 'CANCELLED'}, selling back on MEXC`);
-   453	      // Sell what is actually free on MEXC, never more than was withdrawn.
-   454	      const qty = floorToStep(Math.min(free, Number(row.withdraw_amount)), row.qty_step).toFixed(decimalsOfStep(row.qty_step));
-   455	      const proceeds = await this.sellOnMexc(row, qty);
-   456	      return this.fail(row, `withdraw status ${rec.status}`, proceeds - row.cost_usd);
-   457	    }
-   458	    if (rec?.status === WITHDRAW_MANUAL) {
-   459	      await this.alertOnce(`wmanual-${row.id}`, `⏳ TRANSFER #${row.id} ${row.base}: MEXC put the withdrawal under MANUAL review. Waiting.`);
-   460	    }
-   461	    if (rec === null) {
-   462	      await this.alertOnce(`wmissing-${row.id}`, `⚠️ TRANSFER #${row.id} ${row.base}: withdrawal ${row.withdraw_id} not found in MEXC history. Still watching the wallet.`);
+    15	import { BestOf, ZEROX_ALLOWANCE_HOLDER, type Aggregator, type Quote } from './dex/aggregator.js';
+    16	import type { GasInfo, TxResult } from './dex/chain.js';
+    17	import type { Book, CoinConfig, Order, SymbolInfo, WithdrawRecord } from './mexc/rest.js';
+    18	import { AmbiguousRequestError } from './mexc/rest.js';
+    19	import type { Db, TransferRow } from './db.js';
+    20	import type { Risk } from './risk.js';
+    21	import type { Notifier } from './engine.js';
+    22	import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine.js';
+    23	import { closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
+    24	import { type Gap, type ScanToken, dexPrices, findGaps, loadUniverse } from './scanner.js';
+    25	import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
+    26	import { log, errMsg } from './log.js';
+    27	import { decimalsOfStep, dhakaDay, floorToStep, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+    28	
+    29	const APPROVE_GAS = 60_000n;
+    30	const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
+    31	const SELL_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000]; // after attempt 1, 2, 3; attempt 4 -> stuck
+    32	const MAX_SELL_ATTEMPTS = 4;
+    33	const FALSE_GAP_COOLDOWN_MS = 10 * 60_000;
+    34	
+    35	export interface TransferMexc {
+    36	  exchangeInfo(): Promise<SymbolInfo[]>;
+    37	  tickers24h(): Promise<{ symbol: string; quoteVolume: string; lastPrice: string }[]>;
+    38	  coinConfigs(): Promise<CoinConfig[]>;
+    39	  bookTickers(): Promise<Map<string, { bid: number; ask: number }>>;
+    40	  depth(symbol: string, limit?: number): Promise<Book>;
+    41	  balances(): Promise<Record<string, number>>;
+    42	  limitOrder(symbol: string, side: 'BUY' | 'SELL', quantity: string, price: string, clientOrderId?: string): Promise<{ orderId: string }>;
+    43	  marketSell(symbol: string, quantity: string, clientOrderId?: string): Promise<{ orderId: string }>;
+    44	  getOrder(symbol: string, orderId: string): Promise<Order>;
+    45	  getOrderByClientId(symbol: string, clientOrderId: string): Promise<Order | null>;
+    46	  cancelOrder(symbol: string, orderId: string): Promise<Order>;
+    47	  withdraw(p: { coin: string; netWork: string; address: string; amount: string; contractAddress?: string; withdrawOrderId?: string }): Promise<string>;
+    48	  findWithdraw(coin: string, sinceTs: number, ref: { id?: string | null; withdrawOrderId?: string }): Promise<WithdrawRecord | null>;
+    49	}
+    50	export interface TransferChain {
+    51	  readonly address: string;
+    52	  gas(): Promise<GasInfo>;
+    53	  decimals(token: string): Promise<number>;
+    54	  tokenBalance(token: string): Promise<bigint>;
+    55	  approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
+    56	  simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
+    57	  send(
+    58	    tx: { to: string; data: string; value?: bigint },
+    59	    gasLimit: bigint,
+    60	    gas: GasInfo,
+    61	    timeoutSec: number,
+    62	    onSigned?: (hash: string, nonce: number) => void,
+    63	  ): Promise<TxResult>;
+    64	  checkUnresolved?(): Promise<{ state: 'clear' | 'pending'; dropped?: boolean }>;
+    65	  receipt?(hash: string): Promise<{ status: number | null } | null>;
+    66	}
+    67	
+    68	export interface TransferDeps {
+    69	  cfg: Config;
+    70	  mexc: TransferMexc;
+    71	  chain: TransferChain;
+    72	  agg: Aggregator;
+    73	  db: Db;
+    74	  risk: Risk;
+    75	  tg: Notifier;
+    76	  dexPricesFn?: typeof dexPrices;
+    77	  sleep?: (ms: number) => Promise<void>;
+    78	  now?: () => number;
+    79	}
+    80	
+    81	interface Candidate {
+    82	  gap: Gap;
+    83	  plan: NonNullable<ReturnType<typeof planCexBuy>>;
+    84	  ev: ReturnType<typeof evaluateTransfer>;
+    85	  decimals: number;
+    86	}
+    87	
+    88	const WITHDRAW_FAILED = new Set([8, 9]); // FAILED, CANCEL
+    89	const WITHDRAW_MANUAL = 10;
+    90	const buyCid = (id: number) => `arb${id}b`;
+    91	const withdrawCid = (id: number) => `arb${id}w`;
+    92	
+    93	export class TransferEngine {
+    94	  universe: ScanToken[] = [];
+    95	  private universeTs = 0;
+    96	  private lastNote = new Map<string, string>();
+    97	  private cooldown = new Map<string, number>(); // token -> skip exact quotes until
+    98	  private alerted = new Set<string>();
+    99	  private sleep: (ms: number) => Promise<void>;
+   100	  private now: () => number;
+   101	  lastGasGwei = 0;
+   102	  lastTopGaps: Gap[] = [];
+   103	
+   104	  constructor(private d: TransferDeps) {
+   105	    this.sleep = d.sleep ?? realSleep;
+   106	    this.now = d.now ?? Date.now;
+   107	  }
+   108	
+   109	  private get cfg() {
+   110	    return this.d.cfg;
+   111	  }
+   112	  private get live() {
+   113	    return this.cfg.mode === 'live';
+   114	  }
+   115	  /** USDT per USDC, from MEXC USDCUSDT (refreshed every tick). */
+   116	  stableRate = 1;
+   117	  private fee(base: string) {
+   118	    return takerFeeFor(this.universe.find((t) => t.base === base)?.rules, this.cfg.mexcTakerFee);
+   119	  }
+   120	  private costs(base: string) {
+   121	    return {
+   122	      takerFee: this.fee(base),
+   123	      cexSlippageBps: this.cfg.cexSlippageBps,
+   124	      safetyMarginUsd: this.cfg.safetyMarginUsd,
+   125	      safetyMarginBps: this.cfg.safetyMarginBps,
+   126	      stableInUsdt: this.stableRate,
+   127	    };
+   128	  }
+   129	  private note(key: string, msg: string) {
+   130	    if (this.lastNote.get(key) !== msg) {
+   131	      this.lastNote.set(key, msg);
+   132	      log.info(msg);
+   133	    }
+   134	  }
+   135	  /** Telegram once per key (per process). */
+   136	  private async alertOnce(key: string, text: string) {
+   137	    if (this.alerted.has(key)) return;
+   138	    this.alerted.add(key);
+   139	    await this.d.tg.send(text);
+   140	  }
+   141	  private reload(row: TransferRow): TransferRow {
+   142	    return this.d.db.getTransfer(row.id!)!;
+   143	  }
+   144	
+   145	  async refreshUniverse(force = false): Promise<void> {
+   146	    if (!force && this.now() - this.universeTs < 10 * 60_000) return;
+   147	    this.universe = await loadUniverse(this.d.mexc, { minVolumeUsd: this.cfg.minMexcVolumeUsd, only: this.cfg.watchlist });
+   148	    this.universeTs = this.now();
+   149	    log.info(`scanner universe: ${this.universe.length} MEXC ERC20 tokens (deposit+withdraw open, volume >= $${this.cfg.minMexcVolumeUsd})`);
+   150	  }
+   151	
+   152	  /** One scan cycle. Always advances open transfers first. */
+   153	  async tick(): Promise<void> {
+   154	    const gas = await this.d.chain.gas();
+   155	    this.lastGasGwei = Number(gas.effective) / 1e9;
+   156	    const tickers = await this.d.mexc.bookTickers();
+   157	    const eth = tickers.get('ETHUSDT');
+   158	    if (!eth) throw new Error('no ETHUSDT ticker');
+   159	    const ethUsd = (eth.bid + eth.ask) / 2;
+   160	    const st = tickers.get('USDCUSDT');
+   161	    const rate = st ? (st.bid + st.ask) / 2 : NaN;
+   162	    if (!(rate >= 0.99 && rate <= 1.01)) return this.note('stable', `no trading: USDC/USDT rate ${rate} unusable`);
+   163	    this.stableRate = rate;
+   164	
+   165	    // BestOf must compare quotes AFTER gas, like the inventory engine does (round-3, L7f).
+   166	    // The transfer's buy token is always the stable, so gas converts straight to stable units.
+   167	    if (this.d.agg instanceof BestOf) {
+   168	      const dec = await this.d.chain.decimals(this.cfg.usdc);
+   169	      this.d.agg.gasInOutput = (units) => toUnits(gasUsd(units, gas.effective, ethUsd) / this.stableRate, dec);
+   170	    }
+   171	
+   172	    // An earlier DEX tx with unknown outcome blocks every new send (same nonce rule as the inventory engine).
+   173	    let txBlocked = false;
+   174	    if (this.d.chain.checkUnresolved) {
+   175	      const u = await this.d.chain.checkUnresolved();
+   176	      if (u.dropped) await this.d.tg.send('ℹ️ An unresolved DEX tx was dropped by every RPC (never mined); its nonce is free again.');
+   177	      txBlocked = u.state === 'pending';
+   178	      if (txBlocked) await this.alertOnce('unresolved-tx', '⏳ An earlier DEX tx is still unresolved: no DEX sales or new trades until it is mined or dropped.');
+   179	      else this.alerted.delete('unresolved-tx');
+   180	    }
+   181	
+   182	    for (const row of this.d.db.openTransfers()) {
+   183	      if (txBlocked && row.status === 'selling') continue; // would only be refused
+   184	      try {
+   185	        await this.advance(row, gas, ethUsd);
+   186	      } catch (e) {
+   187	        log.error(`transfer #${row.id} ${row.base}: ${errMsg(e)}`);
+   188	      }
+   189	    }
+   190	
+   191	    await this.refreshUniverse();
+   192	    const dex = await (this.d.dexPricesFn ?? dexPrices)(this.universe.map((t) => t.address));
+   193	    const now = this.now();
+   194	    const gaps = findGaps(this.universe, tickers, dex, {
+   195	      minTvlUsd: this.cfg.minDexTvlUsd,
+   196	      minGapPct: this.cfg.scanMinGapPct,
+   197	      maxGapPct: this.cfg.scanMaxGapPct,
+   198	    });
+   199	    this.lastTopGaps = gaps.slice(0, 5);
+   200	    this.note(
+   201	      'gaps',
+   202	      gaps.length
+   203	        ? `scan: ${gaps.length} gaps >= ${this.cfg.scanMinGapPct}%: ${gaps.slice(0, 5).map((g) => `${g.token.base} ${g.gapPct.toFixed(1)}%`).join(', ')}`
+   204	        : `scan: ${this.universe.length} tokens, no gap >= ${this.cfg.scanMinGapPct}%`,
+   205	    );
+   206	
+   207	    const block = this.d.risk.blockReason();
+   208	    if (block) return this.note('block', `new trades blocked: ${block}`);
+   209	    this.note('block', 'new trades enabled');
+   210	    if (txBlocked) return;
+   211	    if (this.d.db.blockingTransfers().length >= this.cfg.maxOpenTransfers) return this.note('open', 'waiting for open transfer to finish');
+   212	    this.note('open', 'no open transfer');
+   213	    if (this.lastGasGwei > this.cfg.maxGasGwei) return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > ${this.cfg.maxGasGwei}, no new trades`);
+   214	    this.note('gas', 'gas ok');
+   215	
+   216	    // Skip tokens whose exact quote recently showed the gap was not real, so they cannot starve the rest.
+   217	    // Never two transfers of the same token at once (they would share one wallet balance), even after
+   218	    // an old one stopped blocking because of a long withdrawal.
+   219	    const busyTokens = new Set([...this.d.db.openTransfers(), ...this.d.db.stuckTransfers()].map((t) => t.base));
+   220	    const fresh = gaps.filter((g) => (this.cooldown.get(g.token.base) ?? 0) <= now && !busyTokens.has(g.token.base));
+   221	    if (!fresh.length) return;
+   222	
+   223	    const usdt = this.live ? ((await this.d.mexc.balances()).USDT ?? 0) : 1e12;
+   224	    let best: Candidate | null = null;
+   225	    for (const g of fresh.slice(0, this.cfg.scanExactQuotes)) {
+   226	      try {
+   227	        const c = await this.evaluate(g, gas, ethUsd, usdt);
+   228	        if (!c) {
+   229	          this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
+   230	          continue;
+   231	        }
+   232	        const need = threshold(c.ev.costUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
+   233	        log.info(`${g.token.base}: gap ${g.gapPct.toFixed(2)}%, size ${usd(c.ev.costUsd)}, exact net ${usd(c.ev.net)} (need ${usd(need)})`);
+   234	        if (c.ev.net <= need) this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
+   235	        else if (!best || c.ev.net > best.ev.net) best = c;
+   236	      } catch (e) {
+   237	        log.warn(`${g.token.base} evaluate: ${errMsg(e)}`);
+   238	        this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
+   239	      }
+   240	    }
+   241	    if (!best) return;
+   242	    if (!this.live) return this.recordPaper(best);
+   243	    await this.start(best, gas, ethUsd);
+   244	  }
+   245	
+   246	  /** Exact, size-specific numbers: MEXC depth walk + withdraw fee + aggregator quote + gas + drift reserve. */
+   247	  async evaluate(g: Gap, gas: GasInfo, ethUsd: number, usdt: number): Promise<Candidate | null> {
+   248	    const size = Math.min(this.cfg.maxTradeUsd, usdt * 0.99);
+   249	    if (size < this.cfg.minTradeUsd) {
+   250	      this.note('usdt', `MEXC USDT too low for a trade (${usd(usdt)})`);
+   251	      return null;
+   252	    }
+   253	    const t = g.token;
+   254	    const book = await this.d.mexc.depth(t.symbol, 20);
+   255	    const plan = planCexBuy({ sizeUsd: size, asks: book.asks, qtyStep: t.qtyStep, takerFee: this.fee(t.base) });
+   256	    if (!plan || plan.tokensToSell < t.withdrawMin) return null;
+   257	    const arriving = plan.tokensToSell - t.withdrawFee;
+   258	    if (arriving <= 0) return null;
+   259	    const decimals = await this.d.chain.decimals(t.address);
+   260	    const q = await this.d.agg.price({
+   261	      sellToken: t.address,
+   262	      buyToken: this.cfg.usdc,
+   263	      sellAmount: toUnits(arriving, decimals),
+   264	      taker: this.live ? this.d.chain.address : PAPER_TAKER,
+   265	      slippageBps: this.cfg.dexSlippageBps,
+   266	    });
+   267	    const ev = evaluateTransfer({
+   268	      plan,
+   269	      withdrawFeeTokens: t.withdrawFee,
+   270	      usdcOut: toFloat(q.buyAmount, USDC_DECIMALS),
+   271	      usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
+   272	      gasUsd: gasUsd(q.gas + APPROVE_GAS, gas.effective, ethUsd) + this.cfg.l1FeeUsd,
+   273	      driftBps: this.cfg.transferDriftBps,
+   274	      costs: this.costs(t.base),
+   275	    });
+   276	    return { gap: g, plan, ev, decimals };
+   277	  }
+   278	
+   279	  private async recordPaper(c: Candidate) {
+   280	    const t = c.gap.token;
+   281	    const now = this.now();
+   282	    this.d.db.insertTrade({
+   283	      ts: now, day: dhakaDay(now), mode: 'paper', symbol: t.base, direction: 'TRANSFER',
+   284	      size_usd: c.ev.costUsd, qty: c.plan.qty, buy_price: c.ev.buyPrice, sell_price: c.ev.sellPrice,
+   285	      expected_net: c.ev.net, cex_fee_usd: c.ev.cexFeeUsd + c.ev.withdrawFeeUsd, gas_usd: c.ev.gasUsd,
+   286	      pnl_usd: c.ev.net, status: 'paper', dex_tx: null, cex_order_id: null, note: `gap ${c.gap.gapPct.toFixed(2)}%`,
+   287	    });
+   288	    await this.d.tg.send(
+   289	      `📝 PAPER TRANSFER ${t.base}: buy MEXC @ ${c.ev.buyPrice.toPrecision(6)} -> sell DEX @ ${c.ev.sellPrice.toPrecision(6)}\n` +
+   290	        `Size ${usd(c.ev.costUsd)} | fees ${usd(c.ev.cexFeeUsd + c.ev.withdrawFeeUsd)} | gas ${usd(c.ev.gasUsd)} | drift reserve ${usd(c.ev.driftUsd)}\nNet ${usd(c.ev.net)}`,
+   291	    );
+   292	    this.d.risk.afterTrade('paper');
+   293	    this.cooldown.set(t.base, this.now() + FALSE_GAP_COOLDOWN_MS); // one paper trade per gap
+   294	  }
+   295	
+   296	  /** Create the persisted transfer and run its first steps right away. */
+   297	  private async start(c: Candidate, gas: GasInfo, ethUsd: number) {
+   298	    const t = c.gap.token;
+   299	    const now = this.now();
+   300	    const id = this.d.db.insertTransfer({
+   301	      ts: now, updated: now, base: t.base, symbol: t.symbol, address: t.address, decimals: c.decimals,
+   302	      net_work: t.netWork, qty_step: t.qtyStep, price_decimals: t.priceDecimals, status: 'buying',
+   303	      buy_qty: c.plan.qty, cost_usd: c.ev.costUsd, buy_order_id: null, withdraw_amount: null, withdraw_id: null,
+   304	      wallet_before: null, received: null, usdc_out: null, gas_usd: 0, expected_net: c.ev.net, pnl: null,
+   305	      sell_attempts: 0, alerted_timeout: 0, note: null, withdraw_fee: t.withdrawFee, next_try: 0, force_sell: 0, hold_alerted: 0, sell_tx: null,
+   306	    });
+   307	    log.info(`transfer #${id} ${t.base}: START gap ${c.gap.gapPct.toFixed(2)}% expected ${usd(c.ev.net)}`);
+   308	    const row = this.d.db.getTransfer(id)!;
+   309	    try {
+   310	      await this.buy(row, c.plan.worst * (1 + this.cfg.cexSlippageBps / 10_000));
+   311	    } catch (e) {
+   312	      if (String((e as Error).message).startsWith('UNKNOWN_ORDER_STATE')) {
+   313	        this.d.risk.pause(`MEXC buy state unknown for transfer #${id}`, true);
+   314	        await this.d.tg.send(`🚨 TRANSFER #${id} ${t.base}: MEXC buy state unknown (${errMsg(e)}). Trading PAUSED; the bot keeps looking for the order.`);
+   315	        return;
+   316	      }
+   317	      const now2 = this.reload(row);
+   318	      if (now2.buy_order_id) {
+   319	        log.warn(`transfer #${id}: error after the buy was placed (${errMsg(e)}); continuing next scan`);
+   320	        return;
+   321	      }
+   322	      return this.fail(now2, `MEXC buy rejected: ${errMsg(e)}`, 0, false);
+   323	    }
+   324	    const next = this.d.db.getTransfer(id)!;
+   325	    if (next.status === 'withdrawing') await this.advance(next, gas, ethUsd);
+   326	  }
+   327	
+   328	  /** Move one transfer forward as far as it can go right now. */
+   329	  async advance(row: TransferRow, gas: GasInfo, ethUsd: number): Promise<void> {
+   330	    if (row.status === 'buying') {
+   331	      if (!row.buy_order_id) {
+   332	        // Crashed or timed out while placing: find the order by our client id, never guess.
+   333	        const o = await this.d.mexc.getOrderByClientId(row.symbol, buyCid(row.id!));
+   334	        if (!o) return this.fail(row, 'MEXC buy was never placed', 0, false);
+   335	        this.d.db.updateTransfer(row.id!, { buy_order_id: o.orderId });
+   336	        row = this.reload(row);
+   337	      }
+   338	      await this.finishBuy(row);
+   339	      row = this.reload(row);
+   340	      if (row.status !== 'withdrawing') return;
+   341	    }
+   342	    if (row.status === 'withdrawing') return this.withdrawStep(row, gas, ethUsd);
+   343	    if (row.status === 'selling') return this.sellStep(row, gas, ethUsd);
+   344	  }
+   345	
+   346	  private async buy(row: TransferRow, limitPrice: number) {
+   347	    const f = 10 ** row.price_decimals;
+   348	    const px = (Math.ceil(limitPrice * f) / f).toFixed(row.price_decimals);
+   349	    const qty = row.buy_qty.toFixed(decimalsOfStep(row.qty_step));
+   350	    const cid = buyCid(row.id!);
+   351	    const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, () => this.d.mexc.limitOrder(row.symbol, 'BUY', qty, px, cid), this.sleep);
+   352	    this.d.db.updateTransfer(row.id!, { buy_order_id: orderId });
+   353	    log.info(`transfer #${row.id} MEXC BUY ${qty} ${row.base} @ ${px} id=${orderId}`);
+   354	    await this.sleep(1500);
+   355	    await this.finishBuy(this.reload(row));
+   356	  }
+   357	
+   358	  private async finishBuy(row: TransferRow) {
+   359	    let o = await this.d.mexc.getOrder(row.symbol, row.buy_order_id!);
+   360	    if (o.status !== 'FILLED') {
+   361	      try {
+   362	        o = await cancelAndConfirm(this.d.mexc, row.symbol, row.buy_order_id!, this.sleep);
+   363	      } catch (e) {
+   364	        log.warn(`transfer #${row.id}: ${errMsg(e)}; checking again next scan`);
+   365	        return; // still 'buying': the order is re-read next tick, never assumed
+   366	      }
+   367	    }
+   368	    const filled = Number(o.executedQty);
+   369	    const cost = Number(o.cummulativeQuoteQty);
+   370	    if (filled <= 0) return this.fail(row, 'MEXC buy did not fill (price moved)', 0, false);
+   371	    this.d.db.updateTransfer(row.id!, { status: 'withdrawing', buy_qty: filled, cost_usd: cost });
+   372	  }
+   373	
+   374	  private async withdrawStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
+   375	    const since = row.ts - 60_000;
+   376	
+   377	    if (!row.withdraw_id) {
+   378	      if (row.withdraw_amount) {
+   379	        // A request was sent before but its result was lost (timeout / restart). Look it up; NEVER resend.
+   380	        const rec = await this.d.mexc.findWithdraw(row.base, since, { withdrawOrderId: withdrawCid(row.id!) });
+   381	        if (rec) {
+   382	          this.d.db.updateTransfer(row.id!, { withdraw_id: rec.id });
+   383	          return;
+   384	        }
+   385	        if (this.now() - row.updated > 10 * 60_000) {
+   386	          this.d.db.updateTransfer(row.id!, { status: 'stuck', note: 'withdraw request outcome unknown' });
+   387	          await this.d.tg.send(
+   388	            `🚨 TRANSFER #${row.id} ${row.base}: withdraw request was sent but MEXC shows no record after 10 min.\n` +
+   389	              `Check MEXC withdraw history. If nothing went out: /sell ${row.id} is NOT right (tokens are on MEXC), sell them on MEXC by hand, then /clear ${row.id}.`,
+   390	          );
+   391	        }
+   392	        return;
+   393	      }
+   394	
+   395	      const free = (await this.d.mexc.balances())[row.base] ?? 0;
+   396	      const amount = floorToStep(Math.min(free, row.buy_qty * (1 - this.fee(row.base))), row.qty_step);
+   397	      const amountStr = amount.toFixed(decimalsOfStep(row.qty_step));
+   398	      const min = this.universe.find((t) => t.base === row.base)?.withdrawMin ?? 0;
+   399	      if (amount <= 0 || amount < min) {
+   400	        const proceeds = amount > 0 ? await this.sellOnMexc(row, amountStr) : 0;
+   401	        return this.fail(row, `amount ${amountStr} below MEXC withdraw minimum ${min}; sold back on MEXC`, proceeds - row.cost_usd);
+   402	      }
+   403	      const before = await this.d.chain.tokenBalance(row.address);
+   404	      // Persist BEFORE sending, so a crash during the request can never cause a second withdrawal.
+   405	      this.d.db.updateTransfer(row.id!, { withdraw_amount: amountStr, wallet_before: before.toString() });
+   406	      try {
+   407	        const id = await this.d.mexc.withdraw({
+   408	          coin: row.base,
+   409	          netWork: row.net_work,
+   410	          address: this.d.chain.address, // ONLY ever our own hot wallet
+   411	          amount: amountStr,
+   412	          contractAddress: row.address,
+   413	          withdrawOrderId: withdrawCid(row.id!),
+   414	        });
+   415	        this.d.db.updateTransfer(row.id!, { withdraw_id: id });
+   416	        await this.d.tg.send(`📤 TRANSFER #${row.id} ${row.base}: bought ${row.buy_qty} on MEXC for ${usd(row.cost_usd)}, withdrawing ${amountStr} to wallet`);
+   417	      } catch (e) {
+   418	        if (e instanceof AmbiguousRequestError) {
+   419	          log.warn(`transfer #${row.id} withdraw request ambiguous, will look it up: ${errMsg(e)}`);
+   420	          return; // next tick: findWithdraw by withdrawOrderId
+   421	        }
+   422	        // Clearly rejected: nothing left MEXC. Close the position there instead.
+   423	        this.d.db.updateTransfer(row.id!, { withdraw_amount: null });
+   424	        const proceeds = await this.sellOnMexc(row, amountStr);
+   425	        return this.fail(this.reload(row), `withdraw rejected: ${errMsg(e)}; sold back on MEXC`, proceeds - row.cost_usd);
+   426	      }
+   427	      return;
+   428	    }
+   429	
+   430	    const rec = await this.d.mexc.findWithdraw(row.base, since, { id: row.withdraw_id, withdrawOrderId: withdrawCid(row.id!) }).catch(() => undefined);
+   431	    const bal = await this.d.chain.tokenBalance(row.address);
+   432	    const diff = bal - BigInt(row.wallet_before ?? '0');
+   433	    // Fee actually charged by MEXC (history) beats the configured one.
+   434	    const fee = rec?.transactionFee !== undefined && rec.transactionFee !== '' ? Number(rec.transactionFee) : row.withdraw_fee;
+   435	    const expected = toUnits(Math.max(0, Number(row.withdraw_amount) - fee), row.decimals);
+   436	
+   437	    // Arrival needs BOTH: MEXC says SUCCESS and the wallet grew by (almost) the expected amount.
+   438	    // A balance change alone could be an unrelated deposit / airdrop.
+   439	    if (rec?.status === 7 && diff > 0n && diff * 100n < expected * 98n) {
+   440	      await this.alertOnce(
+   441	        `wshort-${row.id}`,
+   442	        `⚠️ TRANSFER #${row.id} ${row.base}: MEXC says SUCCESS but the wallet only grew by ${toFloat(diff, row.decimals)} (expected ~${toFloat(expected, row.decimals)}). Waiting; check the wallet.`,
+   443	      );
+   444	    }
+   445	    if (rec?.status === 7 && diff > 0n && diff * 100n >= expected * 98n) {
+   446	      // Sell what was withdrawn, never more (extra balance may belong to something else).
+   447	      const received = diff > (expected * 102n) / 100n ? expected : diff;
+   448	      this.d.db.updateTransfer(row.id!, { status: 'selling', received: received.toString() });
+   449	      log.info(`transfer #${row.id} ${row.base}: ${toFloat(received, row.decimals)} arrived in wallet`);
+   450	      return this.sellStep(this.reload(row), gas, ethUsd);
+   451	    }
+   452	    if (rec && WITHDRAW_FAILED.has(rec.status) && diff <= 0n) {
+   453	      // Funds go back to the MEXC account; sell there once they are visible.
+   454	      const free = (await this.d.mexc.balances())[row.base] ?? 0;
+   455	      if (free < Number(row.withdraw_amount) * 0.99) {
+   456	        return this.alertOnce(`wfail-${row.id}`, `⚠️ TRANSFER #${row.id} ${row.base}: MEXC withdrawal ${rec.status === 8 ? 'FAILED' : 'CANCELLED'}; waiting for the tokens to return to MEXC`);
+   457	      }
+   458	      await this.d.tg.send(`⚠️ TRANSFER #${row.id} ${row.base}: withdrawal ${rec.status === 8 ? 'FAILED' : 'CANCELLED'}, selling back on MEXC`);
+   459	      // Sell what is actually free on MEXC, never more than was withdrawn.
+   460	      const qty = floorToStep(Math.min(free, Number(row.withdraw_amount)), row.qty_step).toFixed(decimalsOfStep(row.qty_step));
+   461	      const proceeds = await this.sellOnMexc(row, qty);
+   462	      return this.fail(row, `withdraw status ${rec.status}`, proceeds - row.cost_usd);
    463	    }
-   464	
-   465	    const ageMin = (this.now() - row.ts) / 60_000;
-   466	    if (ageMin > this.cfg.transferTimeoutMin && row.alerted_timeout < 1) {
-   467	      this.d.db.updateTransfer(row.id!, { alerted_timeout: 1 });
-   468	      await this.d.tg.send(
-   469	        `⏳ TRANSFER #${row.id} ${row.base}: not in wallet after ${Math.round(ageMin)} min (MEXC status ${rec?.status ?? '?'}). Still waiting.`,
-   470	      );
-   471	    } else if (ageMin > 2 * this.cfg.transferTimeoutMin && row.alerted_timeout < 2) {
-   472	      // Give up blocking: new trades may start, this one is still watched every scan (read-only, no gas).
-   473	      this.d.db.updateTransfer(row.id!, { alerted_timeout: 2 });
+   464	    if (rec?.status === WITHDRAW_MANUAL) {
+   465	      await this.alertOnce(`wmanual-${row.id}`, `⏳ TRANSFER #${row.id} ${row.base}: MEXC put the withdrawal under MANUAL review. Waiting.`);
+   466	    }
+   467	    if (rec === null) {
+   468	      await this.alertOnce(`wmissing-${row.id}`, `⚠️ TRANSFER #${row.id} ${row.base}: withdrawal ${row.withdraw_id} not found in MEXC history. Still watching the wallet.`);
+   469	    }
+   470	
+   471	    const ageMin = (this.now() - row.ts) / 60_000;
+   472	    if (ageMin > this.cfg.transferTimeoutMin && row.alerted_timeout < 1) {
+   473	      this.d.db.updateTransfer(row.id!, { alerted_timeout: 1 });
    474	      await this.d.tg.send(
-   475	        `⏳ TRANSFER #${row.id} ${row.base}: still not in wallet after ${Math.round(ageMin)} min. It no longer blocks new trades; ` +
-   476	          `the bot keeps watching and sells when it arrives. Check MEXC support if it stays missing.`,
-   477	      );
-   478	    }
-   479	  }
-   480	
-   481	  private async sellStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
-   482	    if (row.next_try > this.now()) return;
-   483	    if (Number(gas.effective) / 1e9 > this.cfg.maxGasGwei) return this.note(`sell-${row.id}`, `transfer #${row.id}: gas too high, sale waits`);
-   484	
-   485	    // Crash safety: a sale tx was signed before (hash persisted). Did it already execute?
-   486	    if (row.sell_tx && this.d.chain.receipt) {
-   487	      const rc = await this.d.chain.receipt(row.sell_tx).catch(() => null);
-   488	      if (rc?.status === 1) {
-   489	        this.d.db.updateTransfer(row.id!, { status: 'done', note: 'sale completed before a restart; PnL not measured' });
-   490	        this.recordTrade(row, 'ok', 0, row.gas_usd, row.sell_tx, 'sale completed before a restart; PnL not measured');
-   491	        await this.d.tg.send(`✅ TRANSFER #${row.id} ${row.base}: the DEX sale ${row.sell_tx} had already executed before the restart. Marked done (PnL not measured).`);
-   492	        return;
-   493	      }
-   494	    }
-   495	    // Never sell more than is really in the wallet now.
-   496	    const balance = await this.d.chain.tokenBalance(row.address);
-   497	    const amount = balance < BigInt(row.received!) ? balance : BigInt(row.received!);
-   498	    if (amount * 100n < BigInt(row.received!)) {
-   499	      this.d.db.updateTransfer(row.id!, { status: 'stuck', note: 'tokens no longer in the wallet' });
-   500	      await this.d.tg.send(
-   501	        `🚨 TRANSFER #${row.id} ${row.base}: the tokens are no longer in the wallet (sold before a restart, or moved). Check etherscan, then /clear ${row.id}.`,
-   502	      );
-   503	      return;
-   504	    }
-   505	    const qty = toFloat(amount, row.decimals);
-   506	    const req = { sellToken: row.address, buyToken: this.cfg.usdc, sellAmount: amount, taker: this.d.chain.address, slippageBps: this.cfg.dexSlippageBps };
-   507	    let gasWei = 0n;
-   508	    let txHash: string | undefined;
-   509	    try {
-   510	      const first = await this.d.agg.quote(req);
+   475	        `⏳ TRANSFER #${row.id} ${row.base}: not in wallet after ${Math.round(ageMin)} min (MEXC status ${rec?.status ?? '?'}). Still waiting.`,
+   476	      );
+   477	    } else if (ageMin > 2 * this.cfg.transferTimeoutMin && row.alerted_timeout < 2) {
+   478	      // Give up blocking: new trades may start, this one is still watched every scan (read-only, no gas).
+   479	      this.d.db.updateTransfer(row.id!, { alerted_timeout: 2 });
+   480	      await this.d.tg.send(
+   481	        `⏳ TRANSFER #${row.id} ${row.base}: still not in wallet after ${Math.round(ageMin)} min. It no longer blocks new trades; ` +
+   482	          `the bot keeps watching and sells when it arrives. Check MEXC support if it stays missing.`,
+   483	      );
+   484	    }
+   485	  }
+   486	
+   487	  /**
+   488	   * Loss floor: if the DEX would pay less than cost minus TRANSFER_MAX_LOSS_PCT, hold the tokens
+   489	   * (alert once) instead of locking in a big loss. Returns true when held.
+   490	   * Called on the first quote AND on the firm quote after the approval, because the price may
+   491	   * have moved during the approval window (round-3 review, M3).
+   492	   */
+   493	  private async holdIfBelowFloor(row: TransferRow, minBuyAmount: bigint, qty: number): Promise<boolean> {
+   494	    const worstOut = toFloat(minBuyAmount, USDC_DECIMALS) * this.stableRate; // in USDT, like the cost
+   495	    const floor = row.cost_usd * (1 - this.cfg.transferMaxLossPct / 100);
+   496	    if (worstOut >= floor && row.hold_alerted) this.d.db.updateTransfer(row.id!, { hold_alerted: 0 }); // recovered: alert again if it falls
+   497	    if (worstOut < floor && !row.force_sell) {
+   498	      this.d.db.updateTransfer(row.id!, { next_try: this.now() + 5 * 60_000 });
+   499	      if (!row.hold_alerted) {
+   500	        this.d.db.updateTransfer(row.id!, { hold_alerted: 1 });
+   501	        await this.d.tg.send(
+   502	          `✋ TRANSFER #${row.id} ${row.base}: DEX would pay only ${usd(worstOut)} for tokens that cost ${usd(row.cost_usd)} ` +
+   503	            `(more than ${this.cfg.transferMaxLossPct}% loss). HOLDING ${qty} ${row.base} in the wallet and re-checking every 5 min.\n` +
+   504	            `Send /sell ${row.id} to sell anyway.`,
+   505	        );
+   506	      }
+   507	      return true;
+   508	    }
+   509	    return false;
+   510	  }
    511	
-   512	      // Loss floor: price may have fallen while the withdrawal travelled. Hold instead of locking in a big loss.
-   513	      const worstOut = toFloat(first.minBuyAmount, USDC_DECIMALS) * this.stableRate; // in USDT, like the cost
-   514	      const floor = row.cost_usd * (1 - this.cfg.transferMaxLossPct / 100);
-   515	      if (worstOut >= floor && row.hold_alerted) this.d.db.updateTransfer(row.id!, { hold_alerted: 0 }); // recovered: alert again if it falls
-   516	      if (worstOut < floor && !row.force_sell) {
-   517	        this.d.db.updateTransfer(row.id!, { next_try: this.now() + 5 * 60_000 });
-   518	        if (!row.hold_alerted) {
-   519	          this.d.db.updateTransfer(row.id!, { hold_alerted: 1 });
-   520	          await this.d.tg.send(
-   521	            `✋ TRANSFER #${row.id} ${row.base}: DEX would pay only ${usd(worstOut)} for tokens that cost ${usd(row.cost_usd)} ` +
-   522	              `(more than ${this.cfg.transferMaxLossPct}% loss). HOLDING ${qty} ${row.base} in the wallet and re-checking every 5 min.\n` +
-   523	              `Send /sell ${row.id} to sell anyway.`,
-   524	          );
-   525	        }
-   526	        return;
-   527	      }
-   528	
-   529	      const ap = await this.d.chain.approveExact(row.address, this.spenderOf(first), amount, gas);
-   530	      gasWei += ap.gasCostWei;
-   531	      if (ap.unknown) return this.unknownOutcome(row, `approval ${ap.hash}`, gasWei, ethUsd);
-   532	      if (!ap.ok) throw new Error(`approval failed: ${ap.reason}`);
-   533	      const firm = await this.d.agg.quote(req); // fresh after the approval
-   534	      if (!firm.tx) throw new Error('quote without transaction');
-   535	      const est = await this.d.chain.simulate(firm.tx);
-   536	      const usdcBefore = await this.d.chain.tokenBalance(this.cfg.usdc);
-   537	      const r = await this.d.chain.send(firm.tx, (est * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash) =>
-   538	        this.d.db.updateTransfer(row.id!, { sell_tx: hash }),
-   539	      );
-   540	      if (r.refused) return; // an earlier tx is unresolved: not an attempt, try again later
-   541	      gasWei += r.gasCostWei;
-   542	      txHash = r.hash;
-   543	      if (r.unknown) return this.unknownOutcome(row, `swap ${r.hash}`, gasWei, ethUsd);
-   544	      if (!r.ok) throw new Error(`swap ${r.reason}`);
-   545	      const usdcOut = toFloat((await this.d.chain.tokenBalance(this.cfg.usdc)) - usdcBefore, USDC_DECIMALS) * this.stableRate; // USDT
-   546	      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * ethUsd;
-   547	      const pnl = usdcOut - row.cost_usd - gasTotal;
-   548	      this.d.db.updateTransfer(row.id!, { status: 'done', usdc_out: usdcOut, gas_usd: gasTotal, pnl });
-   549	      this.recordTrade(row, 'ok', pnl, gasTotal, txHash, `sold ${qty} for ${usd(usdcOut)}`, usdcOut / qty);
-   550	      await this.d.tg.send(
-   551	        [
-   552	          `${pnl >= 0 ? '✅' : '🔻'} TRANSFER #${row.id} ${row.base} done`,
-   553	          `Buy MEXC: ${row.buy_qty} for ${usd(row.cost_usd)} (@ ${(row.cost_usd / row.buy_qty).toPrecision(6)})`,
-   554	          `Sell DEX: ${qty} for ${usd(usdcOut)} (@ ${(usdcOut / qty).toPrecision(6)})`,
-   555	          `Withdraw fee ${row.withdraw_fee} ${row.base} | Gas ${usd(gasTotal)}`,
-   556	          `Expected ${usd(row.expected_net)} | Net PnL ${usd(pnl)}`,
-   557	          `https://etherscan.io/tx/${txHash}`,
-   558	        ].join('\n'),
-   559	      );
-   560	      this.afterRisk('ok');
-   561	    } catch (e) {
-   562	      const attempts = row.sell_attempts + 1;
-   563	      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * ethUsd;
-   564	      const stuck = attempts >= MAX_SELL_ATTEMPTS;
-   565	      const wait = SELL_BACKOFF_MS[Math.min(attempts - 1, SELL_BACKOFF_MS.length - 1)];
-   566	      this.d.db.updateTransfer(row.id!, {
-   567	        sell_attempts: attempts,
-   568	        gas_usd: gasTotal,
-   569	        status: stuck ? 'stuck' : 'selling',
-   570	        next_try: this.now() + wait,
-   571	        note: errMsg(e),
-   572	      });
-   573	      log.warn(`transfer #${row.id} ${row.base} sell attempt ${attempts} failed: ${errMsg(e)}${stuck ? '' : `; retry in ${wait / 60_000} min`}`);
-   574	      if (stuck) {
-   575	        await this.d.tg.send(
-   576	          `🚨 TRANSFER #${row.id} ${row.base}: DEX sale failed ${attempts} times (${errMsg(e)}). Automatic retries STOPPED.\n` +
-   577	            `${qty} ${row.base} are in the hot wallet. Send /sell ${row.id} to try again, or sell by hand and send /clear ${row.id}.`,
-   578	        );
-   579	        this.afterRisk('one_sided');
-   580	      }
-   581	    }
-   582	  }
-   583	
-   584	  /** On-chain outcome unknown: do not retry (could double-sell). Pause and hand over to a human. */
-   585	  private async unknownOutcome(row: TransferRow, what: string, gasWei: bigint, ethUsd: number) {
-   586	    this.d.db.updateTransfer(row.id!, {
-   587	      status: 'stuck',
-   588	      gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * ethUsd,
-   589	      note: `${what} outcome unknown`,
-   590	    });
-   591	    this.d.risk.pause(`transfer #${row.id}: ${what} outcome unknown`, true);
-   592	    await this.d.tg.send(
-   593	      `🚨 TRANSFER #${row.id} ${row.base}: ${what} was not mined and its cancel was not confirmed. Outcome UNKNOWN.\n` +
-   594	        `Trading PAUSED. Check the wallet on etherscan. Then /sell ${row.id} (if the tokens are still there) or /clear ${row.id}, and /start.`,
-   595	    );
-   596	  }
-   597	
-   598	  private spenderOf(q: Quote): string {
-   599	    if (q.spender) return q.spender;
-   600	    if (this.d.agg.name === '0x') return ZEROX_ALLOWANCE_HOLDER;
-   601	    throw new Error('aggregator did not return a spender');
-   602	  }
-   603	
-   604	  /**
-   605	   * Market-sell on MEXC; returns the net USDT received.
-   606	   * MEXC's docs do not say whether the fee is inside cummulativeQuoteQty, so we measure the
-   607	   * real USDT balance change instead of assuming.
-   608	   */
-   609	  private async sellOnMexc(row: TransferRow, qty: string): Promise<number> {
-   610	    const rules = this.universe.find((t) => t.base === row.base)?.rules;
-   611	    const px = row.cost_usd / (row.buy_qty || 1);
-   612	    // Some symbols have no MARKET order type: use an aggressive LIMIT inside the price band instead.
-   613	    const useLimit = Boolean(rules && !rules.orderTypes.includes('MARKET'));
-   614	    const problem = rules && orderProblem(rules, 'SELL', Number(qty), px, useLimit ? 'LIMIT' : 'MARKET');
-   615	    if (problem) {
-   616	      this.d.risk.pause(`cannot sell ${row.base} on MEXC: ${problem}`, true);
-   617	      await this.d.tg.send(`🚨 ${row.base}: cannot market-sell ${qty} on MEXC (${problem}). Trading PAUSED: sell it by hand, then /start confirm.`);
-   618	      return 0;
-   619	    }
-   620	    try {
-   621	      const usdtBefore = (await this.d.mexc.balances()).USDT ?? 0;
-   622	      const cid = clientId(`${row.id}s`);
-   623	      let place = () => this.d.mexc.marketSell(row.symbol, qty, cid);
-   624	      if (useLimit && rules) {
-   625	        const b = await this.d.mexc.depth(row.symbol, 5);
-   626	        const limit = closePrice(rules, 'SELL', { bid: b.bids[0][0], ask: b.asks[0][0] }).toFixed(rules.priceDecimals);
-   627	        place = () => this.d.mexc.limitOrder(row.symbol, 'SELL', qty, limit, cid);
-   628	      }
-   629	      const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, place, this.sleep);
-   630	      await this.sleep(1000);
-   631	      let o = await this.d.mexc.getOrder(row.symbol, orderId);
-   632	      if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, row.symbol, orderId, this.sleep);
-   633	      const filled = Number(o.executedQty);
-   634	      if (filled < Number(qty) * 0.999) {
-   635	        this.d.risk.pause(`MEXC sell of ${row.base} only partly filled`, true);
-   636	        await this.d.tg.send(
-   637	          `🚨 ${row.base}: MEXC market sell filled only ${filled}/${qty}. The rest is still on MEXC. Trading PAUSED: sell it by hand, then /start.`,
-   638	        );
-   639	      }
-   640	      await this.sleep(1500);
-   641	      const received = ((await this.d.mexc.balances()).USDT ?? 0) - usdtBefore;
-   642	      // Fallback only if the balance read is clearly off (e.g. a concurrent deposit/withdrawal).
-   643	      return received > 0 ? received : Number(o.cummulativeQuoteQty) * (1 - this.fee(row.base));
-   644	    } catch (e) {
-   645	      this.d.risk.pause(`could not close ${row.base} on MEXC`, true);
-   646	      await this.d.tg.send(`🚨 ${row.base}: MEXC market sell of ${qty} FAILED (${errMsg(e)}). Trading PAUSED. Close it manually, then /start.`);
-   647	      return 0;
-   648	    }
-   649	  }
-   650	
-   651	  private async fail(row: TransferRow, why: string, pnl: number, countAsFailure = true) {
-   652	    this.d.db.updateTransfer(row.id!, { status: 'failed', pnl, note: why });
-   653	    log.warn(`transfer #${row.id} ${row.base} failed: ${why}`);
-   654	    if (!countAsFailure) return; // e.g. buy simply did not fill: no money moved
-   655	    this.recordTrade(row, 'one_sided', pnl, row.gas_usd, undefined, why);
-   656	    await this.d.tg.send(`⚠️ TRANSFER #${row.id} ${row.base} failed: ${why}\nPnL ${usd(pnl)}`);
-   657	    this.afterRisk('one_sided');
-   658	  }
-   659	
-   660	  /** Telegram /sell <id>: retry a stuck or held sale now (even below the loss floor). */
-   661	  forceSell(id: number): string {
-   662	    const t = this.d.db.getTransfer(id);
-   663	    if (!t) return `No transfer #${id}`;
-   664	    if (!t.received) return `Transfer #${id} has no tokens in the wallet yet (status ${t.status})`;
-   665	    if (t.status !== 'stuck' && t.status !== 'selling') return `Transfer #${id} is ${t.status}`;
-   666	    this.d.db.updateTransfer(id, { status: 'selling', force_sell: 1, next_try: 0, sell_attempts: 0 });
-   667	    return `Transfer #${id}: selling on the next scan (loss floor ignored).`;
-   668	  }
-   669	
-   670	  /** Telegram /clear <id>: you resolved it by hand; close the record. */
-   671	  clear(id: number): string {
-   672	    const t = this.d.db.getTransfer(id);
-   673	    if (!t) return `No transfer #${id}`;
-   674	    if (t.status === 'done' || t.status === 'failed') return `Transfer #${id} is already ${t.status}`;
-   675	    this.d.db.updateTransfer(id, { status: 'failed', note: 'cleared manually via /clear' });
-   676	    // Gas already burned on this transfer is a real cost: book it so the daily loss limit sees it.
-   677	    if (t.gas_usd > 0) this.recordTrade(t, 'one_sided', -t.gas_usd, t.gas_usd, undefined, 'cleared manually; gas spent');
-   678	    return `Transfer #${id} closed manually. Gas spent (${usd(t.gas_usd)}) is booked; the token result is not, check balances yourself.`;
-   679	  }
-   680	
-   681	  private recordTrade(row: TransferRow, status: 'ok' | 'one_sided', pnl: number, gas: number, tx: string | undefined, note: string, sellPrice = 0) {
-   682	    const now = this.now();
-   683	    const buyPrice = row.cost_usd / (row.buy_qty || 1);
-   684	    this.d.db.insertTrade({
-   685	      ts: now, day: dhakaDay(now), mode: this.cfg.mode, symbol: row.base, direction: 'TRANSFER',
-   686	      size_usd: row.cost_usd, qty: row.buy_qty, buy_price: buyPrice, sell_price: sellPrice, expected_net: row.expected_net,
-   687	      // informational only: PnL is measured from real balances and already includes every fee
-   688	      cex_fee_usd: row.cost_usd * this.fee(row.base) + row.withdraw_fee * buyPrice,
-   689	      gas_usd: gas, pnl_usd: pnl, status, dex_tx: tx ?? null, cex_order_id: row.buy_order_id, note,
-   690	    });
-   691	  }
-   692	
-   693	  private afterRisk(status: 'ok' | 'one_sided') {
-   694	    for (const e of this.d.risk.afterTrade(status)) {
-   695	      if (e.kind === 'loss_limit') void this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). New trades STOPPED. Send /start to resume.`);
-   696	      if (e.kind === 'fail_streak') void this.d.tg.send(`🛑 ${e.count} failed trades in a row. New trades PAUSED. /start to resume.`);
-   697	      if (e.kind === 'trade_limit') void this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}).`);
-   698	    }
-   699	  }
-   700	}
+   512	  private async sellStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
+   513	    if (row.next_try > this.now()) return;
+   514	    if (Number(gas.effective) / 1e9 > this.cfg.maxGasGwei) return this.note(`sell-${row.id}`, `transfer #${row.id}: gas too high, sale waits`);
+   515	
+   516	    // Crash safety: a sale tx was signed before (hash persisted). Did it already execute?
+   517	    if (row.sell_tx && this.d.chain.receipt) {
+   518	      const rc = await this.d.chain.receipt(row.sell_tx).catch(() => null);
+   519	      if (rc?.status === 1) {
+   520	        this.d.db.updateTransfer(row.id!, { status: 'done', note: 'sale completed before a restart; PnL not measured' });
+   521	        this.recordTrade(row, 'ok', 0, row.gas_usd, row.sell_tx, 'sale completed before a restart; PnL not measured');
+   522	        await this.d.tg.send(`✅ TRANSFER #${row.id} ${row.base}: the DEX sale ${row.sell_tx} had already executed before the restart. Marked done (PnL not measured).`);
+   523	        return;
+   524	      }
+   525	    }
+   526	    // Never sell more than is really in the wallet now.
+   527	    const balance = await this.d.chain.tokenBalance(row.address);
+   528	    const amount = balance < BigInt(row.received!) ? balance : BigInt(row.received!);
+   529	    if (amount * 100n < BigInt(row.received!)) {
+   530	      this.d.db.updateTransfer(row.id!, { status: 'stuck', note: 'tokens no longer in the wallet' });
+   531	      await this.d.tg.send(
+   532	        `🚨 TRANSFER #${row.id} ${row.base}: the tokens are no longer in the wallet (sold before a restart, or moved). Check etherscan, then /clear ${row.id}.`,
+   533	      );
+   534	      return;
+   535	    }
+   536	    const qty = toFloat(amount, row.decimals);
+   537	    const req = { sellToken: row.address, buyToken: this.cfg.usdc, sellAmount: amount, taker: this.d.chain.address, slippageBps: this.cfg.dexSlippageBps };
+   538	    let gasWei = 0n;
+   539	    let txHash: string | undefined;
+   540	    try {
+   541	      const first = await this.d.agg.quote(req);
+   542	      if (await this.holdIfBelowFloor(row, first.minBuyAmount, qty)) return;
+   543	
+   544	      const ap = await this.d.chain.approveExact(row.address, this.spenderOf(first), amount, gas);
+   545	      gasWei += ap.gasCostWei;
+   546	      if (ap.unknown) return this.unknownOutcome(row, `approval ${ap.hash}`, gasWei, ethUsd);
+   547	      if (!ap.ok) throw new Error(`approval failed: ${ap.reason}`);
+   548	      const firm = await this.d.agg.quote(req); // fresh after the approval
+   549	      if (!firm.tx) throw new Error('quote without transaction');
+   550	      // The price may have moved during the approval (up to ~60 s on mainnet): re-check the floor
+   551	      // on the FIRM quote before sending, or the loss floor does not protect the actual sale (round-3, M3).
+   552	      if (await this.holdIfBelowFloor(row, firm.minBuyAmount, qty)) {
+   553	        // The approval gas was really spent; book it so the row's gas stays honest.
+   554	        this.d.db.updateTransfer(row.id!, { gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * ethUsd });
+   555	        return;
+   556	      }
+   557	      const est = await this.d.chain.simulate(firm.tx);
+   558	      const usdcBefore = await this.d.chain.tokenBalance(this.cfg.usdc);
+   559	      const r = await this.d.chain.send(firm.tx, (est * 13n) / 10n, gas, this.cfg.txTimeoutSec, (hash) =>
+   560	        this.d.db.updateTransfer(row.id!, { sell_tx: hash }),
+   561	      );
+   562	      if (r.refused) return; // an earlier tx is unresolved: not an attempt, try again later
+   563	      gasWei += r.gasCostWei;
+   564	      txHash = r.hash;
+   565	      if (r.unknown) return this.unknownOutcome(row, `swap ${r.hash}`, gasWei, ethUsd);
+   566	      if (!r.ok) throw new Error(`swap ${r.reason}`);
+   567	      const usdcOut = toFloat((await this.d.chain.tokenBalance(this.cfg.usdc)) - usdcBefore, USDC_DECIMALS) * this.stableRate; // USDT
+   568	      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * ethUsd;
+   569	      const pnl = usdcOut - row.cost_usd - gasTotal;
+   570	      this.d.db.updateTransfer(row.id!, { status: 'done', usdc_out: usdcOut, gas_usd: gasTotal, pnl });
+   571	      this.recordTrade(row, 'ok', pnl, gasTotal, txHash, `sold ${qty} for ${usd(usdcOut)}`, usdcOut / qty);
+   572	      await this.d.tg.send(
+   573	        [
+   574	          `${pnl >= 0 ? '✅' : '🔻'} TRANSFER #${row.id} ${row.base} done`,
+   575	          `Buy MEXC: ${row.buy_qty} for ${usd(row.cost_usd)} (@ ${(row.cost_usd / row.buy_qty).toPrecision(6)})`,
+   576	          `Sell DEX: ${qty} for ${usd(usdcOut)} (@ ${(usdcOut / qty).toPrecision(6)})`,
+   577	          `Withdraw fee ${row.withdraw_fee} ${row.base} | Gas ${usd(gasTotal)}`,
+   578	          `Expected ${usd(row.expected_net)} | Net PnL ${usd(pnl)}`,
+   579	          `https://etherscan.io/tx/${txHash}`,
+   580	        ].join('\n'),
+   581	      );
+   582	      this.afterRisk('ok');
+   583	    } catch (e) {
+   584	      const attempts = row.sell_attempts + 1;
+   585	      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * ethUsd;
+   586	      const stuck = attempts >= MAX_SELL_ATTEMPTS;
+   587	      const wait = SELL_BACKOFF_MS[Math.min(attempts - 1, SELL_BACKOFF_MS.length - 1)];
+   588	      this.d.db.updateTransfer(row.id!, {
+   589	        sell_attempts: attempts,
+   590	        gas_usd: gasTotal,
+   591	        status: stuck ? 'stuck' : 'selling',
+   592	        next_try: this.now() + wait,
+   593	        note: errMsg(e),
+   594	      });
+   595	      log.warn(`transfer #${row.id} ${row.base} sell attempt ${attempts} failed: ${errMsg(e)}${stuck ? '' : `; retry in ${wait / 60_000} min`}`);
+   596	      if (stuck) {
+   597	        await this.d.tg.send(
+   598	          `🚨 TRANSFER #${row.id} ${row.base}: DEX sale failed ${attempts} times (${errMsg(e)}). Automatic retries STOPPED.\n` +
+   599	            `${qty} ${row.base} are in the hot wallet. Send /sell ${row.id} to try again, or sell by hand and send /clear ${row.id}.`,
+   600	        );
+   601	        this.afterRisk('one_sided');
+   602	      }
+   603	    }
+   604	  }
+   605	
+   606	  /** On-chain outcome unknown: do not retry (could double-sell). Pause and hand over to a human. */
+   607	  private async unknownOutcome(row: TransferRow, what: string, gasWei: bigint, ethUsd: number) {
+   608	    this.d.db.updateTransfer(row.id!, {
+   609	      status: 'stuck',
+   610	      gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * ethUsd,
+   611	      note: `${what} outcome unknown`,
+   612	    });
+   613	    this.d.risk.pause(`transfer #${row.id}: ${what} outcome unknown`, true);
+   614	    await this.d.tg.send(
+   615	      `🚨 TRANSFER #${row.id} ${row.base}: ${what} was not mined and its cancel was not confirmed. Outcome UNKNOWN.\n` +
+   616	        `Trading PAUSED. Check the wallet on etherscan. Then /sell ${row.id} (if the tokens are still there) or /clear ${row.id}, and /start.`,
+   617	    );
+   618	  }
+   619	
+   620	  private spenderOf(q: Quote): string {
+   621	    if (q.spender) return q.spender;
+   622	    if (this.d.agg.name === '0x') return ZEROX_ALLOWANCE_HOLDER;
+   623	    throw new Error('aggregator did not return a spender');
+   624	  }
+   625	
+   626	  /**
+   627	   * Market-sell on MEXC; returns the net USDT received.
+   628	   * MEXC's docs do not say whether the fee is inside cummulativeQuoteQty, so we measure the
+   629	   * real USDT balance change instead of assuming.
+   630	   */
+   631	  private async sellOnMexc(row: TransferRow, qty: string): Promise<number> {
+   632	    const rules = this.universe.find((t) => t.base === row.base)?.rules;
+   633	    const px = row.cost_usd / (row.buy_qty || 1);
+   634	    // Some symbols have no MARKET order type: use an aggressive LIMIT inside the price band instead.
+   635	    const useLimit = Boolean(rules && !rules.orderTypes.includes('MARKET'));
+   636	    const problem = rules && orderProblem(rules, 'SELL', Number(qty), px, useLimit ? 'LIMIT' : 'MARKET');
+   637	    if (problem) {
+   638	      this.d.risk.pause(`cannot sell ${row.base} on MEXC: ${problem}`, true);
+   639	      await this.d.tg.send(`🚨 ${row.base}: cannot market-sell ${qty} on MEXC (${problem}). Trading PAUSED: sell it by hand, then /start confirm.`);
+   640	      return 0;
+   641	    }
+   642	    try {
+   643	      const usdtBefore = (await this.d.mexc.balances()).USDT ?? 0;
+   644	      const cid = clientId(`${row.id}s`);
+   645	      let place = () => this.d.mexc.marketSell(row.symbol, qty, cid);
+   646	      if (useLimit && rules) {
+   647	        const b = await this.d.mexc.depth(row.symbol, 5);
+   648	        const limit = closePrice(rules, 'SELL', { bid: b.bids[0][0], ask: b.asks[0][0] }).toFixed(rules.priceDecimals);
+   649	        place = () => this.d.mexc.limitOrder(row.symbol, 'SELL', qty, limit, cid);
+   650	      }
+   651	      const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, place, this.sleep);
+   652	      await this.sleep(1000);
+   653	      let o = await this.d.mexc.getOrder(row.symbol, orderId);
+   654	      if (o.status !== 'FILLED') o = await cancelAndConfirm(this.d.mexc, row.symbol, orderId, this.sleep);
+   655	      const filled = Number(o.executedQty);
+   656	      if (filled < Number(qty) * 0.999) {
+   657	        this.d.risk.pause(`MEXC sell of ${row.base} only partly filled`, true);
+   658	        await this.d.tg.send(
+   659	          `🚨 ${row.base}: MEXC market sell filled only ${filled}/${qty}. The rest is still on MEXC. Trading PAUSED: sell it by hand, then /start.`,
+   660	        );
+   661	      }
+   662	      await this.sleep(1500);
+   663	      const received = ((await this.d.mexc.balances()).USDT ?? 0) - usdtBefore;
+   664	      // Fallback only if the balance read is clearly off (e.g. a concurrent deposit/withdrawal).
+   665	      return received > 0 ? received : Number(o.cummulativeQuoteQty) * (1 - this.fee(row.base));
+   666	    } catch (e) {
+   667	      this.d.risk.pause(`could not close ${row.base} on MEXC`, true);
+   668	      await this.d.tg.send(`🚨 ${row.base}: MEXC market sell of ${qty} FAILED (${errMsg(e)}). Trading PAUSED. Close it manually, then /start.`);
+   669	      return 0;
+   670	    }
+   671	  }
+   672	
+   673	  private async fail(row: TransferRow, why: string, pnl: number, countAsFailure = true) {
+   674	    this.d.db.updateTransfer(row.id!, { status: 'failed', pnl, note: why });
+   675	    log.warn(`transfer #${row.id} ${row.base} failed: ${why}`);
+   676	    if (!countAsFailure) return; // e.g. buy simply did not fill: no money moved
+   677	    this.recordTrade(row, 'one_sided', pnl, row.gas_usd, undefined, why);
+   678	    await this.d.tg.send(`⚠️ TRANSFER #${row.id} ${row.base} failed: ${why}\nPnL ${usd(pnl)}`);
+   679	    this.afterRisk('one_sided');
+   680	  }
+   681	
+   682	  /** Telegram /sell <id>: retry a stuck or held sale now (even below the loss floor). */
+   683	  forceSell(id: number): string {
+   684	    const t = this.d.db.getTransfer(id);
+   685	    if (!t) return `No transfer #${id}`;
+   686	    if (!t.received) return `Transfer #${id} has no tokens in the wallet yet (status ${t.status})`;
+   687	    if (t.status !== 'stuck' && t.status !== 'selling') return `Transfer #${id} is ${t.status}`;
+   688	    this.d.db.updateTransfer(id, { status: 'selling', force_sell: 1, next_try: 0, sell_attempts: 0 });
+   689	    return `Transfer #${id}: selling on the next scan (loss floor ignored).`;
+   690	  }
+   691	
+   692	  /** Telegram /clear <id>: you resolved it by hand; close the record. */
+   693	  clear(id: number): string {
+   694	    const t = this.d.db.getTransfer(id);
+   695	    if (!t) return `No transfer #${id}`;
+   696	    if (t.status === 'done' || t.status === 'failed') return `Transfer #${id} is already ${t.status}`;
+   697	    this.d.db.updateTransfer(id, { status: 'failed', note: 'cleared manually via /clear' });
+   698	    // Gas already burned on this transfer is a real cost: book it so the daily loss limit sees it.
+   699	    if (t.gas_usd > 0) this.recordTrade(t, 'one_sided', -t.gas_usd, t.gas_usd, undefined, 'cleared manually; gas spent');
+   700	    return `Transfer #${id} closed manually. Gas spent (${usd(t.gas_usd)}) is booked; the token result is not, check balances yourself.`;
+   701	  }
+   702	
+   703	  private recordTrade(row: TransferRow, status: 'ok' | 'one_sided', pnl: number, gas: number, tx: string | undefined, note: string, sellPrice = 0) {
+   704	    const now = this.now();
+   705	    const buyPrice = row.cost_usd / (row.buy_qty || 1);
+   706	    this.d.db.insertTrade({
+   707	      ts: now, day: dhakaDay(now), mode: this.cfg.mode, symbol: row.base, direction: 'TRANSFER',
+   708	      size_usd: row.cost_usd, qty: row.buy_qty, buy_price: buyPrice, sell_price: sellPrice, expected_net: row.expected_net,
+   709	      // informational only: PnL is measured from real balances and already includes every fee
+   710	      cex_fee_usd: row.cost_usd * this.fee(row.base) + row.withdraw_fee * buyPrice,
+   711	      gas_usd: gas, pnl_usd: pnl, status, dex_tx: tx ?? null, cex_order_id: row.buy_order_id, note,
+   712	    });
+   713	  }
+   714	
+   715	  private afterRisk(status: 'ok' | 'one_sided') {
+   716	    for (const e of this.d.risk.afterTrade(status)) {
+   717	      if (e.kind === 'loss_limit') void this.d.tg.send(`🛑 Daily loss limit hit (${usd(e.pnl)}). New trades STOPPED. Send /start to resume.`);
+   718	      if (e.kind === 'fail_streak') void this.d.tg.send(`🛑 ${e.count} failed trades in a row. New trades PAUSED. /start to resume.`);
+   719	      if (e.kind === 'trade_limit') void this.d.tg.send(`ℹ️ Daily trade limit reached (${e.trades}).`);
+   720	    }
+   721	  }
+   722	}
 ```
 
 ## `src/util.ts`
 
-```ts
+```
      1	export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
      2	
      3	const DHAKA_OFFSET_MS = 6 * 3600 * 1000; // Bangladesh: UTC+6, no DST
@@ -4349,7 +4472,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/watchlist.ts`
 
-```ts
+```
      1	// Builds the token list: on MEXC (USDT pair) AND on Ethereum, with the SAME contract address
      2	// (taken from MEXC's own deposit network info), enough DEX TVL and MEXC volume.
      3	import type { CoinConfig, MexcRest } from './mexc/rest.js';
@@ -4468,7 +4591,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/mexc/proto.ts`
 
-```ts
+```
      1	// Minimal protobuf decoder for MEXC WebSocket pushes (wss://wbs-api.mexc.com/ws).
      2	// MEXC sends PushDataV3ApiWrapper messages:
      3	//   1: channel (string), 3: symbol (string), 6: sendTime (int64),
@@ -4557,7 +4680,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/mexc/rest.ts`
 
-```ts
+```
      1	// MEXC Spot API v3 REST client. https://mexcdevelop.github.io/apidocs/spot_v3_en/
      2	import crypto from 'node:crypto';
      3	import { redact } from '../log.js';
@@ -4827,7 +4950,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/mexc/rules.ts`
 
-```ts
+```
      1	// MEXC symbol trading rules, taken from GET /api/v3/exchangeInfo, checked BEFORE either leg is sent.
      2	// Field meanings (verified against live exchangeInfo, e.g. ETHUSDT: baseAssetPrecision 5, baseSizePrecision "0.0001"):
      3	//   baseAssetPrecision   -> quantity decimals (step = 10^-n)
@@ -4941,7 +5064,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/mexc/ws.ts`
 
-```ts
+```
      1	// MEXC public WebSocket: keeps a live top-20 order book per symbol.
      2	import WebSocket from 'ws';
      3	import { decodeDepthPush } from './proto.js';
@@ -5036,7 +5159,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/dex/aggregator.ts`
 
-```ts
+```
      1	// DEX quotes from 0x (Swap API v2, AllowanceHolder), 1inch (Swap API v6) and KyberSwap (Aggregator API v1).
      2	// All route across many DEXs; DEX pool fees are already in the output amount.
      3	// BestOf queries several of them and uses the best quote after gas; Limited wraps each in a rate limiter.
@@ -5400,7 +5523,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `src/dex/chain.ts`
 
-```ts
+```
      1	// Ethereum side: balances, gas, exact approvals, simulation and private sending.
      2	import { ethers } from 'ethers';
      3	import { log, errMsg } from '../log.js';
@@ -5456,138 +5579,143 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     53	        },
     54	        confirmedNonce: () => this.provider.getTransactionCount(this.address, 'latest'),
     55	        receipt: (h) => this.provider.getTransactionReceipt(h),
-    56	        knowsTx: async (h) => Boolean((await this.provider.getTransaction(h).catch(() => null)) ?? (await this.sendProvider.getTransaction(h).catch(() => null))),
-    57	        sign: async (t) => {
-    58	          const raw = await this.wallet!.signTransaction({ chainId: BigInt(chainId), type: 2, ...t });
-    59	          return { raw, hash: ethers.keccak256(raw) };
+    56	        // Raw receipt for the OP-stack L1 fee (ethers' receipt type has no l1Fee field).
+    57	        rawReceipt: async (h) => {
+    58	          const raw = (await this.provider.send('eth_getTransactionReceipt', [h]).catch(() => null)) as { l1Fee?: string } | null;
+    59	          return raw?.l1Fee ? { l1Fee: BigInt(raw.l1Fee) } : null;
     60	        },
-    61	        broadcast: async (raw) => {
-    62	          await this.sendProvider.send('eth_sendRawTransaction', [raw]);
-    63	        },
-    64	        broadcastPublic: async (raw) => {
-    65	          await this.provider.send('eth_sendRawTransaction', [raw]);
-    66	        },
-    67	        gas: () => this.gas(),
-    68	      },
-    69	      unresolvedStore,
-    70	    );
-    71	  }
-    72	
-    73	  get unresolved() {
-    74	    return this.tx.unresolved;
-    75	  }
-    76	  checkUnresolved() {
-    77	    return this.tx.checkUnresolved();
-    78	  }
-    79	  receipt(hash: string) {
-    80	    return this.provider.getTransactionReceipt(hash);
-    81	  }
-    82	  readyToSend() {
-    83	    return this.tx.readyToSend();
-    84	  }
-    85	  cancelNonce() {
-    86	    return this.tx.cancelNonce();
-    87	  }
-    88	  resetNonce() {
-    89	    this.tx.resetNonce();
-    90	  }
-    91	  send(
-    92	    tx: { to: string; data: string; value?: bigint },
-    93	    gasLimit: bigint,
-    94	    gas: GasInfo,
-    95	    timeoutSec: number,
-    96	    onSigned?: (hash: string, nonce: number) => void,
-    97	  ): Promise<TxResult> {
-    98	    return this.tx.send(tx, gasLimit, gas, timeoutSec, onSigned);
-    99	  }
-   100	
-   101	  get address(): string {
-   102	    if (!this.wallet) throw new Error('PRIVATE_KEY not set');
-   103	    return this.wallet.address;
+    61	        knowsTx: async (h) => Boolean((await this.provider.getTransaction(h).catch(() => null)) ?? (await this.sendProvider.getTransaction(h).catch(() => null))),
+    62	        sign: async (t) => {
+    63	          const raw = await this.wallet!.signTransaction({ chainId: BigInt(chainId), type: 2, ...t });
+    64	          return { raw, hash: ethers.keccak256(raw) };
+    65	        },
+    66	        broadcast: async (raw) => {
+    67	          await this.sendProvider.send('eth_sendRawTransaction', [raw]);
+    68	        },
+    69	        broadcastPublic: async (raw) => {
+    70	          await this.provider.send('eth_sendRawTransaction', [raw]);
+    71	        },
+    72	        gas: () => this.gas(),
+    73	      },
+    74	      unresolvedStore,
+    75	    );
+    76	  }
+    77	
+    78	  get unresolved() {
+    79	    return this.tx.unresolved;
+    80	  }
+    81	  checkUnresolved() {
+    82	    return this.tx.checkUnresolved();
+    83	  }
+    84	  receipt(hash: string) {
+    85	    return this.provider.getTransactionReceipt(hash);
+    86	  }
+    87	  readyToSend() {
+    88	    return this.tx.readyToSend();
+    89	  }
+    90	  cancelNonce() {
+    91	    return this.tx.cancelNonce();
+    92	  }
+    93	  resetNonce() {
+    94	    this.tx.resetNonce();
+    95	  }
+    96	  send(
+    97	    tx: { to: string; data: string; value?: bigint },
+    98	    gasLimit: bigint,
+    99	    gas: GasInfo,
+   100	    timeoutSec: number,
+   101	    onSigned?: (hash: string, nonce: number) => void,
+   102	  ): Promise<TxResult> {
+   103	    return this.tx.send(tx, gasLimit, gas, timeoutSec, onSigned);
    104	  }
    105	
-   106	  erc20(token: string) {
-   107	    return new ethers.Contract(token, ERC20_ABI, this.wallet ?? this.provider);
-   108	  }
-   109	
-   110	  async decimals(token: string): Promise<number> {
-   111	    const key = token.toLowerCase();
-   112	    if (!this.decimalsCache.has(key)) this.decimalsCache.set(key, Number(await this.erc20(token).decimals()));
-   113	    return this.decimalsCache.get(key)!;
-   114	  }
-   115	
-   116	  async tokenBalance(token: string, owner = this.address): Promise<bigint> {
-   117	    return this.erc20(token).balanceOf(owner);
-   118	  }
-   119	
-   120	  async ethBalance(owner = this.address): Promise<bigint> {
-   121	    return this.provider.getBalance(owner);
-   122	  }
-   123	
-   124	  async gas(): Promise<GasInfo> {
-   125	    const block = await this.provider.getBlock('latest');
-   126	    const baseFee = block?.baseFeePerGas ?? 0n;
-   127	    const cap = ethers.parseUnits(String(this.priorityFeeGwei), 'gwei');
-   128	    // Tip = median (p50) of the last 20 blocks' tips, capped by PRIORITY_FEE_GWEI. A fixed 1 gwei was
-   129	    // 2-7x the whole base fee on mainnet (base fee ~0.15 gwei), i.e. most of the gas cost.
-   130	    let tip = cap;
-   131	    try {
-   132	      const h = (await this.provider.send('eth_feeHistory', ['0x14', 'latest', [50]])) as { reward?: string[][] };
-   133	      tip = pickTip((h.reward ?? []).map((r) => BigInt(r[0])), cap);
-   134	    } catch {
-   135	      // keep the cap
-   136	    }
-   137	    return { baseFee, tip, effective: baseFee + tip, maxFee: baseFee * 2n + tip };
-   138	  }
-   139	
-   140	  /** Gas units needed for an approval before the swap (0 if allowance already covers it). */
-   141	  async approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint> {
-   142	    if (!this.wallet) return 0n;
-   143	    const allowance: bigint = await this.erc20(token).allowance(this.address, spender);
-   144	    if (allowance >= amount) return 0n;
-   145	    return allowance > 0n ? APPROVE_GAS * 2n : APPROVE_GAS; // USDT-style tokens need approve(0) first
-   146	  }
-   147	
-   148	  /** Approve exactly `amount` (never unlimited). Sent through the private RPC. */
-   149	  async approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult> {
-   150	    const c = this.erc20(token);
-   151	    let cost = 0n;
-   152	    const current: bigint = await c.allowance(this.address, spender);
-   153	    if (current >= amount) return { ok: true, gasCostWei: 0n };
-   154	    if (current > 0n) {
-   155	      const data0 = c.interface.encodeFunctionData('approve', [spender, 0n]);
-   156	      const r = await this.send({ to: token, data: data0 }, await this.approveGasLimit(token, data0), gas, 60);
-   157	      cost += r.gasCostWei;
-   158	      if (!r.ok) return { ...r, gasCostWei: cost };
-   159	    }
-   160	    const data = c.interface.encodeFunctionData('approve', [spender, amount]);
-   161	    const r = await this.send({ to: token, data }, await this.approveGasLimit(token, data), gas, 60);
-   162	    return { ...r, gasCostWei: cost + r.gasCostWei };
-   163	  }
-   164	
-   165	  /** Some tokens need more than 60k gas for approve: estimate, +30%, never below 60k. */
-   166	  private async approveGasLimit(token: string, data: string): Promise<bigint> {
-   167	    try {
-   168	      const est = await this.provider.estimateGas({ from: this.address, to: token, data });
-   169	      const limit = (est * 13n) / 10n;
-   170	      return limit > APPROVE_GAS ? limit : APPROVE_GAS;
-   171	    } catch {
-   172	      return APPROVE_GAS * 2n;
-   173	    }
-   174	  }
-   175	
-   176	  /** eth_call + estimateGas. Returns the gas estimate, or throws with the revert reason. */
-   177	  async simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint> {
-   178	    const req = { from: this.address, to: tx.to, data: tx.data, value: tx.value };
-   179	    await this.provider.call(req);
-   180	    return this.provider.estimateGas(req);
-   181	  }
-   182	}
+   106	  get address(): string {
+   107	    if (!this.wallet) throw new Error('PRIVATE_KEY not set');
+   108	    return this.wallet.address;
+   109	  }
+   110	
+   111	  erc20(token: string) {
+   112	    return new ethers.Contract(token, ERC20_ABI, this.wallet ?? this.provider);
+   113	  }
+   114	
+   115	  async decimals(token: string): Promise<number> {
+   116	    const key = token.toLowerCase();
+   117	    if (!this.decimalsCache.has(key)) this.decimalsCache.set(key, Number(await this.erc20(token).decimals()));
+   118	    return this.decimalsCache.get(key)!;
+   119	  }
+   120	
+   121	  async tokenBalance(token: string, owner = this.address): Promise<bigint> {
+   122	    return this.erc20(token).balanceOf(owner);
+   123	  }
+   124	
+   125	  async ethBalance(owner = this.address): Promise<bigint> {
+   126	    return this.provider.getBalance(owner);
+   127	  }
+   128	
+   129	  async gas(): Promise<GasInfo> {
+   130	    const block = await this.provider.getBlock('latest');
+   131	    const baseFee = block?.baseFeePerGas ?? 0n;
+   132	    const cap = ethers.parseUnits(String(this.priorityFeeGwei), 'gwei');
+   133	    // Tip = median (p50) of the last 20 blocks' tips, capped by PRIORITY_FEE_GWEI. A fixed 1 gwei was
+   134	    // 2-7x the whole base fee on mainnet (base fee ~0.15 gwei), i.e. most of the gas cost.
+   135	    let tip = cap;
+   136	    try {
+   137	      const h = (await this.provider.send('eth_feeHistory', ['0x14', 'latest', [50]])) as { reward?: string[][] };
+   138	      tip = pickTip((h.reward ?? []).map((r) => BigInt(r[0])), cap);
+   139	    } catch {
+   140	      // keep the cap
+   141	    }
+   142	    return { baseFee, tip, effective: baseFee + tip, maxFee: baseFee * 2n + tip };
+   143	  }
+   144	
+   145	  /** Gas units needed for an approval before the swap (0 if allowance already covers it). */
+   146	  async approvalGasNeeded(token: string, spender: string, amount: bigint): Promise<bigint> {
+   147	    if (!this.wallet) return 0n;
+   148	    const allowance: bigint = await this.erc20(token).allowance(this.address, spender);
+   149	    if (allowance >= amount) return 0n;
+   150	    return allowance > 0n ? APPROVE_GAS * 2n : APPROVE_GAS; // USDT-style tokens need approve(0) first
+   151	  }
+   152	
+   153	  /** Approve exactly `amount` (never unlimited). Sent through the private RPC. */
+   154	  async approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult> {
+   155	    const c = this.erc20(token);
+   156	    let cost = 0n;
+   157	    const current: bigint = await c.allowance(this.address, spender);
+   158	    if (current >= amount) return { ok: true, gasCostWei: 0n };
+   159	    if (current > 0n) {
+   160	      const data0 = c.interface.encodeFunctionData('approve', [spender, 0n]);
+   161	      const r = await this.send({ to: token, data: data0 }, await this.approveGasLimit(token, data0), gas, 60);
+   162	      cost += r.gasCostWei;
+   163	      if (!r.ok) return { ...r, gasCostWei: cost };
+   164	    }
+   165	    const data = c.interface.encodeFunctionData('approve', [spender, amount]);
+   166	    const r = await this.send({ to: token, data }, await this.approveGasLimit(token, data), gas, 60);
+   167	    return { ...r, gasCostWei: cost + r.gasCostWei };
+   168	  }
+   169	
+   170	  /** Some tokens need more than 60k gas for approve: estimate, +30%, never below 60k. */
+   171	  private async approveGasLimit(token: string, data: string): Promise<bigint> {
+   172	    try {
+   173	      const est = await this.provider.estimateGas({ from: this.address, to: token, data });
+   174	      const limit = (est * 13n) / 10n;
+   175	      return limit > APPROVE_GAS ? limit : APPROVE_GAS;
+   176	    } catch {
+   177	      return APPROVE_GAS * 2n;
+   178	    }
+   179	  }
+   180	
+   181	  /** eth_call + estimateGas. Returns the gas estimate, or throws with the revert reason. */
+   182	  async simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint> {
+   183	    const req = { from: this.address, to: tx.to, data: tx.data, value: tx.value };
+   184	    await this.provider.call(req);
+   185	    return this.provider.estimateGas(req);
+   186	  }
+   187	}
 ```
 
 ## `src/dex/txsender.ts`
 
-```ts
+```
      1	// Transaction sending with a local nonce manager and persisted "unresolved" state.
      2	//
      3	// Our txs go through a PRIVATE RPC, so the public RPC's 'pending' count does not see them.
@@ -5625,255 +5753,263 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     35	  gasPrice?: bigint;
     36	  /** ms from signing to the receipt (inclusion latency). */
     37	  inclusionMs?: number;
-    38	}
-    39	
-    40	export interface Unresolved {
-    41	  nonce: number;
-    42	  hashes: string[];
-    43	  since: number;
-    44	  /** Highest maxFeePerGas / tip used at this nonce (a replacement must outbid them). */
-    45	  maxFee?: string;
-    46	  tip?: string;
-    47	  /** false while we are still waiting normally (in flight); true once the outcome is unknown. */
-    48	  unknown?: boolean;
-    49	}
-    50	
-    51	export interface TxBackend {
-    52	  address: string;
-    53	  confirmedNonce(): Promise<number>;
-    54	  receipt(hash: string): Promise<{ status: number | null; gasUsed: bigint; gasPrice: bigint } | null>;
-    55	  /** true if the public or the private RPC still knows this tx (pending or mined). */
-    56	  knowsTx(hash: string): Promise<boolean>;
-    57	  sign(tx: { nonce: number; to: string; data: string; value: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Promise<{ raw: string; hash: string }>;
-    58	  broadcast(raw: string): Promise<void>;
-    59	  /** Optional second route (public RPC) for /cancelnonce. */
-    60	  broadcastPublic?(raw: string): Promise<void>;
-    61	  gas(): Promise<GasInfo>;
-    62	}
-    63	
-    64	export interface KeyValue {
-    65	  get(): string | undefined;
-    66	  set(v: string | null): void;
-    67	}
-    68	
-    69	export const DROP_AFTER_MS = 10 * 60_000;
-    70	
-    71	/** What a broadcast error means. */
-    72	export function classifySendError(e: unknown): 'accepted' | 'rejected' | 'ambiguous' {
-    73	  const o = (e ?? {}) as { code?: unknown; error?: { code?: unknown }; info?: { error?: { code?: unknown } } };
-    74	  const msg = errMsg(e);
-    75	  if (/already known|known transaction|already imported|already in mempool/i.test(msg)) return 'accepted';
-    76	  if (['INSUFFICIENT_FUNDS', 'NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(String(o.code))) return 'rejected';
-    77	  if (/nonce too low|insufficient funds|underpriced|intrinsic gas too low|exceeds block gas limit|invalid sender|max fee per gas less than/i.test(msg)) {
-    78	    return 'rejected';
-    79	  }
-    80	  // The server answered with a JSON-RPC error object: it explicitly refused the tx.
-    81	  if (typeof o.error?.code === 'number' || typeof o.info?.error?.code === 'number') return 'rejected';
-    82	  return 'ambiguous'; // timeout, connection reset, 5xx, no answer: it may have been accepted
-    83	}
-    84	
-    85	export class TxSender {
-    86	  private nextNonce: number | null = null;
-    87	
-    88	  constructor(
-    89	    private b: TxBackend,
-    90	    private store?: KeyValue,
-    91	    private now: () => number = Date.now,
-    92	    private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
-    93	  ) {}
-    94	
-    95	  get unresolved(): Unresolved | null {
-    96	    const v = this.store?.get() ?? this.mem;
-    97	    return v ? (JSON.parse(v) as Unresolved) : null;
-    98	  }
-    99	  private mem: string | undefined;
-   100	  private setUnresolved(u: Unresolved | null) {
-   101	    const v = u ? JSON.stringify(u) : null;
-   102	    if (this.store) this.store.set(v);
-   103	    else this.mem = v ?? undefined;
-   104	  }
-   105	
-   106	  private async takeNonce(): Promise<number> {
-   107	    const confirmed = await this.b.confirmedNonce();
-   108	    if (this.nextNonce === null || this.nextNonce < confirmed) this.nextNonce = confirmed;
-   109	    return this.nextNonce;
-   110	  }
-   111	
-   112	  /**
-   113	   * Re-check an unresolved tx. 'clear' once its nonce is consumed on-chain (by it or its cancel),
-   114	   * or once no RPC knows it any more after DROP_AFTER_MS (`dropped`). 'pending' otherwise.
-   115	   */
-   116	  async checkUnresolved(): Promise<{ state: 'clear' | 'pending'; executedHash?: string; ok?: boolean; dropped?: boolean }> {
-   117	    const u = this.unresolved;
-   118	    if (!u) return { state: 'clear' };
-   119	    for (const h of u.hashes) {
-   120	      const r = await this.b.receipt(h).catch(() => null);
-   121	      if (r) {
-   122	        this.setUnresolved(null);
-   123	        this.nextNonce = Math.max(this.nextNonce ?? 0, u.nonce + 1);
-   124	        return { state: 'clear', executedHash: h, ok: r.status === 1 };
-   125	      }
-   126	    }
-   127	    const confirmed = await this.b.confirmedNonce().catch(() => -1);
-   128	    if (confirmed > u.nonce) {
-   129	      // Nonce consumed by something we have no receipt for yet (RPC lag).
-   130	      this.setUnresolved(null);
-   131	      this.nextNonce = Math.max(this.nextNonce ?? 0, confirmed);
-   132	      return { state: 'clear' };
-   133	    }
-   134	    if (this.now() - u.since > DROP_AFTER_MS) {
-   135	      const known = await Promise.all(u.hashes.map((h) => this.b.knowsTx(h).catch(() => true)));
-   136	      if (!known.some(Boolean)) {
-   137	        // Never accepted or dropped by every mempool: the nonce is free again.
-   138	        this.setUnresolved(null);
-   139	        this.nextNonce = null;
-   140	        return { state: 'clear', dropped: true };
-   141	      }
-   142	    }
-   143	    return { state: 'pending' };
-   144	  }
-   145	
-   146	  /** Re-read the nonce from the chain on the next send (after /start confirm). */
-   147	  resetNonce(): void {
-   148	    this.nextNonce = null;
-   149	  }
-   150	
-   151	  /**
-   152	   * Safe to send now? Only if nothing is unresolved AND our next nonce is exactly the chain's next nonce
-   153	   * (a gap would make the tx unminable, so the MEXC leg must not fire).
-   154	   */
-   155	  async readyToSend(): Promise<{ ok: boolean; reason?: string }> {
-   156	    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
-   157	      const u = this.unresolved!;
-   158	      return { ok: false, reason: `tx at nonce ${u.nonce} unresolved (${u.hashes.join(', ')})` };
-   159	    }
-   160	    const latest = await this.b.confirmedNonce();
-   161	    if (this.nextNonce !== null && this.nextNonce !== latest) {
-   162	      log.warn(`nonce gap: local ${this.nextNonce}, chain ${latest}; resetting to the chain value`);
-   163	      this.nextNonce = latest;
-   164	    }
-   165	    return { ok: true };
-   166	  }
-   167	
-   168	  /**
-   169	   * /cancelnonce: replace the unresolved tx with a 0-value self-transfer at the same nonce, at least 2x the
-   170	   * highest fee used so far, through the private AND the public RPC. Waits up to `timeoutMs` for the nonce to be used.
-   171	   */
-   172	  async cancelNonce(timeoutMs = 10 * 60_000): Promise<string> {
-   173	    const u = this.unresolved;
-   174	    if (!u) return 'Nothing unresolved.';
-   175	    const g = await this.b.gas();
-   176	    const twice = (x: bigint | undefined) => (x ?? 0n) * 2n;
-   177	    const max = (...xs: bigint[]) => xs.reduce((a, c) => (c > a ? c : a));
-   178	    const maxFee = max(twice(u.maxFee ? BigInt(u.maxFee) : undefined), g.maxFee * 2n);
-   179	    const tip = max(twice(u.tip ? BigInt(u.tip) : undefined), g.tip * 2n);
-   180	    const c = await this.b.sign({ nonce: u.nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
-   181	    this.setUnresolved({ ...u, hashes: [...u.hashes, c.hash], maxFee: maxFee.toString(), tip: tip.toString() });
-   182	    await Promise.allSettled([this.b.broadcast(c.raw), this.b.broadcastPublic?.(c.raw)]);
-   183	    const deadline = this.now() + timeoutMs;
-   184	    while (this.now() < deadline) {
-   185	      const r = await this.checkUnresolved();
-   186	      if (r.state === 'clear') {
-   187	        if (r.executedHash) return `Nonce ${u.nonce} used by ${r.executedHash} (${r.executedHash === c.hash ? 'the cancel' : 'an earlier tx'}, ${r.ok ? 'success' : 'reverted'}).`;
-   188	        return `Nonce ${u.nonce} is used${r.dropped ? ' (all txs were dropped)' : ''}, but no receipt was found for our hashes: check etherscan.`;
-   189	      }
-   190	      await this.sleep(5000);
-   191	    }
-   192	    return `Nonce ${u.nonce} still not used after ${Math.round(timeoutMs / 60_000)} min (cancel ${c.hash}). Try /cancelnonce again later.`;
-   193	  }
-   194	
-   195	  async send(
-   196	    tx: { to: string; data: string; value?: bigint },
-   197	    gasLimit: bigint,
-   198	    gas: GasInfo,
-   199	    timeoutSec: number,
-   200	    onSigned?: (hash: string, nonce: number) => void,
-   201	  ): Promise<TxResult> {
-   202	    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
-   203	      return { ok: false, refused: true, gasCostWei: 0n, reason: `earlier tx ${this.unresolved!.hashes[0]} still unresolved` };
-   204	    }
-   205	    const nonce = await this.takeNonce();
-   206	    const { raw, hash } = await this.b.sign({
-   207	      nonce, to: tx.to, data: tx.data, value: tx.value ?? 0n, gasLimit, maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.tip,
-   208	    });
-   209	    this.nextNonce = nonce + 1;
-   210	    this.signedAt = this.now();
-   211	    onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
-   212	    // In flight from now on, and PERSISTED: if the bot dies while waiting, a restart still knows this nonce is taken.
-   213	    const fees = { maxFee: gas.maxFee.toString(), tip: gas.tip.toString() };
-   214	    this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: false });
-   215	    try {
-   216	      await this.b.broadcast(raw);
-   217	    } catch (e) {
-   218	      const kind = classifySendError(e);
-   219	      if (kind === 'rejected') {
-   220	        this.nextNonce = nonce; // nothing was broadcast: reuse the nonce
-   221	        this.setUnresolved(null);
-   222	        return { ok: false, rejected: true, hash, gasCostWei: 0n, reason: `RPC rejected the tx: ${errMsg(e)}` };
-   223	      }
-   224	      if (kind === 'ambiguous') {
-   225	        this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: true });
-   226	        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `send error, outcome unknown: ${errMsg(e)}` };
+    38	  /** OP-stack L1 data fee (wei), when the raw receipt carries one (Base/Optimism). */
+    39	  l1FeeWei?: bigint;
+    40	}
+    41	
+    42	export interface Unresolved {
+    43	  nonce: number;
+    44	  hashes: string[];
+    45	  since: number;
+    46	  /** Highest maxFeePerGas / tip used at this nonce (a replacement must outbid them). */
+    47	  maxFee?: string;
+    48	  tip?: string;
+    49	  /** false while we are still waiting normally (in flight); true once the outcome is unknown. */
+    50	  unknown?: boolean;
+    51	}
+    52	
+    53	export interface TxBackend {
+    54	  address: string;
+    55	  confirmedNonce(): Promise<number>;
+    56	  receipt(hash: string): Promise<{ status: number | null; gasUsed: bigint; gasPrice: bigint } | null>;
+    57	  /** Optional raw receipt (ethers does not expose the OP-stack L1 fee): only l1Fee is read. */
+    58	  rawReceipt?(hash: string): Promise<{ l1Fee?: bigint } | null>;
+    59	  /** true if the public or the private RPC still knows this tx (pending or mined). */
+    60	  knowsTx(hash: string): Promise<boolean>;
+    61	  sign(tx: { nonce: number; to: string; data: string; value: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Promise<{ raw: string; hash: string }>;
+    62	  broadcast(raw: string): Promise<void>;
+    63	  /** Optional second route (public RPC) for /cancelnonce. */
+    64	  broadcastPublic?(raw: string): Promise<void>;
+    65	  gas(): Promise<GasInfo>;
+    66	}
+    67	
+    68	export interface KeyValue {
+    69	  get(): string | undefined;
+    70	  set(v: string | null): void;
+    71	}
+    72	
+    73	export const DROP_AFTER_MS = 10 * 60_000;
+    74	
+    75	/** What a broadcast error means. */
+    76	export function classifySendError(e: unknown): 'accepted' | 'rejected' | 'ambiguous' {
+    77	  const o = (e ?? {}) as { code?: unknown; error?: { code?: unknown }; info?: { error?: { code?: unknown } } };
+    78	  const msg = errMsg(e);
+    79	  if (/already known|known transaction|already imported|already in mempool/i.test(msg)) return 'accepted';
+    80	  if (['INSUFFICIENT_FUNDS', 'NONCE_EXPIRED', 'REPLACEMENT_UNDERPRICED'].includes(String(o.code))) return 'rejected';
+    81	  if (/nonce too low|insufficient funds|underpriced|intrinsic gas too low|exceeds block gas limit|invalid sender|max fee per gas less than/i.test(msg)) {
+    82	    return 'rejected';
+    83	  }
+    84	  // The server answered with a JSON-RPC error object: it explicitly refused the tx.
+    85	  if (typeof o.error?.code === 'number' || typeof o.info?.error?.code === 'number') return 'rejected';
+    86	  return 'ambiguous'; // timeout, connection reset, 5xx, no answer: it may have been accepted
+    87	}
+    88	
+    89	export class TxSender {
+    90	  private nextNonce: number | null = null;
+    91	
+    92	  constructor(
+    93	    private b: TxBackend,
+    94	    private store?: KeyValue,
+    95	    private now: () => number = Date.now,
+    96	    private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+    97	  ) {}
+    98	
+    99	  get unresolved(): Unresolved | null {
+   100	    const v = this.store?.get() ?? this.mem;
+   101	    return v ? (JSON.parse(v) as Unresolved) : null;
+   102	  }
+   103	  private mem: string | undefined;
+   104	  private setUnresolved(u: Unresolved | null) {
+   105	    const v = u ? JSON.stringify(u) : null;
+   106	    if (this.store) this.store.set(v);
+   107	    else this.mem = v ?? undefined;
+   108	  }
+   109	
+   110	  private async takeNonce(): Promise<number> {
+   111	    const confirmed = await this.b.confirmedNonce();
+   112	    if (this.nextNonce === null || this.nextNonce < confirmed) this.nextNonce = confirmed;
+   113	    return this.nextNonce;
+   114	  }
+   115	
+   116	  /**
+   117	   * Re-check an unresolved tx. 'clear' once its nonce is consumed on-chain (by it or its cancel),
+   118	   * or once no RPC knows it any more after DROP_AFTER_MS (`dropped`). 'pending' otherwise.
+   119	   */
+   120	  async checkUnresolved(): Promise<{ state: 'clear' | 'pending'; executedHash?: string; ok?: boolean; dropped?: boolean }> {
+   121	    const u = this.unresolved;
+   122	    if (!u) return { state: 'clear' };
+   123	    for (const h of u.hashes) {
+   124	      const r = await this.b.receipt(h).catch(() => null);
+   125	      if (r) {
+   126	        this.setUnresolved(null);
+   127	        this.nextNonce = Math.max(this.nextNonce ?? 0, u.nonce + 1);
+   128	        return { state: 'clear', executedHash: h, ok: r.status === 1 };
+   129	      }
+   130	    }
+   131	    const confirmed = await this.b.confirmedNonce().catch(() => -1);
+   132	    if (confirmed > u.nonce) {
+   133	      // Nonce consumed by something we have no receipt for yet (RPC lag).
+   134	      this.setUnresolved(null);
+   135	      this.nextNonce = Math.max(this.nextNonce ?? 0, confirmed);
+   136	      return { state: 'clear' };
+   137	    }
+   138	    if (this.now() - u.since > DROP_AFTER_MS) {
+   139	      const known = await Promise.all(u.hashes.map((h) => this.b.knowsTx(h).catch(() => true)));
+   140	      if (!known.some(Boolean)) {
+   141	        // Never accepted or dropped by every mempool: the nonce is free again.
+   142	        this.setUnresolved(null);
+   143	        this.nextNonce = null;
+   144	        return { state: 'clear', dropped: true };
+   145	      }
+   146	    }
+   147	    return { state: 'pending' };
+   148	  }
+   149	
+   150	  /** Re-read the nonce from the chain on the next send (after /start confirm). */
+   151	  resetNonce(): void {
+   152	    this.nextNonce = null;
+   153	  }
+   154	
+   155	  /**
+   156	   * Safe to send now? Only if nothing is unresolved AND our next nonce is exactly the chain's next nonce
+   157	   * (a gap would make the tx unminable, so the MEXC leg must not fire).
+   158	   */
+   159	  async readyToSend(): Promise<{ ok: boolean; reason?: string }> {
+   160	    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
+   161	      const u = this.unresolved!;
+   162	      return { ok: false, reason: `tx at nonce ${u.nonce} unresolved (${u.hashes.join(', ')})` };
+   163	    }
+   164	    const latest = await this.b.confirmedNonce();
+   165	    if (this.nextNonce !== null && this.nextNonce !== latest) {
+   166	      log.warn(`nonce gap: local ${this.nextNonce}, chain ${latest}; resetting to the chain value`);
+   167	      this.nextNonce = latest;
+   168	    }
+   169	    return { ok: true };
+   170	  }
+   171	
+   172	  /**
+   173	   * /cancelnonce: replace the unresolved tx with a 0-value self-transfer at the same nonce, at least 2x the
+   174	   * highest fee used so far, through the private AND the public RPC. Waits up to `timeoutMs` for the nonce to be used.
+   175	   */
+   176	  async cancelNonce(timeoutMs = 10 * 60_000): Promise<string> {
+   177	    const u = this.unresolved;
+   178	    if (!u) return 'Nothing unresolved.';
+   179	    const g = await this.b.gas();
+   180	    const twice = (x: bigint | undefined) => (x ?? 0n) * 2n;
+   181	    const max = (...xs: bigint[]) => xs.reduce((a, c) => (c > a ? c : a));
+   182	    const maxFee = max(twice(u.maxFee ? BigInt(u.maxFee) : undefined), g.maxFee * 2n);
+   183	    const tip = max(twice(u.tip ? BigInt(u.tip) : undefined), g.tip * 2n);
+   184	    const c = await this.b.sign({ nonce: u.nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
+   185	    this.setUnresolved({ ...u, hashes: [...u.hashes, c.hash], maxFee: maxFee.toString(), tip: tip.toString() });
+   186	    await Promise.allSettled([this.b.broadcast(c.raw), this.b.broadcastPublic?.(c.raw)]);
+   187	    const deadline = this.now() + timeoutMs;
+   188	    while (this.now() < deadline) {
+   189	      const r = await this.checkUnresolved();
+   190	      if (r.state === 'clear') {
+   191	        if (r.executedHash) return `Nonce ${u.nonce} used by ${r.executedHash} (${r.executedHash === c.hash ? 'the cancel' : 'an earlier tx'}, ${r.ok ? 'success' : 'reverted'}).`;
+   192	        return `Nonce ${u.nonce} is used${r.dropped ? ' (all txs were dropped)' : ''}, but no receipt was found for our hashes: check etherscan.`;
+   193	      }
+   194	      await this.sleep(5000);
+   195	    }
+   196	    return `Nonce ${u.nonce} still not used after ${Math.round(timeoutMs / 60_000)} min (cancel ${c.hash}). Try /cancelnonce again later.`;
+   197	  }
+   198	
+   199	  async send(
+   200	    tx: { to: string; data: string; value?: bigint },
+   201	    gasLimit: bigint,
+   202	    gas: GasInfo,
+   203	    timeoutSec: number,
+   204	    onSigned?: (hash: string, nonce: number) => void,
+   205	  ): Promise<TxResult> {
+   206	    if (this.unresolved && (await this.checkUnresolved()).state === 'pending') {
+   207	      return { ok: false, refused: true, gasCostWei: 0n, reason: `earlier tx ${this.unresolved!.hashes[0]} still unresolved` };
+   208	    }
+   209	    const nonce = await this.takeNonce();
+   210	    const { raw, hash } = await this.b.sign({
+   211	      nonce, to: tx.to, data: tx.data, value: tx.value ?? 0n, gasLimit, maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.tip,
+   212	    });
+   213	    this.nextNonce = nonce + 1;
+   214	    this.signedAt = this.now();
+   215	    onSigned?.(hash, nonce); // persisted before broadcast, so a crash cannot lose the hash
+   216	    // In flight from now on, and PERSISTED: if the bot dies while waiting, a restart still knows this nonce is taken.
+   217	    const fees = { maxFee: gas.maxFee.toString(), tip: gas.tip.toString() };
+   218	    this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: false });
+   219	    try {
+   220	      await this.b.broadcast(raw);
+   221	    } catch (e) {
+   222	      const kind = classifySendError(e);
+   223	      if (kind === 'rejected') {
+   224	        this.nextNonce = nonce; // nothing was broadcast: reuse the nonce
+   225	        this.setUnresolved(null);
+   226	        return { ok: false, rejected: true, hash, gasCostWei: 0n, reason: `RPC rejected the tx: ${errMsg(e)}` };
    227	      }
-   228	      // 'accepted': already in the mempool, just wait for it below.
-   229	    }
-   230	    log.info(`tx sent ${hash} (nonce ${nonce})`);
-   231	
-   232	    let receipt = await this.waitReceipt(hash, timeoutSec);
-   233	    if (receipt) {
-   234	      this.setUnresolved(null);
-   235	      return this.result(hash, receipt);
-   236	    }
-   237	
-   238	    log.warn(`tx ${hash} not mined in ${timeoutSec}s, sending cancel`);
-   239	    // Re-read gas: if the base fee spiked while we waited, a cancel priced from the old fee would not mine either.
-   240	    const fresh = await this.b.gas().catch(() => gas);
-   241	    const bump = (x: bigint) => (x * 13n) / 10n; // +30% to replace
-   242	    const maxFee = [bump(gas.maxFee), bump(fresh.maxFee)].reduce((a, c) => (c > a ? c : a));
-   243	    const tip = [bump(gas.tip), bump(fresh.tip)].reduce((a, c) => (c > a ? c : a));
-   244	    const cancel = await this.b.sign({ nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
-   245	    this.setUnresolved({ nonce, hashes: [hash, cancel.hash], since: this.now(), maxFee: maxFee.toString(), tip: tip.toString(), unknown: false }); // before broadcasting the cancel
-   246	    await this.b.broadcast(cancel.raw).catch((e) => log.warn(`cancel send failed: ${errMsg(e)}`));
-   247	    const deadline = this.now() + timeoutSec * 1000;
-   248	    while (this.now() < deadline) {
-   249	      receipt = await this.b.receipt(hash).catch(() => null);
-   250	      if (receipt) {
-   251	        this.setUnresolved(null);
-   252	        return this.result(hash, receipt);
-   253	      }
-   254	      const c = await this.b.receipt(cancel.hash).catch(() => null);
-   255	      if (c) {
-   256	        this.setUnresolved(null);
-   257	        return { ok: false, hash, gasCostWei: c.gasUsed * c.gasPrice, reason: 'not mined, cancelled' };
-   258	      }
-   259	      await this.sleep(3000);
-   260	    }
-   261	    this.setUnresolved({ ...this.unresolved!, unknown: true });
-   262	    return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancel.hash} not confirmed: outcome UNKNOWN` };
-   263	  }
-   264	
-   265	  private signedAt = 0;
-   266	  private result(hash: string, r: { status: number | null; gasUsed: bigint; gasPrice: bigint }): TxResult {
-   267	    const cost = r.gasUsed * r.gasPrice;
-   268	    const extra = { gasUsed: r.gasUsed, gasPrice: r.gasPrice, inclusionMs: this.now() - this.signedAt };
-   269	    return r.status === 1 ? { ok: true, hash, gasCostWei: cost, ...extra } : { ok: false, hash, gasCostWei: cost, reason: 'reverted', ...extra };
-   270	  }
-   271	
-   272	  private async waitReceipt(hash: string, timeoutSec: number) {
-   273	    const deadline = this.now() + timeoutSec * 1000;
-   274	    while (this.now() < deadline) {
-   275	      const r = await this.b.receipt(hash).catch(() => null);
-   276	      if (r) return r;
-   277	      await this.sleep(2000);
-   278	    }
-   279	    return null;
-   280	  }
-   281	}
+   228	      if (kind === 'ambiguous') {
+   229	        this.setUnresolved({ nonce, hashes: [hash], since: this.now(), ...fees, unknown: true });
+   230	        return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `send error, outcome unknown: ${errMsg(e)}` };
+   231	      }
+   232	      // 'accepted': already in the mempool, just wait for it below.
+   233	    }
+   234	    log.info(`tx sent ${hash} (nonce ${nonce})`);
+   235	
+   236	    let receipt = await this.waitReceipt(hash, timeoutSec);
+   237	    if (receipt) {
+   238	      this.setUnresolved(null);
+   239	      return this.result(hash, receipt);
+   240	    }
+   241	
+   242	    log.warn(`tx ${hash} not mined in ${timeoutSec}s, sending cancel`);
+   243	    // Re-read gas: if the base fee spiked while we waited, a cancel priced from the old fee would not mine either.
+   244	    const fresh = await this.b.gas().catch(() => gas);
+   245	    const bump = (x: bigint) => (x * 13n) / 10n; // +30% to replace
+   246	    const maxFee = [bump(gas.maxFee), bump(fresh.maxFee)].reduce((a, c) => (c > a ? c : a));
+   247	    const tip = [bump(gas.tip), bump(fresh.tip)].reduce((a, c) => (c > a ? c : a));
+   248	    const cancel = await this.b.sign({ nonce, to: this.b.address, data: '0x', value: 0n, gasLimit: 21_000n, maxFeePerGas: maxFee, maxPriorityFeePerGas: tip });
+   249	    this.setUnresolved({ nonce, hashes: [hash, cancel.hash], since: this.now(), maxFee: maxFee.toString(), tip: tip.toString(), unknown: false }); // before broadcasting the cancel
+   250	    await this.b.broadcast(cancel.raw).catch((e) => log.warn(`cancel send failed: ${errMsg(e)}`));
+   251	    const deadline = this.now() + timeoutSec * 1000;
+   252	    while (this.now() < deadline) {
+   253	      receipt = await this.b.receipt(hash).catch(() => null);
+   254	      if (receipt) {
+   255	        this.setUnresolved(null);
+   256	        return this.result(hash, receipt);
+   257	      }
+   258	      const c = await this.b.receipt(cancel.hash).catch(() => null);
+   259	      if (c) {
+   260	        this.setUnresolved(null);
+   261	        return { ok: false, hash, gasCostWei: c.gasUsed * c.gasPrice, reason: 'not mined, cancelled' };
+   262	      }
+   263	      await this.sleep(3000);
+   264	    }
+   265	    this.setUnresolved({ ...this.unresolved!, unknown: true });
+   266	    return { ok: false, unknown: true, hash, gasCostWei: 0n, reason: `not mined and cancel ${cancel.hash} not confirmed: outcome UNKNOWN` };
+   267	  }
+   268	
+   269	  private signedAt = 0;
+   270	  private async result(hash: string, r: { status: number | null; gasUsed: bigint; gasPrice: bigint }): Promise<TxResult> {
+   271	    // OP-stack chains (Base/Optimism) charge an L1 data fee on top of the L2 gas: it lives in the
+   272	    // raw receipt's l1Fee field, which ethers does not expose. Without it the recorded gas
+   273	    // understates the true cost (round-3 review, M1). On other chains the field is absent.
+   274	    const l1 = (await this.b.rawReceipt?.(hash).catch(() => null))?.l1Fee ?? 0n;
+   275	    const cost = r.gasUsed * r.gasPrice + l1;
+   276	    const extra = { gasUsed: r.gasUsed, gasPrice: r.gasPrice, inclusionMs: this.now() - this.signedAt, ...(l1 > 0n ? { l1FeeWei: l1 } : {}) };
+   277	    return r.status === 1 ? { ok: true, hash, gasCostWei: cost, ...extra } : { ok: false, hash, gasCostWei: cost, reason: 'reverted', ...extra };
+   278	  }
+   279	
+   280	  private async waitReceipt(hash: string, timeoutSec: number) {
+   281	    const deadline = this.now() + timeoutSec * 1000;
+   282	    while (this.now() < deadline) {
+   283	      const r = await this.b.receipt(hash).catch(() => null);
+   284	      if (r) return r;
+   285	      await this.sleep(2000);
+   286	    }
+   287	    return null;
+   288	  }
+   289	}
 ```
 
 ## `scripts/check-0x-quote.ts`
 
-```ts
+```
      1	// One read-only firm 0x quote, to confirm before going live that transaction.to is the AllowanceHolder.
      2	// It NEVER signs or sends anything, and prints only transaction.to, allowanceTarget and issues.
      3	// Usage: npx tsx scripts/check-0x-quote.ts   (reads ZEROX_API_KEY and PRIVATE_KEY -> address from .env)
@@ -5899,7 +6035,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `scripts/networks.ts`
 
-```ts
+```
      1	// Read-only: per MEXC network, how many USDT-listed tokens have deposit AND withdraw enabled and a contract.
      2	// Also shows which raw MEXC network names each CHAIN profile matches (src/chains.ts), so you can check
      3	// the matcher before trading a new chain. It NEVER trades. Usage: npm run networks
@@ -5946,7 +6082,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `test/engine.test.ts`
 
-```ts
+```
      1	// End-to-end tests of the trading engine with fake MEXC, chain and aggregator.
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';
@@ -6143,275 +6279,311 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
    194	  assert.ok(Math.abs(s.total.pnl - expected) < 1e-6, `${s.total.pnl} vs ${expected}`);
    195	  assert.ok(Math.abs(s.total.gas - 3) < 1e-9);
    196	  assert.ok(alerts.some((a) => a.includes('✅ LIVE LINK DEX_BUY [ok]') && a.includes('Net PnL')));
-   197	});
-   198	
-   199	test('no trade when the gap is below max($15, 0.5%)', async () => {
-   200	  const { engine, db, calls } = setup({ bid: 10.9 });
-   201	  await engine.tick();
-   202	  assert.deepEqual(calls, []);
-   203	  assert.equal(trades(db).total.trades, 0);
-   204	});
-   205	
-   206	test('DEX leg fails after MEXC sold: buys back at market, alerts one-sided', async () => {
-   207	  const { engine, db, alerts, calls, bal } = setup({ dexOk: false });
-   208	  await engine.tick();
-   209	  // close: 2% over ask 11.21 = 11.4342, rounded DOWN (stays inside the price band)
-   210	  assert.ok(calls.includes('limit BUY 19.98 @ 11.434'));
-   211	  const row = trades(db);
-   212	  assert.equal(row.total.failed, 1);
-   213	  assert.ok(alerts.some((a) => a.startsWith('⚠️ ONE-SIDED FILL LINK')));
-   214	  assert.ok(Math.abs(bal.walletToken.LINK - 100) < 1e-9); // wallet untouched
-   215	  assert.ok(Math.abs(bal.mexc.LINK - 100 + 19.98 * 0.0005) < 1e-9); // flat again except the fee
-   216	});
-   217	
-   218	test('MEXC partial fill: rest is cancelled and closed at market', async () => {
-   219	  const { engine, calls } = setup({ mexcFillRatio: 0.5 });
-   220	  await engine.tick();
-   221	  assert.ok(calls.includes('cancel 1'));
-   222	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976')); // rest closed with an aggressive limit 2% under the bid
-   223	});
-   224	
-   225	test('simulation failure: nothing is sent, approval gas is still booked', async () => {
-   226	  const { engine, db, calls } = setup({ simulateThrows: true, approvalNeeded: true });
-   227	  await engine.tick();
-   228	  assert.ok(calls[0].startsWith('approve 200000000')); // exact amount: 200 USDC, never MaxUint256
-   229	  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
-   230	  const s = trades(db);
-   231	  assert.equal(s.total.trades, 0); // approval rows are not trades
-   232	  assert.ok(s.total.pnl < 0 && s.total.gas > 0);
-   233	});
-   234	
-   235	test('gas above MAX_GAS_GWEI: no quotes at all', async () => {
-   236	  const { engine, calls } = setup({ gasGwei: 50n });
-   237	  await engine.tick();
-   238	  assert.deepEqual(calls, []);
-   239	});
-   240	
-   241	test('kill switch: paused bot does nothing', async () => {
-   242	  const { engine, risk, calls } = setup({});
-   243	  risk.pause('Telegram /stop');
-   244	  await engine.tick();
-   245	  assert.deepEqual(calls, []);
-   246	});
-   247	
-   248	test('3 failed trades in a row pause trading', async () => {
-   249	  const { engine, risk, alerts } = setup({ dexOk: false });
-   250	  await engine.tick();
+   197	  assert.ok(alerts.some((a) => a.includes('https://etherscan.io/tx/0xtx'))); // chain explorer, not a hardcoded host (round-3 L4)
+   198	});
+   199	
+   200	test('no trade when the gap is below max($15, 0.5%)', async () => {
+   201	  const { engine, db, calls } = setup({ bid: 10.9 });
+   202	  await engine.tick();
+   203	  assert.deepEqual(calls, []);
+   204	  assert.equal(trades(db).total.trades, 0);
+   205	});
+   206	
+   207	test('DEX leg fails after MEXC sold: buys back at market, alerts one-sided', async () => {
+   208	  const { engine, db, alerts, calls, bal } = setup({ dexOk: false });
+   209	  await engine.tick();
+   210	  // close: 2% over ask 11.21 = 11.4342, rounded DOWN (stays inside the price band)
+   211	  assert.ok(calls.includes('limit BUY 19.98 @ 11.434'));
+   212	  const row = trades(db);
+   213	  assert.equal(row.total.failed, 1);
+   214	  assert.ok(alerts.some((a) => a.startsWith('⚠️ ONE-SIDED FILL LINK')));
+   215	  assert.ok(Math.abs(bal.walletToken.LINK - 100) < 1e-9); // wallet untouched
+   216	  assert.ok(Math.abs(bal.mexc.LINK - 100 + 19.98 * 0.0005) < 1e-9); // flat again except the fee
+   217	});
+   218	
+   219	test('MEXC partial fill: rest is cancelled and closed at market', async () => {
+   220	  const { engine, calls } = setup({ mexcFillRatio: 0.5 });
+   221	  await engine.tick();
+   222	  assert.ok(calls.includes('cancel 1'));
+   223	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976')); // rest closed with an aggressive limit 2% under the bid
+   224	});
+   225	
+   226	test('simulation failure: nothing is sent, approval gas is still booked', async () => {
+   227	  const { engine, db, calls } = setup({ simulateThrows: true, approvalNeeded: true });
+   228	  await engine.tick();
+   229	  assert.ok(calls[0].startsWith('approve 200000000')); // exact amount: 200 USDC, never MaxUint256
+   230	  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
+   231	  const s = trades(db);
+   232	  assert.equal(s.total.trades, 0); // approval rows are not trades
+   233	  assert.ok(s.total.pnl < 0 && s.total.gas > 0);
+   234	});
+   235	
+   236	test('gas above MAX_GAS_GWEI: no quotes at all', async () => {
+   237	  const { engine, calls } = setup({ gasGwei: 50n });
+   238	  await engine.tick();
+   239	  assert.deepEqual(calls, []);
+   240	});
+   241	
+   242	test('kill switch: paused bot does nothing', async () => {
+   243	  const { engine, risk, calls } = setup({});
+   244	  risk.pause('Telegram /stop');
+   245	  await engine.tick();
+   246	  assert.deepEqual(calls, []);
+   247	});
+   248	
+   249	test('3 failed trades in a row pause trading', async () => {
+   250	  const { engine, risk, alerts } = setup({ dexOk: false });
    251	  await engine.tick();
    252	  await engine.tick();
-   253	  assert.equal(risk.paused, true);
-   254	  assert.ok(alerts.some((a) => a.includes('3 failed trades in a row')));
-   255	  const before = alerts.length;
-   256	  await engine.tick();
-   257	  assert.equal(alerts.length, before); // stays stopped
-   258	});
-   259	
-   260	test('paper mode: records the trade, sends nothing real', async () => {
-   261	  const { engine, db, calls, alerts } = setup({ mode: 'paper' });
-   262	  await engine.tick();
-   263	  assert.deepEqual(calls, []);
-   264	  assert.equal(db.statsSince(0, 'paper').total.trades, 1);
-   265	  assert.ok(alerts.some((a) => a.startsWith('📝 PAPER LINK')));
-   266	});
-   267	
-   268	test('DEX outcome unknown: NO automatic unwind, trading paused', async () => {
-   269	  const { engine, risk, calls, alerts } = setup({ dexUnknown: true });
-   270	  await engine.tick();
-   271	  assert.ok(!calls.some((c) => c.startsWith('market') || c.startsWith('limit BUY')));
-   272	  assert.equal(risk.paused, true);
-   273	  assert.ok(alerts.some((a) => a.includes('outcome UNKNOWN')));
-   274	});
-   275	
-   276	test('unwind SELL that only partly fills is detected (not assumed flat)', async () => {
-   277	  const { engine, risk, calls, alerts } = setup({ mexcFillRatio: 0.5, closeFillRatio: 0.5 });
-   278	  await engine.tick();
-   279	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976'));
-   280	  assert.equal(risk.paused, true);
-   281	  assert.equal(risk.critical, true);
-   282	  // reports what is REALLY still open (half of 9.99), not the full quantity
-   283	  assert.ok(alerts.some((a) => a.includes('market close FAILED') && a.includes('Still open: MEXC SELL 5 LINK')));
-   284	});
-   285	
-   286	test('MEXC 5xx on order placement: found by clientOrderId, no double sell', async () => {
-   287	  const { engine, db, calls } = setup({ placeAmbiguous: true });
-   288	  await engine.tick();
-   289	  assert.equal(calls.filter((c) => c.startsWith('limit SELL')).length, 1); // never re-sent, never "unwound"
-   290	  assert.ok(!calls.some((c) => c.startsWith('limit BUY')));
-   291	  assert.equal(trades(db).total.failed, 0);
-   292	});
-   293	
-   294	test('order below MEXC minNotional: rejected BEFORE any DEX tx', async () => {
-   295	  const { engine, calls } = setup({ minNotional: 1000 });
-   296	  await engine.tick();
-   297	  assert.deepEqual(calls, []); // no simulate, no send, no MEXC order
-   298	});
-   299	
-   300	test('unresolved earlier DEX tx: no new trades', async () => {
-   301	  const { engine, calls } = setup({ unresolved: true });
-   302	  await engine.tick();
-   303	  assert.deepEqual(calls, []);
-   304	});
-   305	
-   306	test('critical pause needs /start confirm; soft pause does not', () => {
-   307	  const { risk } = setup({});
-   308	  risk.pause('Telegram /stop');
-   309	  assert.equal(risk.resume(), true);
-   310	  risk.pause('DEX tx unknown 0xabc', true);
-   311	  risk.pause('Telegram /stop'); // a later soft pause must not downgrade it
-   312	  assert.equal(risk.critical, true);
-   313	  assert.equal(risk.resume(), false);
-   314	  assert.equal(risk.paused, true);
-   315	  assert.equal(risk.resume(true), true);
-   316	  assert.equal(risk.paused, false);
-   317	});
-   318	
-   319	test('worst case beyond the remaining daily loss budget: skipped before any order', async () => {
-   320	  const { engine, db, calls } = setup({});
-   321	  db.insertTrade({ ts: Date.now(), day: (await import('../src/util.js')).dhakaDay(), mode: 'live', symbol: 'X', direction: 'DEX_BUY', size_usd: 1, qty: 1, buy_price: 1, sell_price: 1, expected_net: 0, cex_fee_usd: 0, gas_usd: 0, pnl_usd: -25, status: 'ok', dex_tx: null, cex_order_id: null, note: null });
-   322	  await engine.tick(); // budget left $5 < 5% of $200 + gas
-   323	  assert.deepEqual(calls, []);
-   324	});
-   325	
-   326	test('restart with an executing row: looked up, reported, paused until /start confirm', async () => {
-   327	  const { db, risk } = setup({});
-   328	  const { recoverExecuting } = await import('../src/recovery.js');
-   329	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xpending', cex_order_id: 'cidX', note: 'client order id cidX; nonce 7' });
-   330	  const alerts: string[] = [];
-   331	  await recoverExecuting(
-   332	    db, risk, { send: async (t) => void alerts.push(t) },
-   333	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
-   334	    async () => null,
-   335	  );
-   336	  assert.equal(risk.paused, true);
-   337	  assert.equal(risk.critical, true);
-   338	  assert.equal(risk.resume(), false);
-   339	  assert.equal(db.executingTrades().length, 0);
-   340	  assert.ok(alerts[0].includes('MEXC cidX (order 9): FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
-   341	});
-   342	
-   343	test('recovery: both legs done -> trade marked ok, no critical pause', async () => {
-   344	  const { db, risk } = setup({});
-   345	  const { recoverExecuting } = await import('../src/recovery.js');
-   346	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xdone', cex_order_id: 'cidY', note: 'client order id cidY; nonce 8' });
-   347	  const alerts: string[] = [];
-   348	  await recoverExecuting(
-   349	    db, risk, { send: async (t) => void alerts.push(t) },
-   350	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
-   351	    async () => ({ status: 1 }),
-   352	    async () => ({ state: 'clear' }),
-   353	  );
-   354	  assert.equal(risk.paused, false);
-   355	  assert.equal(db.statsSince(0, 'live').total.failed, 0);
-   356	  assert.ok(alerts[0].includes('All legs completed'));
-   357	});
-   358	
-   359	test('recovery: a pending DEX tx from before the restart keeps the bot critically paused', async () => {
-   360	  const { db, risk } = setup({});
-   361	  const { recoverExecuting } = await import('../src/recovery.js');
-   362	  await recoverExecuting(db, risk, { send: async () => {} }, { getOrderByClientId: async () => null }, async () => null, async () => ({ state: 'pending' }));
-   363	  assert.equal(risk.critical, true);
-   364	});
-   365	
-   366	test('critical resume does not reset the failure streak', () => {
-   367	  const { risk, db } = setup({});
-   368	  db.setState('consecutive_fails', '2');
-   369	  risk.pause('DEX tx unknown', true);
-   370	  risk.resume(true);
-   371	  assert.equal(risk.consecutiveFails, 2);
-   372	});
-   373	
-   374	test('nonce not ready (gap / unresolved): the MEXC leg never fires', async () => {
-   375	  const { engine, calls } = setup({ notReady: true });
-   376	  await engine.tick();
-   377	  assert.ok(calls.includes('simulate')); // got as far as the final checks
-   378	  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
-   379	});
-   380	
-   381	test('stale or unreasonable USDC/USDT rate: no trading', async () => {
-   382	  const off = setup({ usdcUsdt: 1.05 });
-   383	  await off.engine.tick();
-   384	  assert.deepEqual(off.calls, []);
-   385	});
-   386	
-   387	// ---------------- Phase-1 upgrade: items 2, 4e, 5 ----------------
-   388	const opps = (db: Db) => db.all<{ token: string; direction: string; size_usd: number | null; decision: string; net_usd: number | null; gross_bps: number | null }>('SELECT * FROM opportunities');
-   389	
-   390	test('every evaluated candidate is logged to opportunities, with its decision', async () => {
-   391	  const { engine, db } = setup({ bid: 10.9 }); // below the hurdle
-   392	  await engine.tick();
-   393	  const rows = opps(db);
-   394	  assert.ok(rows.length >= 2); // both directions
-   395	  assert.ok(rows.every((r) => r.token === 'LINK'));
-   396	  assert.ok(rows.some((r) => r.decision === 'below_hurdle' && r.gross_bps !== null && r.net_usd !== null));
-   397	});
-   398	
-   399	test('a traded candidate is logged as trade; paused ticks are logged as paused', async () => {
-   400	  const s1 = setup({});
-   401	  await s1.engine.tick();
-   402	  assert.ok(opps(s1.db).some((r) => r.decision === 'trade'));
-   403	  const s2 = setup({});
-   404	  s2.risk.pause('Telegram /stop');
-   405	  await s2.engine.tick();
-   406	  assert.ok(opps(s2.db).every((r) => r.decision === 'paused'));
-   407	});
-   408	
-   409	test('multi-size: near the hurdle, 0.5x and 2x of the base size are quoted and the best net is used', async () => {
-   410	  const { engine, priced, calls } = setup({});
-   411	  await engine.tick();
-   412	  // DEX_BUY quotes in USDC base units: base = MAX_TRADE_USD/2 = 100, then 50 and 200
-   413	  const usdc = priced.filter((x) => x % 1_000_000n === 0n && x <= 1_000_000_000n).map((x) => Number(x / 1_000_000n));
-   414	  assert.ok(usdc.includes(100) && usdc.includes(50) && usdc.includes(200), String(usdc));
-   415	  assert.ok(calls.includes('limit SELL 19.98 @ 11.177')); // the $200 size won (largest net)
-   416	});
-   417	
-   418	test('legs: a live trade writes one dex and one mexc leg with latency', async () => {
-   419	  const { engine, db } = setup({});
-   420	  await engine.tick();
-   421	  const legs = db.all<{ leg: string; quoted_price: number; executed_qty: number | null; latency_quote_ms: number | null; latency_mexc_ack_ms: number | null }>('SELECT * FROM legs');
-   422	  assert.deepEqual(legs.map((l) => l.leg).sort(), ['dex', 'mexc']);
-   423	  assert.ok(legs.find((l) => l.leg === 'dex')!.latency_quote_ms !== null);
-   424	  assert.equal(legs.find((l) => l.leg === 'mexc')!.executed_qty, 19.98);
-   425	});
-   426	
-   427	test('paper: the trade is booked at the re-quoted net, not the first quote', async () => {
-   428	  const { engine, db } = setup({ mode: 'paper' });
-   429	  await engine.tick();
-   430	  const t = db.all<{ pnl_usd: number; expected_net: number; requoted_net: number | null }>("SELECT * FROM trades WHERE mode = 'paper'")[0];
-   431	  assert.ok(t.requoted_net !== null);
-   432	  assert.equal(t.pnl_usd, t.requoted_net);
-   433	});
-   434	
-   435	test('skewed hurdle: a trade that worsens the wallet/MEXC balance needs more, one that restores it needs less', () => {
-   436	  const { engine, bal } = setup({});
-   437	  const tok = { ...LINK, rules: { ...LINK.rules } };
-   438	  const plain = 15; // need without skew: max(MIN_PROFIT_USD 15, 50 bps of $200)
-   439	  const lopsided = { ...bal, walletToken: { LINK: 150 }, mexc: { ...bal.mexc, LINK: 50 } }; // 75% in the wallet
-   440	  const worse = engine.needFor(tok, 'DEX_BUY', 200, lopsided, 10); // 75% -> 85% wallet: worse by 0.10
-   441	  const better = engine.needFor(tok, 'CEX_BUY', 200, lopsided, 10); // 75% -> 65%: restores
-   442	  assert.ok(Math.abs(worse - plain * (1 + 0.75 * 0.1)) < 1e-9, String(worse)); // SKEW_K 0.75
-   443	  assert.ok(Math.abs(better - plain * 0.8) < 1e-9, String(better));
-   444	});
-   445	
-   446	test('rebalance ticket: a side low for REBALANCE_AFTER_MIN opens ONE ticket and alerts once', async () => {
-   447	  process.env.REBALANCE_AFTER_MIN = '0';
-   448	  try {
-   449	    const { engine, db, alerts, bal } = setup({});
-   450	    bal.mexc.LINK = 0.5; // MEXC side of LINK far below 1x the trade size
-   451	    await engine.tick();
+   253	  await engine.tick();
+   254	  assert.equal(risk.paused, true);
+   255	  assert.ok(alerts.some((a) => a.includes('3 failed trades in a row')));
+   256	  const before = alerts.length;
+   257	  await engine.tick();
+   258	  assert.equal(alerts.length, before); // stays stopped
+   259	});
+   260	
+   261	test('paper mode: records the trade, sends nothing real', async () => {
+   262	  const { engine, db, calls, alerts } = setup({ mode: 'paper' });
+   263	  await engine.tick();
+   264	  assert.deepEqual(calls, []);
+   265	  assert.equal(db.statsSince(0, 'paper').total.trades, 1);
+   266	  assert.ok(alerts.some((a) => a.startsWith('📝 PAPER LINK')));
+   267	});
+   268	
+   269	test('DEX outcome unknown: NO automatic unwind, trading paused', async () => {
+   270	  const { engine, risk, calls, alerts } = setup({ dexUnknown: true });
+   271	  await engine.tick();
+   272	  assert.ok(!calls.some((c) => c.startsWith('market') || c.startsWith('limit BUY')));
+   273	  assert.equal(risk.paused, true);
+   274	  assert.ok(alerts.some((a) => a.includes('outcome UNKNOWN')));
+   275	});
+   276	
+   277	test('unwind SELL that only partly fills is detected (not assumed flat)', async () => {
+   278	  const { engine, risk, calls, alerts } = setup({ mexcFillRatio: 0.5, closeFillRatio: 0.5 });
+   279	  await engine.tick();
+   280	  assert.ok(calls.includes('limit SELL 9.99 @ 10.976'));
+   281	  assert.equal(risk.paused, true);
+   282	  assert.equal(risk.critical, true);
+   283	  // reports what is REALLY still open (half of 9.99), not the full quantity
+   284	  assert.ok(alerts.some((a) => a.includes('market close FAILED') && a.includes('Still open: MEXC SELL 5 LINK')));
+   285	});
+   286	
+   287	test('MEXC 5xx on order placement: found by clientOrderId, no double sell', async () => {
+   288	  const { engine, db, calls } = setup({ placeAmbiguous: true });
+   289	  await engine.tick();
+   290	  assert.equal(calls.filter((c) => c.startsWith('limit SELL')).length, 1); // never re-sent, never "unwound"
+   291	  assert.ok(!calls.some((c) => c.startsWith('limit BUY')));
+   292	  assert.equal(trades(db).total.failed, 0);
+   293	});
+   294	
+   295	test('order below MEXC minNotional: rejected BEFORE any DEX tx', async () => {
+   296	  const { engine, calls } = setup({ minNotional: 1000 });
+   297	  await engine.tick();
+   298	  assert.deepEqual(calls, []); // no simulate, no send, no MEXC order
+   299	});
+   300	
+   301	test('unresolved earlier DEX tx: no new trades', async () => {
+   302	  const { engine, calls } = setup({ unresolved: true });
+   303	  await engine.tick();
+   304	  assert.deepEqual(calls, []);
+   305	});
+   306	
+   307	test('critical pause needs /start confirm; soft pause does not', () => {
+   308	  const { risk } = setup({});
+   309	  risk.pause('Telegram /stop');
+   310	  assert.equal(risk.resume(), true);
+   311	  risk.pause('DEX tx unknown 0xabc', true);
+   312	  risk.pause('Telegram /stop'); // a later soft pause must not downgrade it
+   313	  assert.equal(risk.critical, true);
+   314	  assert.equal(risk.resume(), false);
+   315	  assert.equal(risk.paused, true);
+   316	  assert.equal(risk.resume(true), true);
+   317	  assert.equal(risk.paused, false);
+   318	});
+   319	
+   320	test('worst case beyond the remaining daily loss budget: skipped before any order', async () => {
+   321	  const { engine, db, calls } = setup({});
+   322	  db.insertTrade({ ts: Date.now(), day: (await import('../src/util.js')).dhakaDay(), mode: 'live', symbol: 'X', direction: 'DEX_BUY', size_usd: 1, qty: 1, buy_price: 1, sell_price: 1, expected_net: 0, cex_fee_usd: 0, gas_usd: 0, pnl_usd: -25, status: 'ok', dex_tx: null, cex_order_id: null, note: null });
+   323	  await engine.tick(); // budget left $5 < 5% of $200 + gas
+   324	  assert.deepEqual(calls, []);
+   325	});
+   326	
+   327	test('restart with an executing row: looked up, reported, paused until /start confirm', async () => {
+   328	  const { db, risk } = setup({});
+   329	  const { recoverExecuting } = await import('../src/recovery.js');
+   330	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xpending', cex_order_id: 'cidX', note: 'client order id cidX; nonce 7' });
+   331	  const alerts: string[] = [];
+   332	  await recoverExecuting(
+   333	    db, risk, { send: async (t) => void alerts.push(t) },
+   334	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
+   335	    async () => null,
+   336	  );
+   337	  assert.equal(risk.paused, true);
+   338	  assert.equal(risk.critical, true);
+   339	  assert.equal(risk.resume(), false);
+   340	  assert.equal(db.executingTrades().length, 0);
+   341	  assert.ok(alerts[0].includes('MEXC cidX (order 9): FILLED, filled 19.98') && alerts[0].includes('NOT MINED'));
+   342	});
+   343	
+   344	test('recovery: both legs done -> trade marked ok, no critical pause', async () => {
+   345	  const { db, risk } = setup({});
+   346	  const { recoverExecuting } = await import('../src/recovery.js');
+   347	  db.insertTrade({ ts: Date.now(), day: '2026-11-20', mode: 'live', symbol: 'LINK', direction: 'DEX_BUY', size_usd: 200, qty: 19.98, buy_price: 10, sell_price: 11, expected_net: 18, cex_fee_usd: 0, gas_usd: 0, pnl_usd: 0, status: 'executing', dex_tx: '0xdone', cex_order_id: 'cidY', note: 'client order id cidY; nonce 8' });
+   348	  const alerts: string[] = [];
+   349	  await recoverExecuting(
+   350	    db, risk, { send: async (t) => void alerts.push(t) },
+   351	    { getOrderByClientId: async () => ({ orderId: '9', status: 'FILLED', executedQty: '19.98' }) as Order },
+   352	    async () => ({ status: 1 }),
+   353	    async () => ({ state: 'clear' }),
+   354	  );
+   355	  assert.equal(risk.paused, false);
+   356	  assert.equal(db.statsSince(0, 'live').total.failed, 0);
+   357	  assert.ok(alerts[0].includes('All legs completed'));
+   358	});
+   359	
+   360	test('recovery: a pending DEX tx from before the restart keeps the bot critically paused', async () => {
+   361	  const { db, risk } = setup({});
+   362	  const { recoverExecuting } = await import('../src/recovery.js');
+   363	  await recoverExecuting(db, risk, { send: async () => {} }, { getOrderByClientId: async () => null }, async () => null, async () => ({ state: 'pending' }));
+   364	  assert.equal(risk.critical, true);
+   365	});
+   366	
+   367	test('critical resume does not reset the failure streak', () => {
+   368	  const { risk, db } = setup({});
+   369	  db.setState('consecutive_fails', '2');
+   370	  risk.pause('DEX tx unknown', true);
+   371	  risk.resume(true);
+   372	  assert.equal(risk.consecutiveFails, 2);
+   373	});
+   374	
+   375	test('nonce not ready (gap / unresolved): the MEXC leg never fires', async () => {
+   376	  const { engine, calls } = setup({ notReady: true });
+   377	  await engine.tick();
+   378	  assert.ok(calls.includes('simulate')); // got as far as the final checks
+   379	  assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
+   380	});
+   381	
+   382	test('stale or unreasonable USDC/USDT rate: no trading', async () => {
+   383	  const off = setup({ usdcUsdt: 1.05 });
+   384	  await off.engine.tick();
+   385	  assert.deepEqual(off.calls, []);
+   386	});
+   387	
+   388	// ---------------- Phase-1 upgrade: items 2, 4e, 5 ----------------
+   389	const opps = (db: Db) => db.all<{ token: string; direction: string; size_usd: number | null; decision: string; net_usd: number | null; gross_bps: number | null }>('SELECT * FROM opportunities');
+   390	
+   391	test('every evaluated candidate is logged to opportunities, with its decision', async () => {
+   392	  const { engine, db } = setup({ bid: 10.9 }); // below the hurdle
+   393	  await engine.tick();
+   394	  const rows = opps(db);
+   395	  assert.ok(rows.length >= 2); // both directions
+   396	  assert.ok(rows.every((r) => r.token === 'LINK'));
+   397	  assert.ok(rows.some((r) => r.decision === 'below_hurdle' && r.gross_bps !== null && r.net_usd !== null));
+   398	});
+   399	
+   400	test('a traded candidate is logged as trade; paused ticks are logged as paused', async () => {
+   401	  const s1 = setup({});
+   402	  await s1.engine.tick();
+   403	  assert.ok(opps(s1.db).some((r) => r.decision === 'trade'));
+   404	  const s2 = setup({});
+   405	  s2.risk.pause('Telegram /stop');
+   406	  await s2.engine.tick();
+   407	  assert.ok(opps(s2.db).every((r) => r.decision === 'paused'));
+   408	});
+   409	
+   410	test('multi-size: near the hurdle, 0.5x and 2x of the base size are quoted and the best net is used', async () => {
+   411	  const { engine, priced, calls } = setup({});
+   412	  await engine.tick();
+   413	  // DEX_BUY quotes in USDC base units: base = MAX_TRADE_USD/2 = 100, then 50 and 200
+   414	  const usdc = priced.filter((x) => x % 1_000_000n === 0n && x <= 1_000_000_000n).map((x) => Number(x / 1_000_000n));
+   415	  assert.ok(usdc.includes(100) && usdc.includes(50) && usdc.includes(200), String(usdc));
+   416	  assert.ok(calls.includes('limit SELL 19.98 @ 11.177')); // the $200 size won (largest net)
+   417	});
+   418	
+   419	test('legs: a live trade writes one dex and one mexc leg with latency', async () => {
+   420	  const { engine, db } = setup({});
+   421	  await engine.tick();
+   422	  const legs = db.all<{ leg: string; quoted_price: number; executed_qty: number | null; latency_quote_ms: number | null; latency_mexc_ack_ms: number | null }>('SELECT * FROM legs');
+   423	  assert.deepEqual(legs.map((l) => l.leg).sort(), ['dex', 'mexc']);
+   424	  assert.ok(legs.find((l) => l.leg === 'dex')!.latency_quote_ms !== null);
+   425	  assert.equal(legs.find((l) => l.leg === 'mexc')!.executed_qty, 19.98);
+   426	});
+   427	
+   428	test('paper: the trade is booked at the re-quoted net, not the first quote', async () => {
+   429	  const { engine, db } = setup({ mode: 'paper' });
+   430	  await engine.tick();
+   431	  const t = db.all<{ pnl_usd: number; expected_net: number; requoted_net: number | null }>("SELECT * FROM trades WHERE mode = 'paper'")[0];
+   432	  assert.ok(t.requoted_net !== null);
+   433	  assert.equal(t.pnl_usd, t.requoted_net);
+   434	});
+   435	
+   436	test('skewed hurdle: a trade that worsens the wallet/MEXC balance needs more, one that restores it needs less', () => {
+   437	  const { engine, bal } = setup({});
+   438	  const tok = { ...LINK, rules: { ...LINK.rules } };
+   439	  const plain = 15; // need without skew: max(MIN_PROFIT_USD 15, 50 bps of $200)
+   440	  const lopsided = { ...bal, walletToken: { LINK: 150 }, mexc: { ...bal.mexc, LINK: 50 } }; // 75% in the wallet
+   441	  const worse = engine.needFor(tok, 'DEX_BUY', 200, lopsided, 10); // 75% -> 85% wallet: worse by 0.10
+   442	  const better = engine.needFor(tok, 'CEX_BUY', 200, lopsided, 10); // 75% -> 65%: restores
+   443	  assert.ok(Math.abs(worse - plain * (1 + 0.75 * 0.1)) < 1e-9, String(worse)); // SKEW_K 0.75
+   444	  assert.ok(Math.abs(better - plain * 0.8) < 1e-9, String(better));
+   445	});
+   446	
+   447	test('rebalance ticket: a side low for REBALANCE_AFTER_MIN opens ONE ticket and alerts once', async () => {
+   448	  process.env.REBALANCE_AFTER_MIN = '0';
+   449	  try {
+   450	    const { engine, db, alerts, bal } = setup({});
+   451	    bal.mexc.LINK = 0.5; // MEXC side of LINK far below 1x the trade size
    452	    await engine.tick();
-   453	    const open = db.openTickets().filter((k) => k.token === 'LINK' && k.side === 'mexc');
-   454	    assert.equal(open.length, 1);
-   455	    assert.match(open[0].direction, /deposit wallet→MEXC/);
-   456	    assert.equal(alerts.filter((a) => a.startsWith('🎫 Rebalance ticket') && a.includes('LINK')).length, 1);
-   457	  } finally {
-   458	    delete process.env.REBALANCE_AFTER_MIN;
-   459	  }
-   460	});
+   453	    await engine.tick();
+   454	    const open = db.openTickets().filter((k) => k.token === 'LINK' && k.side === 'mexc');
+   455	    assert.equal(open.length, 1);
+   456	    assert.match(open[0].direction, /deposit wallet→MEXC/);
+   457	    assert.equal(alerts.filter((a) => a.startsWith('🎫 Rebalance ticket') && a.includes('LINK')).length, 1);
+   458	  } finally {
+   459	    delete process.env.REBALANCE_AFTER_MIN;
+   460	  }
+   461	});
+   462	
+   463	test('expected_net subtracts the approval gas already spent (round-3 L3)', async () => {
+   464	  const readExpected = (db: Db) =>
+   465	    db.all<{ expected_net: number }>(`SELECT expected_net FROM trades WHERE status = 'ok'`).map((r) => r.expected_net);
+   466	  const a = setup({});
+   467	  await a.engine.tick();
+   468	  const b = setup({ approvalNeeded: true });
+   469	  await b.engine.tick();
+   470	  assert.equal(readExpected(a.db).length, 1);
+   471	  assert.equal(readExpected(b.db).length, 1);
+   472	  // Same quotes, same books: the re-checked net is identical; only the approval gas ($1.20) differs.
+   473	  // The approval gas sits inside the balance-based PnL, so the stored expectation must not promise it back.
+   474	  assert.ok(Math.abs((readExpected(a.db)[0] - readExpected(b.db)[0]) - 1.2) < 1e-9,
+   475	    `${readExpected(a.db)[0]} vs ${readExpected(b.db)[0]}`);
+   476	});
+   477	
+   478	test('L1_FEE_USD reserve lowers the estimated net (round-3 M1)', async () => {
+   479	  const saved = { ...process.env };
+   480	  try {
+   481	    const run = async () => {
+   482	      const { engine, db } = setup({ mode: 'paper' });
+   483	      await engine.tick();
+   484	      return db.all<{ expected_net: number }>(`SELECT expected_net FROM trades WHERE status = 'paper'`).map((r) => r.expected_net);
+   485	    };
+   486	    delete process.env.L1_FEE_USD;
+   487	    const base = await run();
+   488	    process.env.L1_FEE_USD = '2';
+   489	    const withReserve = await run();
+   490	    assert.equal(base.length, 1);
+   491	    assert.equal(withReserve.length, 1);
+   492	    assert.ok(Math.abs((base[0] - withReserve[0]) - 2) < 1e-9, `${base[0]} vs ${withReserve[0]}`);
+   493	  } finally {
+   494	    process.env = saved;
+   495	  }
+   496	});
 ```
 
 ## `test/grok-r2.test.ts`
 
-```ts
+```
      1	// Tests for Grok's round-2 fix prompt (items 1-10).
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';
@@ -6575,7 +6747,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `test/infra.test.ts`
 
-```ts
+```
      1	import { test } from 'node:test';
      2	import assert from 'node:assert/strict';
      3	import crypto from 'node:crypto';
@@ -6882,11 +7054,33 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
    304	  const ok = { getOrder: async () => ({ orderId: '1', status: st, executedQty: '0' }) as never, cancelOrder: async () => ((st = 'CANCELED'), {} as never) };
    305	  assert.equal((await cancelAndConfirm(ok, 'X', '1', async () => {})).status, 'CANCELED');
    306	});
+   307	
+   308	test('OPP_RETENTION_DAYS defaults to 7 (round-3 M5)', () => {
+   309	  const saved = { ...process.env };
+   310	  try {
+   311	    delete process.env.OPP_RETENTION_DAYS;
+   312	    process.env.RPC_URL = 'http://x';
+   313	    assert.equal(loadConfig().oppRetentionDays, 7);
+   314	  } finally {
+   315	    process.env = saved;
+   316	  }
+   317	});
+   318	
+   319	test('L1_FEE_USD defaults to 0 (round-3 M1)', () => {
+   320	  const saved = { ...process.env };
+   321	  try {
+   322	    delete process.env.L1_FEE_USD;
+   323	    process.env.RPC_URL = 'http://x';
+   324	    assert.equal(loadConfig().l1FeeUsd, 0);
+   325	  } finally {
+   326	    process.env = saved;
+   327	  }
+   328	});
 ```
 
 ## `test/pricing.test.ts`
 
-```ts
+```
      1	import { test } from 'node:test';
      2	import assert from 'node:assert/strict';
      3	import {
@@ -6987,7 +7181,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `test/transfer.test.ts`
 
-```ts
+```
      1	// Transfer strategy: scan -> buy MEXC -> withdraw -> wait -> sell DEX, with fakes.
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';
@@ -6998,364 +7192,398 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
      8	import { findGaps, loadUniverse, type ScanToken } from '../src/scanner.js';
      9	import { evaluateTransfer, planCexBuy } from '../src/pricing.js';
     10	import type { Quote, QuoteRequest } from '../src/dex/aggregator.js';
-    11	import { AmbiguousRequestError, type Order } from '../src/mexc/rest.js';
-    12	
-    13	const GWEI = 1_000_000_000n;
-    14	const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
-    15	const XYZ = '0x1111111111111111111111111111111111111111';
-    16	
-    17	const symbolInfo = (base: string) => ({
-    18	  symbol: `${base}USDT`, baseAsset: base, quoteAsset: 'USDT', status: '1', isSpotTradingAllowed: true,
-    19	  baseSizePrecision: '0.01', quotePrecision: 4, orderTypes: ['LIMIT', 'MARKET'],
-    20	});
-    21	const coin = (base: string, contract: string, dep = true, wd = true) => ({
-    22	  coin: base,
-    23	  networkList: [{ coin: base, network: 'Ethereum(ERC20)', netWork: 'ETH', contract, depositEnable: dep, withdrawEnable: wd, withdrawFee: '1', withdrawMin: '10' }],
-    24	});
-    25	
-    26	function setup(
-    27	  o: {
-    28	    dexPrice?: number;
-    29	    withdrawThrows?: boolean;
-    30	    withdrawAmbiguous?: boolean;
-    31	    withdrawStatus?: number;
-    32	    db?: Db;
-    33	    mode?: 'live' | 'paper';
-    34	    sendFails?: boolean;
-    35	    sendUnknown?: boolean;
-    36	    now?: () => number;
-    37	  } = {},
-    38	) {
-    39	  process.env.MODE = o.mode ?? 'live';
-    40	  process.env.STRATEGY = 'transfer';
-    41	  process.env.ALLOW_WITHDRAWALS = 'yes';
-    42	  process.env.RPC_URL = 'http://localhost';
-    43	  process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
-    44	  process.env.MIN_PROFIT_USD = '15';
-    45	  // These older tests keep the pre-upgrade cost settings, so their numbers stay meaningful.
-    46	  process.env.MIN_PROFIT_BPS = '50';
-    47	  process.env.SAFETY_MARGIN_USD = '2';
-    48	  process.env.SAFETY_MARGIN_BPS = '0';
-    49	  process.env.CEX_SLIPPAGE_BPS = '20';
-    50	  process.env.PRIVATE_KEY = '0x' + '22'.repeat(32);
-    51	  process.env.MEXC_API_KEY = 'k'.repeat(10);
-    52	  process.env.MEXC_API_SECRET = 's'.repeat(10);
-    53	  const cfg = loadConfig();
-    54	  const db = o.db ?? new Db(':memory:');
-    55	  const risk = new Risk(db, cfg.mode, cfg);
-    56	  const alerts: string[] = [];
-    57	  const calls: string[] = [];
-    58	  const dexPrice = o.dexPrice ?? 1.15;
-    59	  const state = {
-    60	    mexc: { USDT: 1000, XYZ: 0 } as Record<string, number>,
-    61	    wallet: { [XYZ]: 0n, [USDC]: 0n } as Record<string, bigint>,
-    62	    withdrawStatus: o.withdrawStatus ?? 4,
-    63	    dexPrice,
-    64	    withdrawals: [] as { id: string; status: number; amount: string; withdrawOrderId?: string }[],
-    65	  };
-    66	  const orders = new Map<string, Order>();
-    67	  let lastQuote: QuoteRequest | null = null;
-    68	
-    69	  const mexc: TransferMexc = {
-    70	    exchangeInfo: async () => [symbolInfo('XYZ'), symbolInfo('BAD')],
-    71	    tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9000000', lastPrice: '1' }, { symbol: 'BADUSDT', quoteVolume: '9000000', lastPrice: '1' }],
-    72	    coinConfigs: async () => [coin('XYZ', XYZ), coin('BAD', '0x2222222222222222222222222222222222222222', true, false)],
-    73	    bookTickers: async () => new Map([['XYZUSDT', { bid: 0.999, ask: 1.0 }], ['ETHUSDT', { bid: 2000, ask: 2000 }], ['USDCUSDT', { bid: 1, ask: 1 }]]),
-    74	    depth: async () => ({ bids: [[0.999, 1e6]], asks: [[1.0, 1e6]], ts: Date.now() }),
-    75	    balances: async () => ({ ...state.mexc }),
-    76	    limitOrder: async (_s, side, q, p) => {
-    77	      calls.push(`limit ${side} ${q} @ ${p}`);
-    78	      const qty = Number(q);
-    79	      state.mexc.USDT -= qty * 1.0;
-    80	      state.mexc.XYZ += qty * (1 - cfg.mexcTakerFee);
-    81	      orders.set('b1', { orderId: 'b1', status: 'FILLED', executedQty: q, cummulativeQuoteQty: String(qty * 1.0), origQty: q, price: p, side });
-    82	      return { orderId: 'b1' };
-    83	    },
-    84	    marketSell: async (_s, q) => {
-    85	      calls.push(`market SELL ${q}`);
-    86	      state.mexc.XYZ -= Number(q);
-    87	      orders.set('s1', { orderId: 's1', status: 'FILLED', executedQty: q, cummulativeQuoteQty: String(Number(q) * 0.999), origQty: q, price: '0', side: 'SELL' });
-    88	      return { orderId: 's1' };
-    89	    },
-    90	    getOrder: async (_s, id) => orders.get(id)!,
-    91	    getOrderByClientId: async () => null,
-    92	    cancelOrder: async (_s, id) => orders.get(id)!,
-    93	    withdraw: async (p) => {
-    94	      calls.push(`withdraw ${p.amount} ${p.coin} ${p.netWork} -> ${p.address}`);
-    95	      if (o.withdrawThrows) throw new Error('no withdraw permission');
-    96	      state.mexc.XYZ -= Number(p.amount);
-    97	      state.withdrawals.push({ id: 'w1', status: 4, amount: p.amount, withdrawOrderId: p.withdrawOrderId });
-    98	      if (o.withdrawAmbiguous) throw new AmbiguousRequestError('timeout');
-    99	      return 'w1';
-   100	    },
-   101	    findWithdraw: async (_c, _since, ref) => {
-   102	      const w = state.withdrawals.find((x) => (ref.id && x.id === ref.id) || (ref.withdrawOrderId && x.withdrawOrderId === ref.withdrawOrderId));
-   103	      return w ? { ...w, status: state.withdrawStatus } : null;
-   104	    },
-   105	  };
-   106	
-   107	  const quote = (r: QuoteRequest, firm: boolean): Quote => {
-   108	    const out = (r.sellAmount * BigInt(Math.round(state.dexPrice * 1e6))) / 10n ** 18n; // token(18) -> USDC(6)
-   109	    return { buyAmount: out, minBuyAmount: (out * 999n) / 1000n, gas: 150_000n, spender: '0xspender', tx: firm ? { to: '0xah', data: '0x01', value: 0n } : undefined };
-   110	  };
-   111	
-   112	  const chain: TransferChain = {
-   113	    address: '0xMyWallet',
-   114	    gas: async () => ({ baseFee: 9n * GWEI, tip: GWEI, effective: 10n * GWEI, maxFee: 19n * GWEI }),
-   115	    decimals: async () => 18,
-   116	    tokenBalance: async (t) => state.wallet[t] ?? 0n,
-   117	    approveExact: async (_t, s, amount) => {
-   118	      calls.push(`approve ${s} ${amount}`);
-   119	      return { ok: true, gasCostWei: 60_000n * 10n * GWEI };
-   120	    },
-   121	    simulate: async () => (calls.push('simulate'), 150_000n),
-   122	    send: async () => {
-   123	      calls.push('send');
-   124	      if (o.sendUnknown) return { ok: false, unknown: true, hash: '0xhash', gasCostWei: 0n, reason: 'unknown' };
-   125	      if (o.sendFails) return { ok: false, hash: '0xhash', gasCostWei: 0n, reason: 'reverted' };
-   126	      const r = lastQuote!;
-   127	      state.wallet[XYZ] -= r.sellAmount;
-   128	      state.wallet[USDC] += quote(r, true).buyAmount;
-   129	      return { ok: true, hash: '0xhash', gasCostWei: 150_000n * 10n * GWEI };
-   130	    },
-   131	  };
-   132	
-   133	  const engine = new TransferEngine({
-   134	    cfg, mexc, chain, db, risk,
-   135	    tg: { send: async (t) => void alerts.push(t) },
-   136	    agg: { name: '0x', price: async (r) => quote(r, false), quote: async (r) => ((lastQuote = r), quote(r, true)) },
-   137	    dexPricesFn: async () => new Map([[XYZ, { price: dexPrice, tvl: 1e6 }]]),
-   138	    sleep: async () => {},
-   139	    now: o.now,
-   140	  });
-   141	  // The withdrawal lands: MEXC reports SUCCESS (7) and the wallet balance grows.
-   142	  const arrive = (tokens: number) => {
-   143	    state.withdrawStatus = 7;
-   144	    state.wallet[XYZ] += BigInt(Math.round(tokens * 1e6)) * 10n ** 12n;
-   145	  };
-   146	  return { engine, db, risk, alerts, calls, state, arrive, cfg };
-   147	}
-   148	
-   149	test('loadUniverse keeps only ERC20 tokens with deposit AND withdraw open', async () => {
-   150	  const { engine } = setup();
-   151	  await engine.refreshUniverse(true);
-   152	  assert.deepEqual(engine.universe.map((t) => t.base), ['XYZ']); // BAD has withdrawals suspended
-   153	  assert.equal(engine.universe[0].address, XYZ);
-   154	  assert.equal(engine.universe[0].netWork, 'ETH');
-   155	  assert.equal(engine.universe[0].withdrawFee, 1);
-   156	});
-   157	
-   158	test('findGaps: filters TVL, too-small and absurd gaps, sorts biggest first', () => {
-   159	  const rules = { qtyStep: 0.01, priceDecimals: 4, minQty: 0, minNotional: 1, maxNotional: 1e6, orderTypes: ['LIMIT'], tradeSideType: 1 };
-   160	  const tok = (base: string, address: string): ScanToken => ({ base, symbol: `${base}USDT`, address, netWork: 'ETH', withdrawFee: 0, withdrawMin: 0, qtyStep: 0.01, priceDecimals: 4, volumeUsd: 1e6, rules });
-   161	  const tokens = [tok('A', '0xa'), tok('B', '0xb'), tok('C', '0xc'), tok('D', '0xd'), tok('E', '0xe')];
-   162	  const tickers = new Map(['A', 'B', 'C', 'D', 'E'].map((b) => [`${b}USDT`, { bid: 0.99, ask: 1 }]));
-   163	  const dex = new Map([
-   164	    ['0xa', { price: 1.05, tvl: 1e6 }], // 5%
-   165	    ['0xb', { price: 1.1, tvl: 1e6 }], // 10%
-   166	    ['0xc', { price: 1.1, tvl: 1000 }], // thin pool
-   167	    ['0xd', { price: 1.01, tvl: 1e6 }], // 1% < min
-   168	    ['0xe', { price: 3, tvl: 1e6 }], // 200%: broken / different token
-   169	  ]);
-   170	  const g = findGaps(tokens, tickers, dex, { minTvlUsd: 200_000, minGapPct: 3 });
-   171	  assert.deepEqual(g.map((x) => x.token.base), ['B', 'A']);
-   172	});
-   173	
-   174	test('evaluateTransfer subtracts withdraw fee, drift reserve and all costs', () => {
-   175	  const plan = planCexBuy({ sizeUsd: 200, asks: [[1, 1e6]], qtyStep: 0.01, takerFee: 0.0005 })!;
-   176	  const ev = evaluateTransfer({ plan, withdrawFeeTokens: 1, usdcOut: 228.7, usdcMin: 228.5, gasUsd: 4, driftBps: 150, costs: { takerFee: 0.0005, cexSlippageBps: 20, safetyMarginUsd: 2 } });
-   177	  assert.ok(Math.abs(ev.arriving - (200 * 0.9995 - 1)) < 1e-9);
-   178	  const expected = 228.7 - 200 - 4 - (0.4 + 0.2) - 228.7 * 0.015 - 2;
-   179	  assert.ok(Math.abs(ev.net - expected) < 1e-9);
-   180	});
-   181	
-   182	test('full cycle: buy on MEXC -> withdraw to own wallet -> wait -> sell on DEX -> PnL', async () => {
-   183	  const { engine, db, calls, alerts, arrive } = setup();
-   184	  await engine.tick(); // finds gap, buys, withdraws
-   185	  assert.equal(calls[0], 'limit BUY 200.00 @ 1.0020');
-   186	  assert.equal(calls[1], 'withdraw 199.90 XYZ ETH -> 0xMyWallet'); // only ever our own wallet
-   187	  assert.equal(db.openTransfers()[0].status, 'withdrawing');
-   188	  assert.ok(alerts.some((a) => a.startsWith('📤 TRANSFER #1 XYZ')));
-   189	
-   190	  await engine.tick(); // still on its way: nothing new is bought meanwhile
-   191	  assert.equal(calls.filter((c) => c.startsWith('limit')).length, 1);
-   192	
-   193	  arrive(198.9); // 199.9 - 1 withdraw fee
-   194	  await engine.tick();
-   195	  assert.ok(calls.includes('approve 0xspender 198900000000000000000')); // exact amount
-   196	  assert.ok(calls.includes('simulate') && calls.includes('send'));
-   197	  assert.ok(!db.openTransfers().some((t) => t.id === 1)); // #1 done (a new one may start: gap still open)
+    11	import { BestOf, type Aggregator } from '../src/dex/aggregator.js';
+    12	import { AmbiguousRequestError, type Order } from '../src/mexc/rest.js';
+    13	
+    14	const GWEI = 1_000_000_000n;
+    15	const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+    16	const XYZ = '0x1111111111111111111111111111111111111111';
+    17	
+    18	const symbolInfo = (base: string) => ({
+    19	  symbol: `${base}USDT`, baseAsset: base, quoteAsset: 'USDT', status: '1', isSpotTradingAllowed: true,
+    20	  baseSizePrecision: '0.01', quotePrecision: 4, orderTypes: ['LIMIT', 'MARKET'],
+    21	});
+    22	const coin = (base: string, contract: string, dep = true, wd = true) => ({
+    23	  coin: base,
+    24	  networkList: [{ coin: base, network: 'Ethereum(ERC20)', netWork: 'ETH', contract, depositEnable: dep, withdrawEnable: wd, withdrawFee: '1', withdrawMin: '10' }],
+    25	});
+    26	
+    27	function setup(
+    28	  o: {
+    29	    dexPrice?: number;
+    30	    withdrawThrows?: boolean;
+    31	    withdrawAmbiguous?: boolean;
+    32	    withdrawStatus?: number;
+    33	    db?: Db;
+    34	    mode?: 'live' | 'paper';
+    35	    sendFails?: boolean;
+    36	    sendUnknown?: boolean;
+    37	    firmDexPrice?: number; // price the FIRM quote (after approval) sees; first quote uses dexPrice
+    38	    agg?: Aggregator; // override the fake aggregator (e.g. a BestOf of two fakes)
+    39	    now?: () => number;
+    40	  } = {},
+    41	) {
+    42	  process.env.MODE = o.mode ?? 'live';
+    43	  process.env.STRATEGY = 'transfer';
+    44	  process.env.ALLOW_WITHDRAWALS = 'yes';
+    45	  process.env.RPC_URL = 'http://localhost';
+    46	  process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
+    47	  process.env.MIN_PROFIT_USD = '15';
+    48	  // These older tests keep the pre-upgrade cost settings, so their numbers stay meaningful.
+    49	  process.env.MIN_PROFIT_BPS = '50';
+    50	  process.env.SAFETY_MARGIN_USD = '2';
+    51	  process.env.SAFETY_MARGIN_BPS = '0';
+    52	  process.env.CEX_SLIPPAGE_BPS = '20';
+    53	  process.env.PRIVATE_KEY = '0x' + '22'.repeat(32);
+    54	  process.env.MEXC_API_KEY = 'k'.repeat(10);
+    55	  process.env.MEXC_API_SECRET = 's'.repeat(10);
+    56	  const cfg = loadConfig();
+    57	  const db = o.db ?? new Db(':memory:');
+    58	  const risk = new Risk(db, cfg.mode, cfg);
+    59	  const alerts: string[] = [];
+    60	  const calls: string[] = [];
+    61	  const dexPrice = o.dexPrice ?? 1.15;
+    62	  const state = {
+    63	    mexc: { USDT: 1000, XYZ: 0 } as Record<string, number>,
+    64	    wallet: { [XYZ]: 0n, [USDC]: 0n } as Record<string, bigint>,
+    65	    withdrawStatus: o.withdrawStatus ?? 4,
+    66	    dexPrice,
+    67	    withdrawals: [] as { id: string; status: number; amount: string; withdrawOrderId?: string }[],
+    68	  };
+    69	  const orders = new Map<string, Order>();
+    70	  let lastQuote: QuoteRequest | null = null;
+    71	
+    72	  const mexc: TransferMexc = {
+    73	    exchangeInfo: async () => [symbolInfo('XYZ'), symbolInfo('BAD')],
+    74	    tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9000000', lastPrice: '1' }, { symbol: 'BADUSDT', quoteVolume: '9000000', lastPrice: '1' }],
+    75	    coinConfigs: async () => [coin('XYZ', XYZ), coin('BAD', '0x2222222222222222222222222222222222222222', true, false)],
+    76	    bookTickers: async () => new Map([['XYZUSDT', { bid: 0.999, ask: 1.0 }], ['ETHUSDT', { bid: 2000, ask: 2000 }], ['USDCUSDT', { bid: 1, ask: 1 }]]),
+    77	    depth: async () => ({ bids: [[0.999, 1e6]], asks: [[1.0, 1e6]], ts: Date.now() }),
+    78	    balances: async () => ({ ...state.mexc }),
+    79	    limitOrder: async (_s, side, q, p) => {
+    80	      calls.push(`limit ${side} ${q} @ ${p}`);
+    81	      const qty = Number(q);
+    82	      state.mexc.USDT -= qty * 1.0;
+    83	      state.mexc.XYZ += qty * (1 - cfg.mexcTakerFee);
+    84	      orders.set('b1', { orderId: 'b1', status: 'FILLED', executedQty: q, cummulativeQuoteQty: String(qty * 1.0), origQty: q, price: p, side });
+    85	      return { orderId: 'b1' };
+    86	    },
+    87	    marketSell: async (_s, q) => {
+    88	      calls.push(`market SELL ${q}`);
+    89	      state.mexc.XYZ -= Number(q);
+    90	      orders.set('s1', { orderId: 's1', status: 'FILLED', executedQty: q, cummulativeQuoteQty: String(Number(q) * 0.999), origQty: q, price: '0', side: 'SELL' });
+    91	      return { orderId: 's1' };
+    92	    },
+    93	    getOrder: async (_s, id) => orders.get(id)!,
+    94	    getOrderByClientId: async () => null,
+    95	    cancelOrder: async (_s, id) => orders.get(id)!,
+    96	    withdraw: async (p) => {
+    97	      calls.push(`withdraw ${p.amount} ${p.coin} ${p.netWork} -> ${p.address}`);
+    98	      if (o.withdrawThrows) throw new Error('no withdraw permission');
+    99	      state.mexc.XYZ -= Number(p.amount);
+   100	      state.withdrawals.push({ id: 'w1', status: 4, amount: p.amount, withdrawOrderId: p.withdrawOrderId });
+   101	      if (o.withdrawAmbiguous) throw new AmbiguousRequestError('timeout');
+   102	      return 'w1';
+   103	    },
+   104	    findWithdraw: async (_c, _since, ref) => {
+   105	      const w = state.withdrawals.find((x) => (ref.id && x.id === ref.id) || (ref.withdrawOrderId && x.withdrawOrderId === ref.withdrawOrderId));
+   106	      return w ? { ...w, status: state.withdrawStatus } : null;
+   107	    },
+   108	  };
+   109	
+   110	  let firmCalls = 0;
+   111	  const quote = (r: QuoteRequest, firm: boolean): Quote => {
+   112	    // The firm quote after the approval may see a different price (round-3 M3 test).
+   113	    const px = firm && firmCalls++ > 0 && o.firmDexPrice !== undefined ? o.firmDexPrice : state.dexPrice;
+   114	    const out = (r.sellAmount * BigInt(Math.round(px * 1e6))) / 10n ** 18n; // token(18) -> USDC(6)
+   115	    return { buyAmount: out, minBuyAmount: (out * 999n) / 1000n, gas: 150_000n, spender: '0xspender', tx: firm ? { to: '0xah', data: '0x01', value: 0n } : undefined };
+   116	  };
+   117	
+   118	  const chain: TransferChain = {
+   119	    address: '0xMyWallet',
+   120	    gas: async () => ({ baseFee: 9n * GWEI, tip: GWEI, effective: 10n * GWEI, maxFee: 19n * GWEI }),
+   121	    decimals: async () => 18,
+   122	    tokenBalance: async (t) => state.wallet[t] ?? 0n,
+   123	    approveExact: async (_t, s, amount) => {
+   124	      calls.push(`approve ${s} ${amount}`);
+   125	      return { ok: true, gasCostWei: 60_000n * 10n * GWEI };
+   126	    },
+   127	    simulate: async () => (calls.push('simulate'), 150_000n),
+   128	    send: async () => {
+   129	      calls.push('send');
+   130	      if (o.sendUnknown) return { ok: false, unknown: true, hash: '0xhash', gasCostWei: 0n, reason: 'unknown' };
+   131	      if (o.sendFails) return { ok: false, hash: '0xhash', gasCostWei: 0n, reason: 'reverted' };
+   132	      const r = lastQuote!;
+   133	      state.wallet[XYZ] -= r.sellAmount;
+   134	      state.wallet[USDC] += quote(r, true).buyAmount;
+   135	      return { ok: true, hash: '0xhash', gasCostWei: 150_000n * 10n * GWEI };
+   136	    },
+   137	  };
+   138	
+   139	  const engine = new TransferEngine({
+   140	    cfg, mexc, chain, db, risk,
+   141	    tg: { send: async (t) => void alerts.push(t) },
+   142	    agg: o.agg ?? { name: '0x', price: async (r) => quote(r, false), quote: async (r) => ((lastQuote = r), quote(r, true)) },
+   143	    dexPricesFn: async () => new Map([[XYZ, { price: dexPrice, tvl: 1e6 }]]),
+   144	    sleep: async () => {},
+   145	    now: o.now,
+   146	  });
+   147	  // The withdrawal lands: MEXC reports SUCCESS (7) and the wallet balance grows.
+   148	  const arrive = (tokens: number) => {
+   149	    state.withdrawStatus = 7;
+   150	    state.wallet[XYZ] += BigInt(Math.round(tokens * 1e6)) * 10n ** 12n;
+   151	  };
+   152	  return { engine, db, risk, alerts, calls, state, arrive, cfg };
+   153	}
+   154	
+   155	test('loadUniverse keeps only ERC20 tokens with deposit AND withdraw open', async () => {
+   156	  const { engine } = setup();
+   157	  await engine.refreshUniverse(true);
+   158	  assert.deepEqual(engine.universe.map((t) => t.base), ['XYZ']); // BAD has withdrawals suspended
+   159	  assert.equal(engine.universe[0].address, XYZ);
+   160	  assert.equal(engine.universe[0].netWork, 'ETH');
+   161	  assert.equal(engine.universe[0].withdrawFee, 1);
+   162	});
+   163	
+   164	test('findGaps: filters TVL, too-small and absurd gaps, sorts biggest first', () => {
+   165	  const rules = { qtyStep: 0.01, priceDecimals: 4, minQty: 0, minNotional: 1, maxNotional: 1e6, orderTypes: ['LIMIT'], tradeSideType: 1 };
+   166	  const tok = (base: string, address: string): ScanToken => ({ base, symbol: `${base}USDT`, address, netWork: 'ETH', withdrawFee: 0, withdrawMin: 0, qtyStep: 0.01, priceDecimals: 4, volumeUsd: 1e6, rules });
+   167	  const tokens = [tok('A', '0xa'), tok('B', '0xb'), tok('C', '0xc'), tok('D', '0xd'), tok('E', '0xe')];
+   168	  const tickers = new Map(['A', 'B', 'C', 'D', 'E'].map((b) => [`${b}USDT`, { bid: 0.99, ask: 1 }]));
+   169	  const dex = new Map([
+   170	    ['0xa', { price: 1.05, tvl: 1e6 }], // 5%
+   171	    ['0xb', { price: 1.1, tvl: 1e6 }], // 10%
+   172	    ['0xc', { price: 1.1, tvl: 1000 }], // thin pool
+   173	    ['0xd', { price: 1.01, tvl: 1e6 }], // 1% < min
+   174	    ['0xe', { price: 3, tvl: 1e6 }], // 200%: broken / different token
+   175	  ]);
+   176	  const g = findGaps(tokens, tickers, dex, { minTvlUsd: 200_000, minGapPct: 3 });
+   177	  assert.deepEqual(g.map((x) => x.token.base), ['B', 'A']);
+   178	});
+   179	
+   180	test('evaluateTransfer subtracts withdraw fee, drift reserve and all costs', () => {
+   181	  const plan = planCexBuy({ sizeUsd: 200, asks: [[1, 1e6]], qtyStep: 0.01, takerFee: 0.0005 })!;
+   182	  const ev = evaluateTransfer({ plan, withdrawFeeTokens: 1, usdcOut: 228.7, usdcMin: 228.5, gasUsd: 4, driftBps: 150, costs: { takerFee: 0.0005, cexSlippageBps: 20, safetyMarginUsd: 2 } });
+   183	  assert.ok(Math.abs(ev.arriving - (200 * 0.9995 - 1)) < 1e-9);
+   184	  const expected = 228.7 - 200 - 4 - (0.4 + 0.2) - 228.7 * 0.015 - 2;
+   185	  assert.ok(Math.abs(ev.net - expected) < 1e-9);
+   186	});
+   187	
+   188	test('full cycle: buy on MEXC -> withdraw to own wallet -> wait -> sell on DEX -> PnL', async () => {
+   189	  const { engine, db, calls, alerts, arrive } = setup();
+   190	  await engine.tick(); // finds gap, buys, withdraws
+   191	  assert.equal(calls[0], 'limit BUY 200.00 @ 1.0020');
+   192	  assert.equal(calls[1], 'withdraw 199.90 XYZ ETH -> 0xMyWallet'); // only ever our own wallet
+   193	  assert.equal(db.openTransfers()[0].status, 'withdrawing');
+   194	  assert.ok(alerts.some((a) => a.startsWith('📤 TRANSFER #1 XYZ')));
+   195	
+   196	  await engine.tick(); // still on its way: nothing new is bought meanwhile
+   197	  assert.equal(calls.filter((c) => c.startsWith('limit')).length, 1);
    198	
-   199	  const s = db.statsSince(0, 'live');
-   200	  assert.equal(s.total.trades, 1);
-   201	  assert.equal(s.total.failed, 0);
-   202	  const usdcOut = Math.floor(198.9 * 1.15 * 1e6) / 1e6;
-   203	  const gas = (0.0006 + 0.0015) * 2000;
-   204	  assert.ok(Math.abs(s.total.pnl - (usdcOut - 200 - gas)) < 1e-6, String(s.total.pnl));
-   205	  assert.ok(alerts.some((a) => a.includes('TRANSFER #1 XYZ done') && a.includes('Net PnL')));
-   206	});
-   207	
-   208	test('restart while withdrawing: a new engine resumes the same transfer', async () => {
-   209	  const first = setup();
-   210	  await first.engine.tick();
-   211	  // "restart": new engine, same database and balances
-   212	  const second = setup({ db: first.db });
-   213	  Object.assign(second.state, first.state);
-   214	  second.state.wallet[XYZ] = BigInt(198.9e6) * 10n ** 12n;
-   215	  second.state.withdrawStatus = 7; // MEXC reports SUCCESS
-   216	  await second.engine.tick();
-   217	  assert.ok(!first.db.openTransfers().some((t) => t.id === 1));
-   218	  assert.equal(first.db.statsSince(0, 'live').total.trades, 1);
-   219	});
-   220	
-   221	test('withdraw request times out: never re-sent, found later by withdrawOrderId', async () => {
-   222	  const { engine, db, calls, arrive } = setup({ withdrawAmbiguous: true });
-   223	  await engine.tick();
-   224	  assert.equal(calls.filter((c) => c.startsWith('withdraw')).length, 1);
-   225	  await engine.tick(); // looks it up instead of withdrawing again
-   226	  assert.equal(calls.filter((c) => c.startsWith('withdraw')).length, 1);
-   227	  assert.equal(db.getTransfer(1)!.withdraw_id, 'w1');
-   228	  arrive(198.9);
+   199	  arrive(198.9); // 199.9 - 1 withdraw fee
+   200	  await engine.tick();
+   201	  assert.ok(calls.includes('approve 0xspender 198900000000000000000')); // exact amount
+   202	  assert.ok(calls.includes('simulate') && calls.includes('send'));
+   203	  assert.ok(!db.openTransfers().some((t) => t.id === 1)); // #1 done (a new one may start: gap still open)
+   204	
+   205	  const s = db.statsSince(0, 'live');
+   206	  assert.equal(s.total.trades, 1);
+   207	  assert.equal(s.total.failed, 0);
+   208	  const usdcOut = Math.floor(198.9 * 1.15 * 1e6) / 1e6;
+   209	  const gas = (0.0006 + 0.0015) * 2000;
+   210	  assert.ok(Math.abs(s.total.pnl - (usdcOut - 200 - gas)) < 1e-6, String(s.total.pnl));
+   211	  assert.ok(alerts.some((a) => a.includes('TRANSFER #1 XYZ done') && a.includes('Net PnL')));
+   212	});
+   213	
+   214	test('restart while withdrawing: a new engine resumes the same transfer', async () => {
+   215	  const first = setup();
+   216	  await first.engine.tick();
+   217	  // "restart": new engine, same database and balances
+   218	  const second = setup({ db: first.db });
+   219	  Object.assign(second.state, first.state);
+   220	  second.state.wallet[XYZ] = BigInt(198.9e6) * 10n ** 12n;
+   221	  second.state.withdrawStatus = 7; // MEXC reports SUCCESS
+   222	  await second.engine.tick();
+   223	  assert.ok(!first.db.openTransfers().some((t) => t.id === 1));
+   224	  assert.equal(first.db.statsSince(0, 'live').total.trades, 1);
+   225	});
+   226	
+   227	test('withdraw request times out: never re-sent, found later by withdrawOrderId', async () => {
+   228	  const { engine, db, calls, arrive } = setup({ withdrawAmbiguous: true });
    229	  await engine.tick();
-   230	  assert.equal(db.getTransfer(1)!.status, 'done');
-   231	});
-   232	
-   233	test('price fell during the withdrawal: holds instead of selling at a big loss; /sell overrides', async () => {
-   234	  let t = Date.UTC(2026, 10, 20, 6);
-   235	  const { engine, db, calls, alerts, arrive, state } = setup({ now: () => t });
-   236	  await engine.tick();
-   237	  state.dexPrice = 0.9; // 10% below the MEXC buy price
-   238	  arrive(198.9);
-   239	  await engine.tick();
-   240	  assert.ok(!calls.includes('send'));
-   241	  assert.equal(db.getTransfer(1)!.status, 'selling');
-   242	  assert.ok(alerts.some((a) => a.startsWith('✋ TRANSFER #1 XYZ') && a.includes('/sell 1')));
-   243	  t += 6 * 60_000;
-   244	  await engine.tick();
-   245	  assert.ok(!calls.includes('send')); // still holding
-   246	  assert.match(engine.forceSell(1), /selling on the next scan/);
-   247	  await engine.tick();
-   248	  assert.ok(calls.includes('send'));
-   249	  assert.equal(db.getTransfer(1)!.status, 'done');
-   250	});
-   251	
-   252	test('failed DEX sales back off, then stop retrying (no gas burn loop)', async () => {
-   253	  let t = Date.UTC(2026, 10, 20, 6);
-   254	  const { engine, db, calls, alerts, arrive } = setup({ sendFails: true, now: () => t });
-   255	  await engine.tick();
-   256	  arrive(198.9);
-   257	  await engine.tick(); // attempt 1
-   258	  await engine.tick(); // inside backoff: no attempt
-   259	  assert.equal(calls.filter((c) => c === 'send').length, 1);
-   260	  for (const wait of [2, 10, 30]) {
-   261	    t += wait * 60_000 + 1;
-   262	    await engine.tick();
-   263	  }
-   264	  assert.equal(calls.filter((c) => c === 'send').length, 4);
-   265	  assert.equal(db.getTransfer(1)!.status, 'stuck');
-   266	  t += 24 * 3600_000;
-   267	  await engine.tick();
-   268	  assert.equal(calls.filter((c) => c === 'send').length, 4); // no more automatic tries
-   269	  assert.ok(alerts.some((a) => a.includes('Automatic retries STOPPED')));
-   270	  assert.match(engine.clear(1), /closed manually/);
-   271	});
-   272	
-   273	test('swap outcome unknown: stuck + paused, never retried automatically', async () => {
-   274	  const { engine, db, risk, calls, arrive } = setup({ sendUnknown: true });
-   275	  await engine.tick();
-   276	  arrive(198.9);
-   277	  await engine.tick();
-   278	  assert.equal(db.getTransfer(1)!.status, 'stuck');
-   279	  assert.equal(risk.paused, true);
-   280	  await engine.tick();
-   281	  assert.equal(calls.filter((c) => c === 'send').length, 1);
-   282	});
-   283	
-   284	test('withdrawal never arrives: after 2x timeout it stops blocking, but never a 2nd transfer of the same token', async () => {
-   285	  let t = Date.UTC(2026, 10, 20, 6);
-   286	  const { engine, db, calls, alerts, cfg } = setup({ now: () => t });
-   287	  await engine.tick();
-   288	  t += (cfg.transferTimeoutMin + 1) * 60_000;
-   289	  await engine.tick();
-   290	  assert.ok(alerts.some((a) => a.includes('not in wallet after')));
-   291	  assert.equal(calls.filter((c) => c.startsWith('limit BUY')).length, 1); // still blocking
-   292	  t += cfg.transferTimeoutMin * 60_000;
-   293	  await engine.tick(); // gives up blocking
-   294	  assert.equal(db.getTransfer(1)!.alerted_timeout, 2);
-   295	  assert.equal(db.getTransfer(1)!.status, 'withdrawing'); // still watched
-   296	  await engine.tick();
-   297	  // It no longer blocks by COUNT, but a second transfer of the SAME token must never start while
-   298	  // the first is still out (they would share one wallet balance).
-   299	  assert.equal(calls.filter((c) => c.startsWith('limit BUY')).length, 1);
-   300	  assert.equal(db.blockingTransfers().length, 0);
-   301	});
-   302	
-   303	test('withdraw rejected: sells the tokens back on MEXC and records a failure', async () => {
-   304	  const { engine, db, calls, alerts } = setup({ withdrawThrows: true });
-   305	  await engine.tick();
-   306	  assert.ok(calls.includes('market SELL 199.90'));
-   307	  assert.equal(db.openTransfers().length, 0);
-   308	  assert.equal(db.statsSince(0, 'live').total.failed, 1);
-   309	  assert.ok(alerts.some((a) => a.includes('withdraw rejected')));
-   310	});
-   311	
-   312	test('withdrawal FAILED on MEXC side: sells back on MEXC', async () => {
-   313	  const { engine, db, calls, state } = setup();
-   314	  await engine.tick();
-   315	  state.withdrawStatus = 8;
-   316	  state.mexc.XYZ += 199.9; // funds returned to the MEXC account
-   317	  await engine.tick();
-   318	  assert.ok(calls.includes('market SELL 199.90'));
-   319	  assert.ok(!db.openTransfers().some((t) => t.id === 1));
-   320	});
-   321	
-   322	test('gap too small after exact costs: nothing happens', async () => {
-   323	  const { engine, calls } = setup({ dexPrice: 1.05 }); // 5% gap, but drift+gas+fees+min $15 eat it
-   324	  await engine.tick();
-   325	  assert.deepEqual(calls, []);
+   230	  assert.equal(calls.filter((c) => c.startsWith('withdraw')).length, 1);
+   231	  await engine.tick(); // looks it up instead of withdrawing again
+   232	  assert.equal(calls.filter((c) => c.startsWith('withdraw')).length, 1);
+   233	  assert.equal(db.getTransfer(1)!.withdraw_id, 'w1');
+   234	  arrive(198.9);
+   235	  await engine.tick();
+   236	  assert.equal(db.getTransfer(1)!.status, 'done');
+   237	});
+   238	
+   239	test('price fell during the withdrawal: holds instead of selling at a big loss; /sell overrides', async () => {
+   240	  let t = Date.UTC(2026, 10, 20, 6);
+   241	  const { engine, db, calls, alerts, arrive, state } = setup({ now: () => t });
+   242	  await engine.tick();
+   243	  state.dexPrice = 0.9; // 10% below the MEXC buy price
+   244	  arrive(198.9);
+   245	  await engine.tick();
+   246	  assert.ok(!calls.includes('send'));
+   247	  assert.equal(db.getTransfer(1)!.status, 'selling');
+   248	  assert.ok(alerts.some((a) => a.startsWith('✋ TRANSFER #1 XYZ') && a.includes('/sell 1')));
+   249	  t += 6 * 60_000;
+   250	  await engine.tick();
+   251	  assert.ok(!calls.includes('send')); // still holding
+   252	  assert.match(engine.forceSell(1), /selling on the next scan/);
+   253	  await engine.tick();
+   254	  assert.ok(calls.includes('send'));
+   255	  assert.equal(db.getTransfer(1)!.status, 'done');
+   256	});
+   257	
+   258	test('failed DEX sales back off, then stop retrying (no gas burn loop)', async () => {
+   259	  let t = Date.UTC(2026, 10, 20, 6);
+   260	  const { engine, db, calls, alerts, arrive } = setup({ sendFails: true, now: () => t });
+   261	  await engine.tick();
+   262	  arrive(198.9);
+   263	  await engine.tick(); // attempt 1
+   264	  await engine.tick(); // inside backoff: no attempt
+   265	  assert.equal(calls.filter((c) => c === 'send').length, 1);
+   266	  for (const wait of [2, 10, 30]) {
+   267	    t += wait * 60_000 + 1;
+   268	    await engine.tick();
+   269	  }
+   270	  assert.equal(calls.filter((c) => c === 'send').length, 4);
+   271	  assert.equal(db.getTransfer(1)!.status, 'stuck');
+   272	  t += 24 * 3600_000;
+   273	  await engine.tick();
+   274	  assert.equal(calls.filter((c) => c === 'send').length, 4); // no more automatic tries
+   275	  assert.ok(alerts.some((a) => a.includes('Automatic retries STOPPED')));
+   276	  assert.match(engine.clear(1), /closed manually/);
+   277	});
+   278	
+   279	test('swap outcome unknown: stuck + paused, never retried automatically', async () => {
+   280	  const { engine, db, risk, calls, arrive } = setup({ sendUnknown: true });
+   281	  await engine.tick();
+   282	  arrive(198.9);
+   283	  await engine.tick();
+   284	  assert.equal(db.getTransfer(1)!.status, 'stuck');
+   285	  assert.equal(risk.paused, true);
+   286	  await engine.tick();
+   287	  assert.equal(calls.filter((c) => c === 'send').length, 1);
+   288	});
+   289	
+   290	test('withdrawal never arrives: after 2x timeout it stops blocking, but never a 2nd transfer of the same token', async () => {
+   291	  let t = Date.UTC(2026, 10, 20, 6);
+   292	  const { engine, db, calls, alerts, cfg } = setup({ now: () => t });
+   293	  await engine.tick();
+   294	  t += (cfg.transferTimeoutMin + 1) * 60_000;
+   295	  await engine.tick();
+   296	  assert.ok(alerts.some((a) => a.includes('not in wallet after')));
+   297	  assert.equal(calls.filter((c) => c.startsWith('limit BUY')).length, 1); // still blocking
+   298	  t += cfg.transferTimeoutMin * 60_000;
+   299	  await engine.tick(); // gives up blocking
+   300	  assert.equal(db.getTransfer(1)!.alerted_timeout, 2);
+   301	  assert.equal(db.getTransfer(1)!.status, 'withdrawing'); // still watched
+   302	  await engine.tick();
+   303	  // It no longer blocks by COUNT, but a second transfer of the SAME token must never start while
+   304	  // the first is still out (they would share one wallet balance).
+   305	  assert.equal(calls.filter((c) => c.startsWith('limit BUY')).length, 1);
+   306	  assert.equal(db.blockingTransfers().length, 0);
+   307	});
+   308	
+   309	test('withdraw rejected: sells the tokens back on MEXC and records a failure', async () => {
+   310	  const { engine, db, calls, alerts } = setup({ withdrawThrows: true });
+   311	  await engine.tick();
+   312	  assert.ok(calls.includes('market SELL 199.90'));
+   313	  assert.equal(db.openTransfers().length, 0);
+   314	  assert.equal(db.statsSince(0, 'live').total.failed, 1);
+   315	  assert.ok(alerts.some((a) => a.includes('withdraw rejected')));
+   316	});
+   317	
+   318	test('withdrawal FAILED on MEXC side: sells back on MEXC', async () => {
+   319	  const { engine, db, calls, state } = setup();
+   320	  await engine.tick();
+   321	  state.withdrawStatus = 8;
+   322	  state.mexc.XYZ += 199.9; // funds returned to the MEXC account
+   323	  await engine.tick();
+   324	  assert.ok(calls.includes('market SELL 199.90'));
+   325	  assert.ok(!db.openTransfers().some((t) => t.id === 1));
    326	});
    327	
-   328	test('paused bot does not open new transfers', async () => {
-   329	  const { engine, risk, calls } = setup();
-   330	  risk.pause('Telegram /stop');
-   331	  await engine.tick();
-   332	  assert.deepEqual(calls, []);
-   333	});
-   334	
-   335	test('paper mode records the opportunity without orders or withdrawals', async () => {
-   336	  const { engine, db, calls, alerts } = setup({ mode: 'paper' });
+   328	test('gap too small after exact costs: nothing happens', async () => {
+   329	  const { engine, calls } = setup({ dexPrice: 1.05 }); // 5% gap, but drift+gas+fees+min $15 eat it
+   330	  await engine.tick();
+   331	  assert.deepEqual(calls, []);
+   332	});
+   333	
+   334	test('paused bot does not open new transfers', async () => {
+   335	  const { engine, risk, calls } = setup();
+   336	  risk.pause('Telegram /stop');
    337	  await engine.tick();
    338	  assert.deepEqual(calls, []);
-   339	  assert.equal(db.statsSince(0, 'paper').total.trades, 1);
-   340	  assert.ok(alerts.some((a) => a.startsWith('📝 PAPER TRANSFER XYZ')));
-   341	});
-   342	
-   343	test('loadUniverse respects WATCHLIST', async () => {
-   344	  const fake = {
-   345	    exchangeInfo: async () => [symbolInfo('XYZ'), symbolInfo('ABC')],
-   346	    tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9e6', lastPrice: '1' }, { symbol: 'ABCUSDT', quoteVolume: '9e6', lastPrice: '1' }],
-   347	    coinConfigs: async () => [coin('XYZ', XYZ), coin('ABC', '0x3333333333333333333333333333333333333333')],
-   348	  };
-   349	  const u = await loadUniverse(fake as never, { minVolumeUsd: 1, only: ['ABC'] });
-   350	  assert.deepEqual(u.map((t) => t.base), ['ABC']);
-   351	});
-   352	
-   353	test('a dust deposit during the withdrawal is NOT taken as arrival', async () => {
-   354	  const { engine, db, alerts, state } = setup();
-   355	  await engine.tick();
-   356	  state.wallet[XYZ] += 10n ** 15n; // 0.001 XYZ airdrop, MEXC still PROCESSING
-   357	  await engine.tick();
-   358	  assert.equal(db.getTransfer(1)!.status, 'withdrawing');
-   359	  state.withdrawStatus = 7; // MEXC says SUCCESS but only dust arrived
-   360	  await engine.tick();
-   361	  assert.equal(db.getTransfer(1)!.status, 'withdrawing');
-   362	  assert.ok(alerts.some((a) => a.includes('only grew by')));
-   363	});
+   339	});
+   340	
+   341	test('paper mode records the opportunity without orders or withdrawals', async () => {
+   342	  const { engine, db, calls, alerts } = setup({ mode: 'paper' });
+   343	  await engine.tick();
+   344	  assert.deepEqual(calls, []);
+   345	  assert.equal(db.statsSince(0, 'paper').total.trades, 1);
+   346	  assert.ok(alerts.some((a) => a.startsWith('📝 PAPER TRANSFER XYZ')));
+   347	});
+   348	
+   349	test('loadUniverse respects WATCHLIST', async () => {
+   350	  const fake = {
+   351	    exchangeInfo: async () => [symbolInfo('XYZ'), symbolInfo('ABC')],
+   352	    tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9e6', lastPrice: '1' }, { symbol: 'ABCUSDT', quoteVolume: '9e6', lastPrice: '1' }],
+   353	    coinConfigs: async () => [coin('XYZ', XYZ), coin('ABC', '0x3333333333333333333333333333333333333333')],
+   354	  };
+   355	  const u = await loadUniverse(fake as never, { minVolumeUsd: 1, only: ['ABC'] });
+   356	  assert.deepEqual(u.map((t) => t.base), ['ABC']);
+   357	});
+   358	
+   359	test('a dust deposit during the withdrawal is NOT taken as arrival', async () => {
+   360	  const { engine, db, alerts, state } = setup();
+   361	  await engine.tick();
+   362	  state.wallet[XYZ] += 10n ** 15n; // 0.001 XYZ airdrop, MEXC still PROCESSING
+   363	  await engine.tick();
+   364	  assert.equal(db.getTransfer(1)!.status, 'withdrawing');
+   365	  state.withdrawStatus = 7; // MEXC says SUCCESS but only dust arrived
+   366	  await engine.tick();
+   367	  assert.equal(db.getTransfer(1)!.status, 'withdrawing');
+   368	  assert.ok(alerts.some((a) => a.includes('only grew by')));
+   369	});
+   370	
+   371	test('sell holds when the FIRM quote falls below the loss floor (round-3 M3)', async () => {
+   372	  const { engine, db, calls, alerts, arrive } = setup({ firmDexPrice: 0.9 });
+   373	  await engine.tick(); // finds gap, buys, withdraws
+   374	  arrive(198.9); // 199.9 - 1 withdraw fee
+   375	  await engine.tick(); // first quote ok (1.15), approval, firm quote 0.9 -> below floor -> hold
+   376	  assert.ok(calls.includes('approve 0xspender 198900000000000000000')); // exact amount
+   377	  assert.ok(!calls.includes('send')); // nothing sent on a below-floor firm quote
+   378	  const row = db.openTransfers().find((t) => t.id === 1)!;
+   379	  assert.equal(row.status, 'selling'); // still selling, retried later
+   380	  assert.ok(alerts.some((a) => a.includes('HOLDING 198.9 XYZ')));
+   381	  // The approval gas was really spent: $1.20 booked on the row.
+   382	  assert.ok(Math.abs((row.gas_usd ?? 0) - 1.2) < 1e-9, String(row.gas_usd));
+   383	});
+   384	
+   385	test('transfer mode sets BestOf gasInOutput so gas is compared (round-3 L7f)', async () => {
+   386	  const mkAgg = (name: '0x' | 'kyber', out: bigint, gas: bigint): Aggregator => ({
+   387	    name,
+   388	    price: async () => ({ buyAmount: out, minBuyAmount: out, gas }),
+   389	    quote: async () => ({ buyAmount: out, minBuyAmount: out, gas, tx: { to: '0xah', data: '0x01', value: 0n } }),
+   390	  });
+   391	  const bestOf = new BestOf([mkAgg('0x', 1000n, 500_000n), mkAgg('kyber', 990n, 100_000n)]);
+   392	  const { engine } = setup({ mode: 'paper', agg: bestOf });
+   393	  await engine.tick();
+   394	  assert.equal(typeof bestOf.gasInOutput, 'function');
+   395	  // 150k gas x 10 gwei effective x $2000 ETH = $3.00; fake chain decimals() is 18.
+   396	  assert.equal(bestOf.gasInOutput!(150_000n, USDC), 3_000_000_000_000_000_000n);
+   397	});
 ```
 
 ## `test/txsender.test.ts`
 
-```ts
+```
      1	// Nonce manager + unresolved-tx handling (round 2 review: R2-P0-2, R2-P0-3, R2-P2-8).
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';
@@ -7364,122 +7592,144 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
      6	const gas: GasInfo = { baseFee: 10n, tip: 1n, effective: 11n, maxFee: 21n };
      7	const tx = { to: '0xrouter', data: '0x01' };
      8	
-     9	function backend(o: { broadcastError?: unknown; mined?: boolean; confirmed?: number; knows?: boolean } = {}) {
+     9	function backend(o: { broadcastError?: unknown; mined?: boolean; confirmed?: number; knows?: boolean; l1Fee?: bigint; rawReceiptThrows?: boolean } = {}) {
     10	  const state = { confirmed: o.confirmed ?? 5, signed: [] as { nonce: number; to: string; maxFeePerGas: bigint }[], receipts: new Map<string, number>(), gasReads: 0 };
     11	  const b: TxBackend = {
     12	    address: '0xme',
     13	    confirmedNonce: async () => state.confirmed,
     14	    receipt: async (h) => (state.receipts.has(h) ? { status: state.receipts.get(h)!, gasUsed: 100n, gasPrice: 2n } : null),
-    15	    knowsTx: async () => o.knows ?? true,
-    16	    sign: async (t) => {
-    17	      state.signed.push({ nonce: t.nonce, to: t.to, maxFeePerGas: t.maxFeePerGas });
-    18	      const hash = `0xh${state.signed.length}`;
-    19	      return { raw: `raw-${hash}`, hash };
-    20	    },
-    21	    broadcast: async (raw) => {
-    22	      if (o.broadcastError && raw === 'raw-0xh1') throw o.broadcastError;
-    23	      if (o.mined) state.receipts.set(raw.slice(4), 1);
+    15	    rawReceipt: async () => {
+    16	      if (o.rawReceiptThrows) throw new Error('rpc down');
+    17	      return o.l1Fee !== undefined ? { l1Fee: o.l1Fee } : null;
+    18	    },
+    19	    knowsTx: async () => o.knows ?? true,
+    20	    sign: async (t) => {
+    21	      state.signed.push({ nonce: t.nonce, to: t.to, maxFeePerGas: t.maxFeePerGas });
+    22	      const hash = `0xh${state.signed.length}`;
+    23	      return { raw: `raw-${hash}`, hash };
     24	    },
-    25	    gas: async () => {
-    26	      state.gasReads++;
-    27	      return { ...gas, maxFee: 1000n, tip: 50n }; // base fee spiked while we waited
+    25	    broadcast: async (raw) => {
+    26	      if (o.broadcastError && raw === 'raw-0xh1') throw o.broadcastError;
+    27	      if (o.mined) state.receipts.set(raw.slice(4), 1);
     28	    },
-    29	  };
-    30	  return { b, state };
-    31	}
-    32	
-    33	const memStore = () => {
-    34	  let v: string | undefined;
-    35	  return { get: () => v, set: (x: string | null) => (v = x ?? undefined) };
-    36	};
-    37	
-    38	test('classifySendError: clear rejections vs ambiguous vs already-known', () => {
-    39	  assert.equal(classifySendError(Object.assign(new Error('insufficient funds for gas * price + value'), { code: 'INSUFFICIENT_FUNDS' })), 'rejected');
-    40	  assert.equal(classifySendError(new Error('nonce too low')), 'rejected');
-    41	  assert.equal(classifySendError(Object.assign(new Error('rpc error'), { error: { code: -32000, message: 'x' } })), 'rejected');
-    42	  assert.equal(classifySendError(Object.assign(new Error('request timeout'), { code: 'TIMEOUT' })), 'ambiguous');
-    43	  assert.equal(classifySendError(new Error('socket hang up')), 'ambiguous');
-    44	  assert.equal(classifySendError(new Error('already known')), 'accepted');
-    45	});
-    46	
-    47	test('mined tx: ok, nonce counts up locally', async () => {
-    48	  const { b, state } = backend({ mined: true });
-    49	  const s = new TxSender(b, memStore(), Date.now, async () => {});
-    50	  assert.equal((await s.send(tx, 100n, gas, 10)).ok, true);
-    51	  assert.equal((await s.send(tx, 100n, gas, 10)).ok, true);
-    52	  assert.deepEqual(state.signed.map((x) => x.nonce), [5, 6]); // public RPC still says 5: local counter wins
-    53	});
-    54	
-    55	test('RPC rejection: NOT unresolved, nonce reused, next send allowed', async () => {
-    56	  const { b, state } = backend({ broadcastError: new Error('insufficient funds for gas'), mined: true });
-    57	  const s = new TxSender(b, memStore(), Date.now, async () => {});
-    58	  const r = await s.send(tx, 100n, gas, 10);
-    59	  assert.equal(r.rejected, true);
-    60	  assert.equal(r.unknown, undefined);
-    61	  assert.equal(s.unresolved, null);
-    62	  assert.equal((await s.send(tx, 100n, gas, 10)).ok, true);
-    63	  assert.deepEqual(state.signed.map((x) => x.nonce), [5, 5]);
-    64	});
-    65	
-    66	test('ambiguous send error: unresolved, next send refused (not counted as an attempt)', async () => {
-    67	  const { b } = backend({ broadcastError: Object.assign(new Error('timeout'), { code: 'TIMEOUT' }) });
-    68	  const s = new TxSender(b, memStore(), Date.now, async () => {});
-    69	  const r = await s.send(tx, 100n, gas, 10);
-    70	  assert.equal(r.unknown, true);
-    71	  assert.equal(s.unresolved?.nonce, 5);
-    72	  const r2 = await s.send(tx, 100n, gas, 10);
-    73	  assert.equal(r2.refused, true);
-    74	});
-    75	
-    76	test('restart with a pending tx: the persisted record still blocks sends', async () => {
-    77	  const store = memStore();
-    78	  const first = backend({ broadcastError: new Error('ECONNRESET') });
-    79	  await new TxSender(first.b, store, Date.now, async () => {}).send(tx, 100n, gas, 10);
-    80	  // "restart": a brand new sender, same store
-    81	  const again = backend({ mined: true });
-    82	  const s2 = new TxSender(again.b, store, Date.now, async () => {});
-    83	  assert.equal(s2.unresolved?.nonce, 5);
-    84	  assert.equal((await s2.send(tx, 100n, gas, 10)).refused, true);
-    85	  assert.equal(again.state.signed.length, 0); // the pending nonce was NOT reused
-    86	});
-    87	
-    88	test('unresolved clears when mined, when the nonce is consumed, or when every RPC dropped it', async () => {
-    89	  let t = 1_000_000;
-    90	  const store = memStore();
-    91	  const { b, state } = backend({ broadcastError: new Error('ECONNRESET'), knows: false });
-    92	  const s = new TxSender(b, store, () => t, async (ms) => void (t += ms)); // fake clock advances on sleep
-    93	  await s.send(tx, 100n, gas, 10);
-    94	  assert.equal((await s.checkUnresolved()).state, 'pending'); // too early to call it dropped
-    95	  t += DROP_AFTER_MS + 1;
-    96	  const c = await s.checkUnresolved();
-    97	  assert.equal(c.state, 'clear');
-    98	  assert.equal(c.dropped, true);
-    99	
-   100	  await s.send(tx, 100n, gas, 10).catch(() => {});
-   101	  state.confirmed = 99; // someone mined that nonce
-   102	  assert.equal((await s.checkUnresolved()).state, 'clear');
-   103	});
-   104	
-   105	test('not mined in time: cancel is priced from FRESH gas, outcome unknown if neither mines', async () => {
-   106	  let t = 0;
-   107	  const { b, state } = backend();
-   108	  const s = new TxSender(b, memStore(), () => t, async (ms) => void (t += ms));
-   109	  const r = await s.send(tx, 100n, gas, 10);
-   110	  assert.equal(r.unknown, true);
-   111	  assert.equal(state.signed[1].to, '0xme'); // the cancel: 0-value self transfer, same nonce
-   112	  assert.equal(state.signed[1].nonce, 5);
-   113	  assert.ok(state.signed[1].maxFeePerGas >= 1300n); // 1.3 x the spiked fee, not the stale one
-   114	  assert.equal(s.unresolved?.hashes.length, 2);
-   115	});
+    29	    gas: async () => {
+    30	      state.gasReads++;
+    31	      return { ...gas, maxFee: 1000n, tip: 50n }; // base fee spiked while we waited
+    32	    },
+    33	  };
+    34	  return { b, state };
+    35	}
+    36	
+    37	const memStore = () => {
+    38	  let v: string | undefined;
+    39	  return { get: () => v, set: (x: string | null) => (v = x ?? undefined) };
+    40	};
+    41	
+    42	test('classifySendError: clear rejections vs ambiguous vs already-known', () => {
+    43	  assert.equal(classifySendError(Object.assign(new Error('insufficient funds for gas * price + value'), { code: 'INSUFFICIENT_FUNDS' })), 'rejected');
+    44	  assert.equal(classifySendError(new Error('nonce too low')), 'rejected');
+    45	  assert.equal(classifySendError(Object.assign(new Error('rpc error'), { error: { code: -32000, message: 'x' } })), 'rejected');
+    46	  assert.equal(classifySendError(Object.assign(new Error('request timeout'), { code: 'TIMEOUT' })), 'ambiguous');
+    47	  assert.equal(classifySendError(new Error('socket hang up')), 'ambiguous');
+    48	  assert.equal(classifySendError(new Error('already known')), 'accepted');
+    49	});
+    50	
+    51	test('mined tx: ok, nonce counts up locally', async () => {
+    52	  const { b, state } = backend({ mined: true });
+    53	  const s = new TxSender(b, memStore(), Date.now, async () => {});
+    54	  assert.equal((await s.send(tx, 100n, gas, 10)).ok, true);
+    55	  assert.equal((await s.send(tx, 100n, gas, 10)).ok, true);
+    56	  assert.deepEqual(state.signed.map((x) => x.nonce), [5, 6]); // public RPC still says 5: local counter wins
+    57	});
+    58	
+    59	test('RPC rejection: NOT unresolved, nonce reused, next send allowed', async () => {
+    60	  const { b, state } = backend({ broadcastError: new Error('insufficient funds for gas'), mined: true });
+    61	  const s = new TxSender(b, memStore(), Date.now, async () => {});
+    62	  const r = await s.send(tx, 100n, gas, 10);
+    63	  assert.equal(r.rejected, true);
+    64	  assert.equal(r.unknown, undefined);
+    65	  assert.equal(s.unresolved, null);
+    66	  assert.equal((await s.send(tx, 100n, gas, 10)).ok, true);
+    67	  assert.deepEqual(state.signed.map((x) => x.nonce), [5, 5]);
+    68	});
+    69	
+    70	test('ambiguous send error: unresolved, next send refused (not counted as an attempt)', async () => {
+    71	  const { b } = backend({ broadcastError: Object.assign(new Error('timeout'), { code: 'TIMEOUT' }) });
+    72	  const s = new TxSender(b, memStore(), Date.now, async () => {});
+    73	  const r = await s.send(tx, 100n, gas, 10);
+    74	  assert.equal(r.unknown, true);
+    75	  assert.equal(s.unresolved?.nonce, 5);
+    76	  const r2 = await s.send(tx, 100n, gas, 10);
+    77	  assert.equal(r2.refused, true);
+    78	});
+    79	
+    80	test('restart with a pending tx: the persisted record still blocks sends', async () => {
+    81	  const store = memStore();
+    82	  const first = backend({ broadcastError: new Error('ECONNRESET') });
+    83	  await new TxSender(first.b, store, Date.now, async () => {}).send(tx, 100n, gas, 10);
+    84	  // "restart": a brand new sender, same store
+    85	  const again = backend({ mined: true });
+    86	  const s2 = new TxSender(again.b, store, Date.now, async () => {});
+    87	  assert.equal(s2.unresolved?.nonce, 5);
+    88	  assert.equal((await s2.send(tx, 100n, gas, 10)).refused, true);
+    89	  assert.equal(again.state.signed.length, 0); // the pending nonce was NOT reused
+    90	});
+    91	
+    92	test('unresolved clears when mined, when the nonce is consumed, or when every RPC dropped it', async () => {
+    93	  let t = 1_000_000;
+    94	  const store = memStore();
+    95	  const { b, state } = backend({ broadcastError: new Error('ECONNRESET'), knows: false });
+    96	  const s = new TxSender(b, store, () => t, async (ms) => void (t += ms)); // fake clock advances on sleep
+    97	  await s.send(tx, 100n, gas, 10);
+    98	  assert.equal((await s.checkUnresolved()).state, 'pending'); // too early to call it dropped
+    99	  t += DROP_AFTER_MS + 1;
+   100	  const c = await s.checkUnresolved();
+   101	  assert.equal(c.state, 'clear');
+   102	  assert.equal(c.dropped, true);
+   103	
+   104	  await s.send(tx, 100n, gas, 10).catch(() => {});
+   105	  state.confirmed = 99; // someone mined that nonce
+   106	  assert.equal((await s.checkUnresolved()).state, 'clear');
+   107	});
+   108	
+   109	test('not mined in time: cancel is priced from FRESH gas, outcome unknown if neither mines', async () => {
+   110	  let t = 0;
+   111	  const { b, state } = backend();
+   112	  const s = new TxSender(b, memStore(), () => t, async (ms) => void (t += ms));
+   113	  const r = await s.send(tx, 100n, gas, 10);
+   114	  assert.equal(r.unknown, true);
+   115	  assert.equal(state.signed[1].to, '0xme'); // the cancel: 0-value self transfer, same nonce
+   116	  assert.equal(state.signed[1].nonce, 5);
+   117	  assert.ok(state.signed[1].maxFeePerGas >= 1300n); // 1.3 x the spiked fee, not the stale one
+   118	  assert.equal(s.unresolved?.hashes.length, 2);
+   119	});
+   120	
+   121	test('mined tx on an OP chain: L1 fee is in gasCostWei and reported (round-3 M1)', async () => {
+   122	  const { b } = backend({ mined: true, l1Fee: 1000n });
+   123	  const s = new TxSender(b, memStore(), Date.now, async () => {});
+   124	  const r = await s.send(tx, 100n, gas, 10);
+   125	  assert.equal(r.ok, true);
+   126	  assert.equal(r.gasCostWei, 100n * 2n + 1000n); // receipt gas 100 x price 2 + L1 1000
+   127	  assert.equal(r.l1FeeWei, 1000n);
+   128	});
+   129	
+   130	test('raw receipt failure: L1 fee treated as 0, tx still ok (round-3 M1)', async () => {
+   131	  const { b } = backend({ mined: true, rawReceiptThrows: true });
+   132	  const s = new TxSender(b, memStore(), Date.now, async () => {});
+   133	  const r = await s.send(tx, 100n, gas, 10);
+   134	  assert.equal(r.ok, true);
+   135	  assert.equal(r.gasCostWei, 200n);
+   136	  assert.equal(r.l1FeeWei, undefined);
+   137	});
 ```
 
 ## `test/upgrade-chain.test.ts`
 
-```ts
+```
      1	// Phase-1 upgrade, item 3: configurable chain.
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';
-     4	import { CHAINS, chainProfile, networkFor } from '../src/chains.js';
+     4	import { CHAINS, chainProfile, explorerTxUrl, networkFor } from '../src/chains.js';
      5	import { loadConfig } from '../src/config.js';
      6	import { dexTvl } from '../src/watchlist.js';
      7	import { ZEROX_ALLOWANCE_HOLDER } from '../src/dex/aggregator.js';
@@ -7549,11 +7799,31 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     71	  assert.equal(ZEROX_ALLOWANCE_HOLDER, '0x0000000000001ff3684f28c67538d4d072c22734');
     72	  for (const c of Object.values(CHAINS)) assert.match(c.stable.address, /^0x[0-9a-f]{40}$/);
     73	});
+    74	
+    75	test('explorerTxUrl uses the chain\'s own explorer (round-3 L4)', () => {
+    76	  assert.equal(explorerTxUrl(CHAINS.ethereum, '0xabc'), 'https://etherscan.io/tx/0xabc');
+    77	  assert.equal(explorerTxUrl(CHAINS.base, '0xabc'), 'https://basescan.org/tx/0xabc');
+    78	  assert.equal(explorerTxUrl(CHAINS.bsc, '0xabc'), 'https://bscscan.com/tx/0xabc');
+    79	  assert.equal(explorerTxUrl(CHAINS.arbitrum, '0xabc'), 'https://arbiscan.io/tx/0xabc');
+    80	});
+    81	
+    82	test('STABLE_ADDRESS override also flips stableIsUsdt (round-3 L7c)', () => {
+    83	  // Point Ethereum at BSC's USDT: the stable rate must follow the address, not the chain default.
+    84	  const c = cfgFor({ STABLE_ADDRESS: '0x55d398326f99059ff775485246999027b3197955' });
+    85	  assert.equal(c.usdc, '0x55d398326f99059ff775485246999027b3197955');
+    86	  assert.equal(c.stableIsUsdt, true);
+    87	  // And the other way: BSC at Ethereum USDC.
+    88	  const d = cfgFor({ CHAIN: 'bsc', STABLE_ADDRESS: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' });
+    89	  assert.equal(d.stableIsUsdt, false);
+    90	  // An unknown address falls back to the chain default.
+    91	  const e = cfgFor({ STABLE_ADDRESS: '0x0000000000000000000000000000000000000001' });
+    92	  assert.equal(e.stableIsUsdt, false);
+    93	});
 ```
 
 ## `test/upgrade-cost.test.ts`
 
-```ts
+```
      1	// Phase-1 upgrade, item 1: cost model (per-symbol fee, USDC != USDT, bps hurdles, dynamic tip).
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';
@@ -7644,7 +7914,7 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
 
 ## `test/upgrade-kpi.test.ts`
 
-```ts
+```
      1	// Phase-1 upgrade, items 2d and 5a: KPIs and inventory plan.
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';
@@ -7700,11 +7970,70 @@ MEXC <-> DEX arbitrage bot (TypeScript, Node 20). Default MODE=paper, STRATEGY=i
     53	  assert.match(side('STABLE', 'wallet').direction, /withdraw MEXC→wallet 0xme/);
     54	  assert.ok(items.some((i) => i.kind === 'warning' && /tokens are 9\d% of the portfolio/.test(i.text)));
     55	});
+    56	
+    57	test('would-have PnL uses the best row\'s own size (round-3 M4)', () => {
+    58	  const db = new Db(':memory:');
+    59	  const t0 = Date.UTC(2026, 10, 21, 3, 0);
+    60	  db.insertOpportunities([
+    61	    row({ ts: t0, net_usd: 0.5, size_usd: 100, gross_bps: 50 }), // best net, small size
+    62	    row({ ts: t0 + 5_000, net_usd: 0.3, size_usd: 200, gross_bps: 15 }), // same minute, bigger size
+    63	  ]);
+    64	  const k = computeKpis(db, 0, 'paper');
+    65	  const at30 = k.wouldHave.find((w) => w.hurdle_bps === 30)!;
+    66	  // Best net 0.5 on its own size $100: hurdle 30 bps = $0.30 -> trades.
+    67	  // (Old code took size $200 from the other row: 0.5 < $0.60 -> 0 trades.)
+    68	  assert.equal(at30.trades, 1);
+    69	  assert.ok(Math.abs(at30.pnl - 0.5) < 1e-9);
+    70	  assert.equal(k.wouldHave.find((w) => w.hurdle_bps === 60)!.trades, 0); // 0.5 < $0.60 on $100
+    71	});
+    72	
+    73	test('gasShareOfGross counts gas only on ok/paper trades, like gross (round-3 L1)', () => {
+    74	  const db = new Db(':memory:');
+    75	  const t0 = Date.UTC(2026, 10, 21, 3, 0);
+    76	  const trade = (o: object) => ({
+    77	    ts: t0, day: '2026-11-21', mode: 'paper', symbol: 'AERO', direction: 'DEX_BUY', size_usd: 100, qty: 10,
+    78	    buy_price: 10, sell_price: 11, expected_net: 1, cex_fee_usd: 0.5, gas_usd: 1, pnl_usd: 10,
+    79	    status: 'ok' as const, dex_tx: null, cex_order_id: null, note: null, ...o,
+    80	  });
+    81	  db.insertTrade(trade({}));
+    82	  db.insertTrade(trade({ status: 'paper', pnl_usd: 5, gas_usd: 2 }));
+    83	  db.insertTrade(trade({ status: 'one_sided', pnl_usd: -5, gas_usd: 4, cex_fee_usd: 0 }));
+    84	  db.insertTrade(trade({ status: 'dex_failed', pnl_usd: 0, gas_usd: 3, cex_fee_usd: 0 }));
+    85	  const k = computeKpis(db, 0, 'paper');
+    86	  // gas on ok/paper only: 1 + 2 = 3; gross on ok/paper only: (10+1+0.5) + (5+2+0.5) = 19.
+    87	  assert.ok(k.gasShareOfGross !== null && Math.abs(k.gasShareOfGross - 3 / 19) < 1e-9, String(k.gasShareOfGross));
+    88	});
+    89	
+    90	test('inventory plan STABLE ticket names the chain stable (round-3 L2)', () => {
+    91	  const tok = { base: 'AERO' } as Token;
+    92	  const bal = { walletEth: 0.01, walletUsdc: 50, walletToken: { AERO: 900 }, mexc: { USDT: 50, AERO: 10 } };
+    93	  const items = inventoryPlan(bal, [tok], { AERO: 1 },
+    94	    { tradeUsd: 100, perSideX: 3, maxTokenSharePct: 50, walletAddress: '0xme', stableSymbol: 'USDC' });
+    95	  const side = (token: string, s: string) =>
+    96	    items.find((i) => i.kind === 'side' && i.token === token && i.side === s) as Extract<(typeof items)[number], { kind: 'side' }>;
+    97	  assert.equal(side('STABLE', 'wallet').asset, 'USDC');
+    98	  assert.match(side('STABLE', 'wallet').direction, /withdraw USDC MEXC→wallet 0xme/);
+    99	  assert.equal(side('STABLE', 'mexc').asset, 'USDT');
+   100	  assert.match(side('STABLE', 'mexc').direction, /deposit USDC wallet→MEXC \(swap to USDT on MEXC\)/);
+   101	  // BSC (stable USDT): both sides plain USDT, no swap note.
+   102	  const bsc = inventoryPlan(bal, [tok], { AERO: 1 },
+   103	    { tradeUsd: 100, perSideX: 3, maxTokenSharePct: 50, walletAddress: '0xme', stableSymbol: 'USDT' });
+   104	  const bside = (token: string, s: string) =>
+   105	    bsc.find((i) => i.kind === 'side' && i.token === token && i.side === s) as Extract<(typeof bsc)[number], { kind: 'side' }>;
+   106	  assert.equal(bside('STABLE', 'wallet').asset, 'USDT');
+   107	  assert.equal(bside('STABLE', 'mexc').direction, 'deposit wallet→MEXC');
+   108	});
+   109	
+   110	test('opportunities has a (ts) index for long report windows (round-3 M5)', () => {
+   111	  const db = new Db(':memory:');
+   112	  const idx = db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'opp_ts'`);
+   113	  assert.equal(idx.length, 1);
+   114	});
 ```
 
 ## `test/upgrade-quotes.test.ts`
 
-```ts
+```
      1	// Phase-1 upgrade, item 4: KyberSwap, best-of quotes, 0x fee, rate limiter.
      2	import { test } from 'node:test';
      3	import assert from 'node:assert/strict';

@@ -53,6 +53,11 @@ export class Chain {
         },
         confirmedNonce: () => this.provider.getTransactionCount(this.address, 'latest'),
         receipt: (h) => this.provider.getTransactionReceipt(h),
+        // Raw receipt for the OP-stack L1 fee (ethers' receipt type has no l1Fee field).
+        rawReceipt: async (h) => {
+          const raw = (await this.provider.send('eth_getTransactionReceipt', [h]).catch(() => null)) as { l1Fee?: string } | null;
+          return raw?.l1Fee ? { l1Fee: BigInt(raw.l1Fee) } : null;
+        },
         knowsTx: async (h) => Boolean((await this.provider.getTransaction(h).catch(() => null)) ?? (await this.sendProvider.getTransaction(h).catch(() => null))),
         sign: async (t) => {
           const raw = await this.wallet!.signTransaction({ chainId: BigInt(chainId), type: 2, ...t });

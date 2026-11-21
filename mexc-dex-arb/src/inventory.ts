@@ -92,12 +92,18 @@ export function inventoryPlan(
   b: Balances,
   tokens: Token[],
   prices: Record<string, number>,
-  o: { tradeUsd: number; perSideX: number; maxTokenSharePct: number; stableInUsdt?: number; walletAddress?: string },
+  o: { tradeUsd: number; perSideX: number; maxTokenSharePct: number; stableInUsdt?: number; walletAddress?: string; stableSymbol?: string },
 ): PlanItem[] {
   const out: PlanItem[] = [];
   const target = o.tradeUsd * o.perSideX;
   const toWallet = `withdraw MEXC→wallet${o.walletAddress ? ` ${o.walletAddress}` : ''} (in the MEXC app)`;
   const toMexc = 'deposit wallet→MEXC';
+  // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). The wallet side needs
+  // that stable, not MEXC's USDT: withdrawing USDT to the wallet does not give it USDC, and
+  // topping up MEXC from a USDC wallet needs a swap to USDT on MEXC (round-3 review, L2).
+  const stable = o.stableSymbol;
+  const toWalletStable = stable ? `withdraw ${stable} MEXC→wallet${o.walletAddress ? ` ${o.walletAddress}` : ''} (in the MEXC app)` : toWallet;
+  const toMexcStable = stable && stable !== 'USDT' ? `deposit ${stable} wallet→MEXC (swap to USDT on MEXC)` : toMexc;
   let tokenUsd = 0;
   for (const t of tokens) {
     const px = prices[t.base];
@@ -110,8 +116,9 @@ export function inventoryPlan(
   }
   const walletStable = b.walletUsdc * (o.stableInUsdt ?? 1);
   const mexcStable = b.mexc.USDT ?? 0;
-  out.push({ kind: 'side', token: 'STABLE', side: 'wallet', low: walletStable < o.tradeUsd, asset: 'USDC/USDT', amount: Math.max(0, Math.min(target - walletStable, mexcStable)), direction: toWallet });
-  out.push({ kind: 'side', token: 'STABLE', side: 'mexc', low: mexcStable < o.tradeUsd, asset: 'USDT', amount: Math.max(0, Math.min(target - mexcStable, walletStable)), direction: toMexc });
+  // Wallet-side amount is in stable units (USDT amount / the USDC-USDT rate); MEXC side is USDT.
+  out.push({ kind: 'side', token: 'STABLE', side: 'wallet', low: walletStable < o.tradeUsd, asset: stable ?? 'USDC/USDT', amount: Math.max(0, Math.min(target - walletStable, mexcStable)) / (o.stableInUsdt ?? 1), direction: toWalletStable });
+  out.push({ kind: 'side', token: 'STABLE', side: 'mexc', low: mexcStable < o.tradeUsd, asset: 'USDT', amount: Math.max(0, Math.min(target - mexcStable, walletStable)), direction: toMexcStable });
 
   const total = tokenUsd + walletStable + mexcStable;
   if (total > 0 && (tokenUsd / total) * 100 > o.maxTokenSharePct) {

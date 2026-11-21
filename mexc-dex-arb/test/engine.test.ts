@@ -194,6 +194,7 @@ test('profitable gap: both legs trade, PnL comes from real balance changes', asy
   assert.ok(Math.abs(s.total.pnl - expected) < 1e-6, `${s.total.pnl} vs ${expected}`);
   assert.ok(Math.abs(s.total.gas - 3) < 1e-9);
   assert.ok(alerts.some((a) => a.includes('✅ LIVE LINK DEX_BUY [ok]') && a.includes('Net PnL')));
+  assert.ok(alerts.some((a) => a.includes('https://etherscan.io/tx/0xtx'))); // chain explorer, not a hardcoded host (round-3 L4)
 });
 
 test('no trade when the gap is below max($15, 0.5%)', async () => {
@@ -456,5 +457,40 @@ test('rebalance ticket: a side low for REBALANCE_AFTER_MIN opens ONE ticket and 
     assert.equal(alerts.filter((a) => a.startsWith('🎫 Rebalance ticket') && a.includes('LINK')).length, 1);
   } finally {
     delete process.env.REBALANCE_AFTER_MIN;
+  }
+});
+
+test('expected_net subtracts the approval gas already spent (round-3 L3)', async () => {
+  const readExpected = (db: Db) =>
+    db.all<{ expected_net: number }>(`SELECT expected_net FROM trades WHERE status = 'ok'`).map((r) => r.expected_net);
+  const a = setup({});
+  await a.engine.tick();
+  const b = setup({ approvalNeeded: true });
+  await b.engine.tick();
+  assert.equal(readExpected(a.db).length, 1);
+  assert.equal(readExpected(b.db).length, 1);
+  // Same quotes, same books: the re-checked net is identical; only the approval gas ($1.20) differs.
+  // The approval gas sits inside the balance-based PnL, so the stored expectation must not promise it back.
+  assert.ok(Math.abs((readExpected(a.db)[0] - readExpected(b.db)[0]) - 1.2) < 1e-9,
+    `${readExpected(a.db)[0]} vs ${readExpected(b.db)[0]}`);
+});
+
+test('L1_FEE_USD reserve lowers the estimated net (round-3 M1)', async () => {
+  const saved = { ...process.env };
+  try {
+    const run = async () => {
+      const { engine, db } = setup({ mode: 'paper' });
+      await engine.tick();
+      return db.all<{ expected_net: number }>(`SELECT expected_net FROM trades WHERE status = 'paper'`).map((r) => r.expected_net);
+    };
+    delete process.env.L1_FEE_USD;
+    const base = await run();
+    process.env.L1_FEE_USD = '2';
+    const withReserve = await run();
+    assert.equal(base.length, 1);
+    assert.equal(withReserve.length, 1);
+    assert.ok(Math.abs((base[0] - withReserve[0]) - 2) < 1e-9, `${base[0]} vs ${withReserve[0]}`);
+  } finally {
+    process.env = saved;
   }
 });

@@ -174,40 +174,41 @@ npm run report -- 24 live
 
 **Live চালুর আগে একবার:** `npm run check:0x` চালান। এটা কিছুই sign বা পাঠায় না, শুধু দেখে 0x-এর `transaction.to` আসলেই AllowanceHolder কিনা। বিস্তারিত `CHANGES.md`-এ।
 
-## Running phase 1 in paper on Base for 7 days and reading the report
+## Running phase 1 in paper for 7 days and reading the report
 
-Phase 1-এর লক্ষ্য **টাকা কামানো না, মাপা**: Base-এ প্রতিদিন আসলে কতগুলো সত্যিকারের সুযোগ আসে, সেটা দেখা।
+Phase 1-এর লক্ষ্য **টাকা কামানো না, মাপা**: প্রতিদিন আসলে কতগুলো সত্যিকারের সুযোগ আসে, সেটা দেখা।
 বিস্তারিত পরিবর্তনের তালিকা আছে `CHANGES_UPGRADE.md`-এ।
 
 **১. আগে একবার যাচাই করুন (কিছুই trade হয় না):**
 ```bash
-npm run networks     # কোন chain-এ কয়টা MEXC token deposit আর withdraw করা যায়, আর chain-এর নাম ঠিক মিলছে কিনা
+CHAIN=ethereum npm run networks     # কোন chain-এ কয়টা MEXC token deposit আর withdraw করা যায়, আর chain-এর নাম ঠিক মিলছে কিনা
 npm run check:0x     # 0x ব্যবহার করলে: transaction.to আসলেই AllowanceHolder কিনা
 ```
 
-**২. Base-এর জন্য `.env` সেট করুন:**
+**২. Ethereum-এর জন্য `.env` সেট করুন (বর্তমান run):**
 ```
 MODE=paper
-CHAIN=base
-RPC_URL=<Base RPC, যেমন Alchemy-র base-mainnet>
-SEND_RPC_URL=<Base RPC>            # শুধু paper mode-এ ব্যবহার হয় না, তবু Base-এর হতে হবে
+CHAIN=ethereum
+RPC_URL=<Ethereum mainnet RPC, যেমন Alchemy-র eth-mainnet>
+SEND_RPC_URL=<Ethereum mainnet private RPC, যেমন MEV Blocker>   # MEV Blocker/Flashbots শুধু mainnet-এ চলে
 DEX_AGGREGATOR=kyber               # API key লাগে না। 0x key থাকলে "0x,kyber" দিন
-WATCHLIST=AERO,VIRTUAL,MORPHO      # networks-এর ফল থেকে ২–৪টা token বেছে নিন
-MAX_TRADE_USD=200
+WATCHLIST=LINK,PEPE,UNI            # networks-এর ফল থেকে ২–৪টা token বেছে নিন
+MAX_TRADE_USD=300                  # Ethereum-এ gas বেশি (~$0.10/swap, spike-এ ~$1), তাই $50 size-এ সুযোগ প্রায় আসে না
 ```
+Ethereum এক ব্লকে একবার scan করে (~১২ সেকেন্ড)। Base-এ চালাতে চাইলে `CHAIN=base`, `MAX_TRADE_USD=200`, আর Base-এর RPC দিন দুই জায়গাতেই (Base ১ সেকেন্ডে scan করে)। এক MEXC অ্যাকাউন্টে একটাই chain চালাবেন — দুই chain এক অ্যাকাউন্টে চালালে দুটোই আলাদা loss limit আর inventory ধরে, একই ব্যালেন্স দুইবার খরচ করতে পারে।
 
 **৩. চালান:**
 ```bash
 npm run build
-BOT_CHAINS=base pm2 start ecosystem.config.cjs && pm2 save
+BOT_CHAINS=ethereum pm2 start ecosystem.config.cjs && pm2 save
 ```
-বট প্রতি ১ সেকেন্ডে scan করে। প্রতিটা সুযোগ, trade হোক বা না হোক, `data/base.sqlite`-এর `opportunities` table-এ লেখা হয়।
+বট প্রতি ব্লকে (~১২ সেকেন্ডে) scan করে। প্রতিটা সুযোগ, trade হোক বা না হোক, `data/ethereum.sqlite`-এর `opportunities` table-এ লেখা হয়।
 Paper trade-এর লাভ হিসাব করা হয় ১ সেকেন্ড পরে আবার quote নিয়ে, প্রথম quote-এর ভিত্তিতে না।
 
 **৪. Report পড়ুন** (প্রতিদিন রাত ১১টায় Telegram-এ আসে, অথবা হাতে চালাতে পারেন):
 ```bash
-CHAIN=base npm run report -- 168 paper          # শেষ ৭ দিন
-CHAIN=base npm run report -- 168 paper --csv > base.csv
+CHAIN=ethereum npm run report -- 168 paper          # শেষ ৭ দিন
+CHAIN=ethereum npm run report -- 168 paper --csv > ethereum.csv
 ```
 যে সংখ্যাগুলো দেখবেন:
 | লাইন | মানে | কী হলে ভালো |

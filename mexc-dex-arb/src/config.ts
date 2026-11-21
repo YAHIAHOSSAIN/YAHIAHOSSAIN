@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { chainProfile } from './chains.js';
+import { chainProfile, stableSymbolFor } from './chains.js';
 
 export type Mode = 'live' | 'paper';
 export type AggregatorName = '0x' | '1inch' | 'kyber';
@@ -38,6 +38,12 @@ export function loadConfig() {
     throw new Error('STRATEGY=transfer needs MEXC withdrawals; set ALLOW_WITHDRAWALS=yes only if you accept that risk');
   }
 
+  // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). STABLE_ADDRESS overrides the chain default.
+  // stableIsUsdt follows the OVERRIDDEN address, not the chain default: pointing STABLE_ADDRESS at a USDT
+  // token on a USDC chain (or vice versa) used to keep the wrong stable rate (round-3 review, L7c).
+  // An address that is none of the four chains' stables falls back to the chain default.
+  const stableAddress = str('STABLE_ADDRESS', str('USDC_ADDRESS', chain.stable.address)).toLowerCase();
+
   return {
     mode,
     // transfer  = scan all MEXC ERC20 tokens, buy on MEXC, withdraw to wallet, sell on DEX
@@ -50,8 +56,8 @@ export function loadConfig() {
     privateKey: mode === 'live' ? str('PRIVATE_KEY') : str('PRIVATE_KEY', ''),
     chain,
     // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). STABLE_ADDRESS overrides the chain default.
-    usdc: str('STABLE_ADDRESS', str('USDC_ADDRESS', chain.stable.address)).toLowerCase(),
-    stableIsUsdt: chain.stable.symbol === 'USDT',
+    usdc: stableAddress,
+    stableIsUsdt: (stableSymbolFor(stableAddress) ?? chain.stable.symbol) === 'USDT',
     tickMs: num('TICK_MS', chain.tickMs ?? 0),
     // --- DEX aggregator ---
     aggregator,
@@ -65,7 +71,7 @@ export function loadConfig() {
     baseTradeUsd: num('BASE_TRADE_USD', 0),
     multiSizeTrigger: num('MULTISIZE_TRIGGER', 0.7),
     // --- Monitoring ---
-    oppRetentionDays: num('OPP_RETENTION_DAYS', 30),
+    oppRetentionDays: num('OPP_RETENTION_DAYS', 7),
     // Paper mode re-quotes both legs after this delay and books THAT net (the first quote overstates profit).
     paperLatencyMs: num('PAPER_LATENCY_MS', 1000),
     // --- Inventory ---
@@ -108,6 +114,10 @@ export function loadConfig() {
     safetyMarginBps: num('SAFETY_MARGIN_BPS', 10),
     // CAP on the priority fee. The tip actually used is the median of recent blocks' tips (eth_feeHistory).
     priorityFeeGwei: num('PRIORITY_FEE_GWEI', 1),
+    // OP-stack L1 data fee reserve (USD) added to every gas estimate (round-3 review, M1).
+    // 0 on Ethereum/Arbitrum. On Base, set it to a typical legs.l1_fee from a past trade (usually a few cents):
+    // receipts now record l1_fee, so the value can be measured instead of guessed.
+    l1FeeUsd: num('L1_FEE_USD', 0),
     // --- Risk limits ---
     maxTradeUsd: num('MAX_TRADE_USD', 50),
     minTradeUsd: num('MIN_TRADE_USD', 25),
@@ -161,6 +171,7 @@ export function validateConfig(c: Config): Config {
   range('DAILY_LOSS_LIMIT_USD', c.dailyLossLimitUsd, 0.01, 1e7);
   range('WORST_CASE_LOSS_PCT', c.worstCaseLossPct, 0, 100);
   range('MAX_GAS_GWEI', c.maxGasGwei, 0.01, 1000);
+  range('L1_FEE_USD', c.l1FeeUsd, 0, 100);
   range('MAX_CONSECUTIVE_FAILS', c.maxConsecutiveFails, 1, 100);
   // Upper bound keeps the graceful-shutdown wait (2x this + 60 s) below pm2's kill_timeout (240 s).
   range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 80);

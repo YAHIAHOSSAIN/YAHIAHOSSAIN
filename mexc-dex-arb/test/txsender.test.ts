@@ -6,12 +6,16 @@ import { DROP_AFTER_MS, TxSender, classifySendError, type TxBackend, type GasInf
 const gas: GasInfo = { baseFee: 10n, tip: 1n, effective: 11n, maxFee: 21n };
 const tx = { to: '0xrouter', data: '0x01' };
 
-function backend(o: { broadcastError?: unknown; mined?: boolean; confirmed?: number; knows?: boolean } = {}) {
+function backend(o: { broadcastError?: unknown; mined?: boolean; confirmed?: number; knows?: boolean; l1Fee?: bigint; rawReceiptThrows?: boolean } = {}) {
   const state = { confirmed: o.confirmed ?? 5, signed: [] as { nonce: number; to: string; maxFeePerGas: bigint }[], receipts: new Map<string, number>(), gasReads: 0 };
   const b: TxBackend = {
     address: '0xme',
     confirmedNonce: async () => state.confirmed,
     receipt: async (h) => (state.receipts.has(h) ? { status: state.receipts.get(h)!, gasUsed: 100n, gasPrice: 2n } : null),
+    rawReceipt: async () => {
+      if (o.rawReceiptThrows) throw new Error('rpc down');
+      return o.l1Fee !== undefined ? { l1Fee: o.l1Fee } : null;
+    },
     knowsTx: async () => o.knows ?? true,
     sign: async (t) => {
       state.signed.push({ nonce: t.nonce, to: t.to, maxFeePerGas: t.maxFeePerGas });
@@ -112,4 +116,22 @@ test('not mined in time: cancel is priced from FRESH gas, outcome unknown if nei
   assert.equal(state.signed[1].nonce, 5);
   assert.ok(state.signed[1].maxFeePerGas >= 1300n); // 1.3 x the spiked fee, not the stale one
   assert.equal(s.unresolved?.hashes.length, 2);
+});
+
+test('mined tx on an OP chain: L1 fee is in gasCostWei and reported (round-3 M1)', async () => {
+  const { b } = backend({ mined: true, l1Fee: 1000n });
+  const s = new TxSender(b, memStore(), Date.now, async () => {});
+  const r = await s.send(tx, 100n, gas, 10);
+  assert.equal(r.ok, true);
+  assert.equal(r.gasCostWei, 100n * 2n + 1000n); // receipt gas 100 x price 2 + L1 1000
+  assert.equal(r.l1FeeWei, 1000n);
+});
+
+test('raw receipt failure: L1 fee treated as 0, tx still ok (round-3 M1)', async () => {
+  const { b } = backend({ mined: true, rawReceiptThrows: true });
+  const s = new TxSender(b, memStore(), Date.now, async () => {});
+  const r = await s.send(tx, 100n, gas, 10);
+  assert.equal(r.ok, true);
+  assert.equal(r.gasCostWei, 200n);
+  assert.equal(r.l1FeeWei, undefined);
 });

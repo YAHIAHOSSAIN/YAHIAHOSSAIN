@@ -8,6 +8,7 @@ import { TransferEngine, type TransferMexc, type TransferChain } from '../src/tr
 import { findGaps, loadUniverse, type ScanToken } from '../src/scanner.js';
 import { evaluateTransfer, planCexBuy } from '../src/pricing.js';
 import type { Quote, QuoteRequest } from '../src/dex/aggregator.js';
+import { BestOf, type Aggregator } from '../src/dex/aggregator.js';
 import { AmbiguousRequestError, type Order } from '../src/mexc/rest.js';
 
 const GWEI = 1_000_000_000n;
@@ -33,6 +34,8 @@ function setup(
     mode?: 'live' | 'paper';
     sendFails?: boolean;
     sendUnknown?: boolean;
+    firmDexPrice?: number; // price the FIRM quote (after approval) sees; first quote uses dexPrice
+    agg?: Aggregator; // override the fake aggregator (e.g. a BestOf of two fakes)
     now?: () => number;
   } = {},
 ) {
@@ -104,8 +107,11 @@ function setup(
     },
   };
 
+  let firmCalls = 0;
   const quote = (r: QuoteRequest, firm: boolean): Quote => {
-    const out = (r.sellAmount * BigInt(Math.round(state.dexPrice * 1e6))) / 10n ** 18n; // token(18) -> USDC(6)
+    // The firm quote after the approval may see a different price (round-3 M3 test).
+    const px = firm && firmCalls++ > 0 && o.firmDexPrice !== undefined ? o.firmDexPrice : state.dexPrice;
+    const out = (r.sellAmount * BigInt(Math.round(px * 1e6))) / 10n ** 18n; // token(18) -> USDC(6)
     return { buyAmount: out, minBuyAmount: (out * 999n) / 1000n, gas: 150_000n, spender: '0xspender', tx: firm ? { to: '0xah', data: '0x01', value: 0n } : undefined };
   };
 
@@ -133,7 +139,7 @@ function setup(
   const engine = new TransferEngine({
     cfg, mexc, chain, db, risk,
     tg: { send: async (t) => void alerts.push(t) },
-    agg: { name: '0x', price: async (r) => quote(r, false), quote: async (r) => ((lastQuote = r), quote(r, true)) },
+    agg: o.agg ?? { name: '0x', price: async (r) => quote(r, false), quote: async (r) => ((lastQuote = r), quote(r, true)) },
     dexPricesFn: async () => new Map([[XYZ, { price: dexPrice, tvl: 1e6 }]]),
     sleep: async () => {},
     now: o.now,
@@ -360,4 +366,32 @@ test('a dust deposit during the withdrawal is NOT taken as arrival', async () =>
   await engine.tick();
   assert.equal(db.getTransfer(1)!.status, 'withdrawing');
   assert.ok(alerts.some((a) => a.includes('only grew by')));
+});
+
+test('sell holds when the FIRM quote falls below the loss floor (round-3 M3)', async () => {
+  const { engine, db, calls, alerts, arrive } = setup({ firmDexPrice: 0.9 });
+  await engine.tick(); // finds gap, buys, withdraws
+  arrive(198.9); // 199.9 - 1 withdraw fee
+  await engine.tick(); // first quote ok (1.15), approval, firm quote 0.9 -> below floor -> hold
+  assert.ok(calls.includes('approve 0xspender 198900000000000000000')); // exact amount
+  assert.ok(!calls.includes('send')); // nothing sent on a below-floor firm quote
+  const row = db.openTransfers().find((t) => t.id === 1)!;
+  assert.equal(row.status, 'selling'); // still selling, retried later
+  assert.ok(alerts.some((a) => a.includes('HOLDING 198.9 XYZ')));
+  // The approval gas was really spent: $1.20 booked on the row.
+  assert.ok(Math.abs((row.gas_usd ?? 0) - 1.2) < 1e-9, String(row.gas_usd));
+});
+
+test('transfer mode sets BestOf gasInOutput so gas is compared (round-3 L7f)', async () => {
+  const mkAgg = (name: '0x' | 'kyber', out: bigint, gas: bigint): Aggregator => ({
+    name,
+    price: async () => ({ buyAmount: out, minBuyAmount: out, gas }),
+    quote: async () => ({ buyAmount: out, minBuyAmount: out, gas, tx: { to: '0xah', data: '0x01', value: 0n } }),
+  });
+  const bestOf = new BestOf([mkAgg('0x', 1000n, 500_000n), mkAgg('kyber', 990n, 100_000n)]);
+  const { engine } = setup({ mode: 'paper', agg: bestOf });
+  await engine.tick();
+  assert.equal(typeof bestOf.gasInOutput, 'function');
+  // 150k gas x 10 gwei effective x $2000 ETH = $3.00; fake chain decimals() is 18.
+  assert.equal(bestOf.gasInOutput!(150_000n, USDC), 3_000_000_000_000_000_000n);
 });

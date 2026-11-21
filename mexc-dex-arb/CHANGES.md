@@ -1,3 +1,40 @@
+# Round-3 review fixes (Muse, 2026-11-21)
+
+Muse's round-3 review (`REVIEW_PROMPT_R3.md`, delivered 2026-11-21 ~08:49) was re-verified against the
+repo code and official docs / live public data. Every finding below was checked; the confirmed ones are
+fixed here, the rejected ones are listed at the bottom. Defaults are unchanged: `MODE=paper`,
+`STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`, `MAX_TRADE_USD=50`. Nothing was run live.
+`tsc --noEmit` passes, and `npm test` passes all 126 tests (112 before + 14 new).
+
+| # | Item | Where (file:line) | Tests |
+|---|---|---|---|
+| M1 | Base L1 data fee was missing from all gas math | `src/dex/txsender.ts:58` `rawReceipt?` on TxBackend; `:270` `result()` adds the raw receipt's `l1Fee` to `gasCostWei` and reports `l1FeeWei` (`:39`); `src/dex/chain.ts:57` implements `rawReceipt` via `eth_getTransactionReceipt` (ethers has no l1Fee field); `src/engine.ts:980` legs now store `l1_fee` instead of null; `src/config.ts:120` `L1_FEE_USD` reserve (default 0, `:174` range-checked) added to every gas estimate via `src/engine.ts:374` `estGasUsd` (`:380` gasValuer, `:498` / `:531` evalAt, `:675` execute re-check, `:940` requote) and `src/transfer.ts:272`; `.env.example:84` documents how to measure it from `legs.l1_fee` | `test/txsender.test.ts` "mined tx on an OP chain" (gas 1200n incl. L1 1000n) + "raw receipt failure" (L1 = 0, still ok); `test/engine.test.ts` "L1_FEE_USD reserve lowers the estimated net" (net drops exactly $2); `test/infra.test.ts` "L1_FEE_USD defaults to 0" |
+| M2 | Two chains on one MEXC account share balances/wallet but keep separate risk state | Docs only: `ecosystem.config.cjs:7` warning; `.env.example:15` one-account-one-chain note; `README.md` "Running phase 1" section | (docs) |
+| M3 | Transfer sell checked the loss floor on the first quote only, not the firm quote after approval | `src/transfer.ts:493` `holdIfBelowFloor` helper; `:542` first-quote check; `:552` firm-quote re-check (approval gas booked on hold, `:553`) | `test/transfer.test.ts` "sell holds when the FIRM quote falls below the loss floor" (no send, still selling, $1.20 approval gas booked). Fails on the old code (verified by stashing the fix). |
+| M4 | Would-have PnL took MAX(net) and MAX(size) from different rows | `src/kpi.ts:53` window function: the best-net row's own size (ties: bigger size first, conservative) | `test/upgrade-kpi.test.ts` "would-have PnL uses the best row's own size". Fails on the old code. |
+| M5 | Opportunities table grows ~115-275k rows/day; 30-day retention ~1-2 GB | `src/config.ts:74` default 30 -> 7; `src/db.ts:162` `(ts)` index; `.env.example:121` | `test/infra.test.ts` "OPP_RETENTION_DAYS defaults to 7"; `test/upgrade-kpi.test.ts` "opportunities has a (ts) index" |
+| L1 | gasShareOfGross mixed populations (gas over all non-approval trades, gross over ok/paper only) | `src/kpi.ts:67` gas sum now filtered to ok/paper like gross | `test/upgrade-kpi.test.ts` "gasShareOfGross counts gas only on ok/paper trades". Fails on the old code. |
+| L2 | STABLE rebalance ticket named the wrong asset/direction on USDC chains | `src/inventory.ts:95` `stableSymbol` option; `:104` wallet side names the chain stable, MEXC side says "swap to USDT on MEXC" when the wallet stable is not USDT; wallet-side amount converted to stable units; `src/engine.ts:585` caller passes `cfg.chain.stable.symbol` | `test/upgrade-kpi.test.ts` "inventory plan STABLE ticket names the chain stable" (USDC + BSC cases) |
+| L3 | Stored expected_net excluded the approval gas already spent | `src/engine.ts:717` `expectedNet = opp.net - approval gas actually paid`; `:719` stored on the trade row; `:816` the Telegram message shows the same number | `test/engine.test.ts` "expected_net subtracts the approval gas already spent" (two identical runs, $1.20 apart). Fails on the old code. |
+| L4 | Hardcoded etherscan.io link in the live-trade alert | `src/chains.ts:29` `explorer` per chain (`:44` etherscan.io, `:56` basescan.org, `:68` bscscan.com, `:80` arbiscan.io); `:98` `explorerTxUrl`; `src/engine.ts:817` uses it (transfer.ts links stay etherscan.io: transfer is ethereum-only) | `test/upgrade-chain.test.ts` "explorerTxUrl uses the chain's own explorer"; `test/engine.test.ts` profitable-gap test asserts the etherscan link |
+| L5 | SEND_RPC_URL default is Ethereum-mainnet-only (MEV Blocker / Flashbots) | Docs only: `.env.example:29` note (other chains need their own private RPC; startup fails loudly on chain-id mismatch) | (docs) |
+| L7c | STABLE_ADDRESS override did not update stableIsUsdt | `src/chains.ts:92` `stableSymbolFor` (known-address lookup, falls back to the chain default); `src/config.ts:54` derives `stableIsUsdt` from the resolved address | `test/upgrade-chain.test.ts` "STABLE_ADDRESS override also flips stableIsUsdt" (both directions + unknown-address fallback) |
+| L7f | BestOf gasInOutput was never set in transfer mode | `src/transfer.ts:169` set in `tick()` after the stable rate is known (buy token is always the stable) | `test/transfer.test.ts` "transfer mode sets BestOf gasInOutput" (wiring + $3.00 for 150k gas at 10 gwei / $2000 ETH) |
+
+## Rejected (verified, no change)
+
+- **L6 — Kyber "public limit 3 rps": CORRECT, no change.** Muse's round-3 review had called this unverified;
+  re-checking found it in Kyber's official docs (kyberswap-documentation,
+  `developer-guide/start-here/rate-limits-and-client-id.md`: "Public rate limits are 3 rps for the
+  Aggregator API"). The code's comment and CHANGES_UPGRADE.md were right.
+- **L7a** (multi-size trigger at 0.7x the net hurdle fires often), **L7b** (pickTip falls back to the CAP
+  when eth_feeHistory fails), **L7d** (no opportunity rows while the stable rate is stale), **L7e**
+  (lowSince is in-memory, a restart restarts the rebalance clock): by design, no change. Tickets
+  themselves are DB-persisted, and the pickTip fallback is fail-safe.
+- **M1 scope note:** the L1-fee estimate side is a reserve knob (`L1_FEE_USD`, default 0), not a live
+  oracle read: at estimate time there is no tx yet to feed `GasPriceOracle.getL1Fee`. The receipt side
+  now measures the real fee, so the reserve can be set from observed `legs.l1_fee` values.
+
 # Changes for Grok's round-2 fix prompt
 
 Defaults are unchanged: `MODE=paper`, `STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`, `MAX_TRADE_USD=50`.

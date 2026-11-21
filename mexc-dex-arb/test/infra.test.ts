@@ -304,3 +304,25 @@ test('cancelAndConfirm: never reports a still-open order as closed', async () =>
   const ok = { getOrder: async () => ({ orderId: '1', status: st, executedQty: '0' }) as never, cancelOrder: async () => ((st = 'CANCELED'), {} as never) };
   assert.equal((await cancelAndConfirm(ok, 'X', '1', async () => {})).status, 'CANCELED');
 });
+
+test('OPP_RETENTION_DAYS defaults to 7 (round-3 M5)', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.OPP_RETENTION_DAYS;
+    process.env.RPC_URL = 'http://x';
+    assert.equal(loadConfig().oppRetentionDays, 7);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('L1_FEE_USD defaults to 0 (round-3 M1)', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.L1_FEE_USD;
+    process.env.RPC_URL = 'http://x';
+    assert.equal(loadConfig().l1FeeUsd, 0);
+  } finally {
+    process.env = saved;
+  }
+});

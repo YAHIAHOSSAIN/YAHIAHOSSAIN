@@ -44,12 +44,17 @@ export function computeKpis(db: Db, sinceTs: number, mode: string): Kpis {
   );
   // Would-have PnL: at most one trade per token+direction per minute (the best net in that minute),
   // traded if its net (already after fee, gas, slippage and safety) beats the hurdle.
+  // The hurdle uses the BEST row's own size: MAX(net) and MAX(size) from different rows would
+  // make the hurdle stricter than the chosen trade's own (round-3 review, M4).
   const wouldHave = [20, 30, 40, 60].map((h) => {
     const r = q<{ trades: number; pnl: number | null }>(
       `SELECT COUNT(*) trades, SUM(best) pnl FROM (
-         SELECT MAX(net_usd) best, MAX(size_usd) size FROM opportunities
-         WHERE ts >= ? AND net_usd IS NOT NULL AND size_usd > 0
-         GROUP BY token, direction, ts / 60000
+         SELECT net_usd best, size_usd size FROM (
+           SELECT net_usd, size_usd, ROW_NUMBER() OVER (
+             PARTITION BY token, direction, ts / 60000 ORDER BY net_usd DESC, size_usd DESC
+           ) rn FROM opportunities
+           WHERE ts >= ? AND net_usd IS NOT NULL AND size_usd > 0
+         ) WHERE rn = 1
        ) WHERE best >= size * ? / 10000.0`,
       sinceTs,
       h,
@@ -59,7 +64,7 @@ export function computeKpis(db: Db, sinceTs: number, mode: string): Kpis {
   const t = q<{ n: number; diff: number | null; gas: number | null; gross: number | null; one_sided: number | null }>(
     `SELECT COUNT(*) n,
             AVG(CASE WHEN status IN ('ok','paper') THEN pnl_usd - expected_net END) diff,
-            SUM(gas_usd) gas,
+            SUM(CASE WHEN status IN ('ok','paper') THEN gas_usd ELSE 0 END) gas,
             SUM(CASE WHEN status IN ('ok','paper') THEN pnl_usd + gas_usd + cex_fee_usd END) gross,
             SUM(CASE WHEN status = 'one_sided' THEN 1 ELSE 0 END) one_sided
      FROM trades WHERE ts >= ? AND mode = ? AND status != 'approval'`,

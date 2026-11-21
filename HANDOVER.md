@@ -149,7 +149,14 @@ so the bot now uses `pickTip`.
   - maker (LIMIT_MAKER) mode;
   - perp hedge of inventory;
   - automated wallet→MEXC deposits to an allowlist.
-- The round-3 review (`REVIEW_PROMPT_R3.md`) was sent to Grok and Muse. No answers have come back yet.
+- The round-3 review (`REVIEW_PROMPT_R3.md`) was sent to Grok and Muse. **Muse's round-3 review was delivered
+  2026-11-21 ~08:49 (see `mexc-dex-arb-review-round3.md` in the owner's files) and has now been worked:
+  every finding was re-verified against the repo code and official docs/live data; the confirmed ones are
+  fixed in this branch (see CHANGES.md, "Round-3 review fixes"), the rejected ones are listed there too.
+  Grok's round-3 answers have not come back yet.**
+  - **L6 was WRONG in Muse's round-3 review:** Kyber's official docs DO state the public Aggregator API
+    limit is 3 rps (kyberswap-documentation, `developer-guide/start-here/rate-limits-and-client-id.md`).
+    The code's "Kyber public 3 rps" is correct; no change was made. The review file's L6 note is outdated.
 
 ## 7. How to work
 
@@ -175,14 +182,19 @@ cd .. && (cd mexc-dex-arb && { echo "# mexc-dex-arb: full source for review"; ec
 
 ## 8. Owner's current step
 
-The owner is about to set up the VPS and run **paper mode on Base for 7 days**. Instructions are in the README
-section "Running phase 1 in paper on Base for 7 days and reading the report".
+The owner is about to set up the VPS and run **paper mode on Ethereum for 7 days**. Instructions are in the README
+section "Running phase 1 in paper for 7 days and reading the report".
+(An earlier plan said Base; the owner's decision 2026-11-21 is Ethereum, `CHAIN=ethereum`.)
 
 They need:
-- a Base RPC (e.g. Alchemy) for both `RPC_URL` and `SEND_RPC_URL`;
+- an Ethereum mainnet RPC (e.g. Alchemy) for both `RPC_URL` and `SEND_RPC_URL` (MEV Blocker / Flashbots
+  are mainnet-only; the bot checks the chain id at startup);
 - a **read-only** MEXC key;
 - Telegram (optional in paper);
-- `WATCHLIST` with 2-4 tokens chosen from `npm run networks`.
+- `WATCHLIST` with 2-4 tokens chosen from `CHAIN=ethereum npm run networks`;
+- `MAX_TRADE_USD=300` for the paper run (Ethereum gas is ~$0.10/swap, up to ~$1 on spikes, so $50 paper
+  size would show almost no trades — that is the math, not a bot fault);
+- Ethereum scans once per 12 s block (no TICK_MS).
 
 Paper mode is **not real trading**. Live needs `MODE=live`, a new wallet's key, a trade-only MEXC key, funds on both
 sides, and Telegram. Do not suggest live until the 7-day paper report shows positive re-quoted net.

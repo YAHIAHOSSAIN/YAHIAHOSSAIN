@@ -159,6 +159,7 @@ export class Db {
       );
       CREATE INDEX IF NOT EXISTS opp_token_ts ON opportunities(token, ts);
       CREATE INDEX IF NOT EXISTS opp_decision_ts ON opportunities(decision, ts);
+      CREATE INDEX IF NOT EXISTS opp_ts ON opportunities(ts);
       CREATE TABLE IF NOT EXISTS legs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL, leg TEXT NOT NULL,
         quoted_price REAL, filled_price REAL, slippage_bps REAL, min_out REAL, real_out REAL,
