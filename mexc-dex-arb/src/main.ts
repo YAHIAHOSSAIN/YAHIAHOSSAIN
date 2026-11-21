@@ -9,7 +9,7 @@ import { MexcRest, RateLimitError } from './mexc/rest.js';
 import { MexcBookStream } from './mexc/ws.js';
 import { Chain } from './dex/chain.js';
 import { BestOf, Kyber, Limited, OneInch, TokenBucket, ZeroEx, type Aggregator } from './dex/aggregator.js';
-import { buildWatchlist, refreshStatus } from './watchlist.js';
+import { buildWatchlist, provenTokens, refreshStatus } from './watchlist.js';
 import { paperBalances, snapshot } from './inventory.js';
 import { Engine } from './engine.js';
 import { TransferEngine } from './transfer.js';
@@ -89,17 +89,30 @@ async function main() {
   if (cfg.mode === 'live') checkEnvPermissions(cfg.envPath);
 
   const db = new Db(cfg.dbPath);
+  // Twin setup: the live bot reads paper history from the paper bot's DB (readonly);
+  // its own DB holds live trades + risk state. Empty PAPER_DB_PATH = own DB (paper bot itself).
+  let paperDb: Db = db;
+  if (cfg.paperDbPath) {
+    try {
+      paperDb = new Db(cfg.paperDbPath, true);
+    } catch (e) {
+      log.warn(`paper DB ${cfg.paperDbPath} unreadable (${errMsg(e)}): live watchlist will be empty`);
+    }
+  }
   const risk = new Risk(db, cfg.mode, cfg);
+  // Every Telegram message carries the mode on its first line, so paper and live
+  // can never be confused in the same chat: 📝 PAPER vs 🔴 LIVE — আসল টাকা.
+  const modeTag = cfg.mode === 'live' ? '🔴 LIVE — আসল টাকা' : '📝 PAPER';
   const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, {
     get: () => db.getState('telegram_offset'),
     set: (v) => db.setState('telegram_offset', v),
-  });
+  }, modeTag);
   if (!tg.enabled) log.warn('Telegram not configured: alerts only go to the log and there is no /stop');
   const mexc = new MexcRest(cfg.mexcApiKey, cfg.mexcApiSecret);
   const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei, {
     get: () => db.getState('unresolved_tx') || undefined,
     set: (v) => db.setState('unresolved_tx', v ?? ''),
-  }, cfg.chain.chainId);
+  }, cfg.chain.chainId, cfg.unlimitedApproval);
   // Every aggregator gets its own quote budget (token bucket, honours 429 / Retry-After).
   const limited = cfg.aggregators.map((name) => {
     const inner =
@@ -161,7 +174,7 @@ async function main() {
   // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
   setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
 
-  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg);
+  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg, paperDb);
 
   const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
     chain: cfg.chain,
@@ -171,6 +184,22 @@ async function main() {
     minVolumeUsd: cfg.minMexcVolumeUsd,
   });
   if (tokens.length === 0) throw new Error('Watchlist is empty: no token passed the filters');
+  // Live mode trades only tokens proven profitable in paper trading (paper history
+  // lives in this DB). Paper mode is the scout: it keeps the full volume list.
+  if (cfg.mode === 'live') {
+    const proven = provenTokens(tokens, paperDb.paperTokenStats(), cfg.liveMinPaperTrades, cfg.liveMinPaperPnlUsd, cfg.liveWatchlistMax);
+    if (!proven.length) {
+      const msg = '⚠️ Live mode: কোনো টোকেন এখনো paper-এ প্রমাণিত হয়নি — live trade হবে না। Paper-এ লাভ করা টোকেন আসলেই watchlist-এ ঢুকবে।';
+      log.warn(msg);
+      await tg.send(msg).catch(() => {});
+      tokens.length = 0;
+    } else {
+      tokens.splice(0, tokens.length, ...proven);
+      const msg = `🎯 Live watchlist — paper-এ লাভ করেছে: ${proven.map((t) => t.base).join(', ')}`;
+      log.info(msg);
+      await tg.send(msg).catch(() => {});
+    }
+  }
   log.info(`watchlist: ${tokens.map((t) => `${t.base}(${t.address.slice(0, 8)}…, tvl $${Math.round(t.dexTvlUsd / 1000)}k)`).join(', ')}`);
 
   const stream = new MexcBookStream([cfg.chain.nativeMexcSymbol, 'USDCUSDT', ...tokens.map((t) => t.symbol)]);
@@ -212,6 +241,8 @@ async function main() {
     },
     '/start': startHandler(risk, statusText, makeUnresolvedCheck(db, chain)),
     '/status': statusText,
+    '/tokens': () =>
+      `Tokens (${tokens.length}): ${tokens.map((t) => `${t.base} (vol $${Math.round(t.mexcVolumeUsd / 1000)}k, TVL $${Math.round(t.dexTvlUsd / 1000)}k)`).join(', ')}`,
     '/cancelnonce': () => chain.cancelNonce(),
     '/resolve': ([id, pnl]) => resolveTrade(db, id, pnl),
   });
@@ -264,6 +295,48 @@ async function main() {
     }
   }, 10 * 60_000);
 
+  // Auto token search: re-run the watchlist filters every WATCHLIST_RESCAN_MIN minutes.
+  // New tokens that pass are added live (no restart); dropped tokens are only reported
+  // (a token with open inventory keeps trading until the next restart).
+  log.info(`auto token search: rescan every ${cfg.watchlistRescanMin} min`);
+  setInterval(async () => {
+    if (lifecycle.stopping) return;
+    try {
+      const freshRaw = await buildWatchlist(mexc, (a) => chain.decimals(a), {
+        chain: cfg.chain,
+        only: cfg.watchlist,
+        max: cfg.watchlistMax,
+        minTvlUsd: cfg.minDexTvlUsd,
+        minVolumeUsd: cfg.minMexcVolumeUsd,
+      });
+      // Live mode: never hot-add a token that paper hasn't proven profitable.
+      const fresh = cfg.mode === 'live'
+        ? provenTokens(freshRaw, paperDb.paperTokenStats(), cfg.liveMinPaperTrades, cfg.liveMinPaperPnlUsd, cfg.liveWatchlistMax)
+        : freshRaw;
+      const cur = new Set(tokens.map((t) => t.base));
+      const added = fresh.filter((t) => !cur.has(t.base));
+      const removed = tokens.filter((t) => !fresh.some((f) => f.base === t.base));
+      if (!added.length && !removed.length) {
+        log.info(`rescan: no change (${tokens.length} tokens)`);
+        return;
+      }
+      if (lifecycle.stopping) return;
+      const fmt = (t: { base: string; mexcVolumeUsd: number; dexTvlUsd: number }) =>
+        `${t.base} (vol $${Math.round(t.mexcVolumeUsd / 1000)}k, TVL $${Math.round(t.dexTvlUsd / 1000)}k)`;
+      const room = cfg.watchlistMax - tokens.length;
+      const toAdd = added.slice(0, Math.max(0, room));
+      for (const t of toAdd) tokens.push(t);
+      const lines = ['🔍 নতুন টোকেনের খোঁজ:'];
+      if (toAdd.length) lines.push(`🆕 নতুন: ${toAdd.map(fmt).join(', ')} — এখন থেকেই scan করছে`);
+      if (added.length > toAdd.length) lines.push(`⏳ জায়গা নেই (সর্বোচ্চ ${cfg.watchlistMax}টা): ${added.slice(toAdd.length).map(fmt).join(', ')}`);
+      if (removed.length) lines.push(`📤 শর্ত পূরণ করছে না (পরের restart থেকে বাদ): ${removed.map((t) => t.base).join(', ')}`);
+      await tg.send(lines.join('\n'));
+      log.info(`rescan: +${toAdd.map((t) => t.base).join(',') || '-'} -${removed.map((t) => t.base).join(',') || '-'}`);
+    } catch (e) {
+      log.warn(`rescan: ${errMsg(e)}`);
+    }
+  }, cfg.watchlistRescanMin * 60_000);
+
   // Keep the opportunities log bounded (OPP_RETENTION_DAYS).
   const prune = () => {
     const n = db.pruneOpportunities(Date.now() - cfg.oppRetentionDays * 86_400_000);
@@ -290,11 +363,25 @@ async function main() {
   );
 }
 
-/** TRANSFER strategy: scan every MEXC ERC20 token, buy on MEXC, withdraw, sell on DEX. */
-async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator) {
-  const engine = new TransferEngine({ cfg, mexc, chain, agg, db, risk, tg });
+/** TRANSFER strategy: scan MEXC ERC20 tokens, buy on MEXC, withdraw, sell on DEX. CEX->DEX only. */
+async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator, paperDb: Db) {
+  const engine = new TransferEngine({ cfg, mexc, chain, agg, db, risk, tg,
+    // Live mode trades only tokens proven profitable in paper (same rule as the
+    // inventory live watchlist). Paper mode is the scout: it scans everything.
+    provenFilter: cfg.mode === 'live'
+      ? (tokens) => provenTokens(tokens, paperDb.paperTokenStats(), cfg.liveMinPaperTrades, cfg.liveMinPaperPnlUsd, cfg.liveWatchlistMax)
+      : undefined,
+  });
   await engine.refreshUniverse(true);
-  if (engine.universe.length === 0) throw new Error('No MEXC ERC20 token passed the filters');
+  if (engine.universe.length === 0) {
+    if (engine.provenFilteredEmpty) {
+      const msg = '⚠️ Live transfer: কোনো টোকেন এখনো paper-এ প্রমাণিত হয়নি — live trade হবে না। Paper-এ লাভ করা টোকেন আসলেই scan শুরু হবে।';
+      log.warn(msg);
+      await tg.send(msg).catch(() => {});
+    } else {
+      throw new Error('No MEXC ERC20 token passed the filters');
+    }
+  }
 
   void tg.startPolling({
     '/stop': () => {
@@ -380,7 +467,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
   const open = db.openTransfers();
   await tg.send(
     `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} STRATEGY=transfer via ${agg.name}\n` +
-      `Scanning ${engine.universe.length} MEXC ERC20 tokens (buy MEXC -> withdraw -> sell DEX)\n` +
+      `Scanning ${engine.universe.length} MEXC ERC20 tokens${engine.universe.length ? ` (${engine.universe.map((t) => t.base).join(', ')})` : ''} (buy MEXC -> withdraw -> sell DEX)\n` +
       (open.length ? `Resuming ${open.length} open transfer(s)\n` : '') +
       (risk.paused ? `⏸ Still paused: ${risk.pauseReason} (send /start)` : '▶️ Trading enabled'),
   );
@@ -388,6 +475,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
 
 main().catch(async (e) => {
   log.error(`startup failed: ${errMsg(e)}`);
-  await new Telegram(cfg.telegramToken, cfg.telegramChatId).send(`❗ Bot failed to start: ${errMsg(e)}`);
+  const modeTag = cfg.mode === 'live' ? '🔴 LIVE — আসল টাকা' : '📝 PAPER';
+  await new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, undefined, modeTag).send(`❗ Bot failed to start: ${errMsg(e)}`);
   process.exit(1);
 });

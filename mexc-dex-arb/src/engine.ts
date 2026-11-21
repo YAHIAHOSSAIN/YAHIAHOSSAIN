@@ -97,7 +97,8 @@ export async function placeSafely(
     throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
   }
 }
-import { decimalsOfStep, dhakaDay, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+import { decimalsOfStep, dhakaDay, mapBatches, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+import { dexPrices } from './watchlist.js';
 
 export const USDC_DECIMALS = 6;
 export { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
@@ -289,7 +290,8 @@ export class Engine {
     const bal = await this.d.balances();
     const books = new Map<string, Book>();
     const prices: Record<string, number> = {};
-    for (const t of this.d.tokens) {
+    // MEXC books are independent: fetch in parallel batches (sequential = ~0.3 s/token).
+    await mapBatches(this.d.tokens, 8, async (t) => {
       try {
         const b = await this.d.book(t.symbol);
         if (b.bids.length && b.asks.length) {
@@ -299,7 +301,7 @@ export class Engine {
       } catch (e) {
         log.warn(`${t.symbol} book: ${errMsg(e)}`);
       }
-    }
+    });
 
     if (this.live) {
       for (const w of inventoryWarnings(bal, this.d.tokens, prices, this.cfg.minTradeUsd, this.cfg.minEthForGas)) {
@@ -313,28 +315,64 @@ export class Engine {
 
     const rows: OpportunityRow[] = [];
     let best: Candidate | null = null;
-    for (const t of this.d.tokens) {
-      const b = books.get(t.symbol);
-      if (!b) continue;
-      if (!t.depositOk || !t.withdrawOk) {
-        this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
-        continue;
-      }
-      this.note(`susp-${t.base}`, `${t.base}: active`);
+    // Quote-saving pre-filter: only spend a (rate-limited) DEX quote when the rough
+    // MEXC-vs-DexScreener gap is big enough to ever trade. On any fetch failure,
+    // quote everything (same as before).
+    let toQuote = this.d.tokens;
+    if (this.cfg.prefilterBps > 0) {
       try {
-        for (const c of await this.candidates(t, b, bal, gas, ethUsd, rows)) {
-          const need = c.need ?? this.need(c.opp.sizeUsd);
-          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(need)})`);
-          const passes = c.opp.net > need;
-          if (c.row) {
-            c.row.decision = passes ? 'trade' : 'below_hurdle';
-            c.row.reason = passes ? null : `net ${c.opp.net.toFixed(4)} <= need ${need.toFixed(4)}`;
-          }
-          if (passes && (!best || c.opp.net > best.opp.net)) best = c;
+        const dex = await dexPrices(this.d.tokens.filter((t) => books.has(t.symbol)).map((t) => t.address));
+        const kept: Token[] = [];
+        for (const t of this.d.tokens) {
+          const b = books.get(t.symbol);
+          const px = dex.get(t.address.toLowerCase());
+          if (!b || px === undefined) { kept.push(t); continue; }
+          const gapBps = (Math.abs(px - prices[t.base]) / prices[t.base]) * 10_000;
+          if (gapBps >= this.cfg.prefilterBps) kept.push(t);
+          else rows.push(this.blankRow(t, 'rule', `prefilter: rough gap ${gapBps.toFixed(0)} bps < ${this.cfg.prefilterBps} bps`));
         }
+        log.info(`prefilter: quoting ${kept.length}/${this.d.tokens.length} tokens`);
+        toQuote = kept;
       } catch (e) {
-        if (e instanceof QuoteBudgetError) rows.push(this.blankRow(t, 'rate_limited', errMsg(e)));
-        else log.warn(`${t.base} quote: ${errMsg(e)}`);
+        log.warn(`prefilter: ${errMsg(e)} (quoting all)`);
+      }
+    }
+    const batchSize = 3;
+    const batchGapMs = 2000; // 3 tokens x 2 quotes per 2 s = Kyber 3 quotes/s
+    const perToken: Candidate[][] = [];
+    for (let i = 0; i < toQuote.length; i += batchSize) {
+      const started = Date.now();
+      const results = await Promise.all(toQuote.slice(i, i + batchSize).map(async (t) => {
+        const b = books.get(t.symbol);
+        if (!b) return [] as Candidate[];
+        if (!t.depositOk || !t.withdrawOk) {
+          this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
+          return [] as Candidate[];
+        }
+        this.note(`susp-${t.base}`, `${t.base}: active`);
+        try {
+          return await this.candidates(t, b, bal, gas, ethUsd, rows);
+        } catch (e) {
+          if (e instanceof QuoteBudgetError) rows.push(this.blankRow(t, 'rate_limited', errMsg(e)));
+          else log.warn(`${t.base} quote: ${errMsg(e)}`);
+          return [] as Candidate[];
+        }
+      }));
+      perToken.push(...results);
+      const elapsed = Date.now() - started;
+      if (i + batchSize < toQuote.length && elapsed < batchGapMs) await this.sleep(batchGapMs - elapsed);
+    }
+    for (const [i, list] of perToken.entries()) {
+      const t = toQuote[i];
+      for (const c of list) {
+        const need = c.need ?? this.need(c.opp.sizeUsd);
+        log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(need)})`);
+        const passes = c.opp.net > need;
+        if (c.row) {
+          c.row.decision = passes ? 'trade' : 'below_hurdle';
+          c.row.reason = passes ? null : `net ${c.opp.net.toFixed(4)} <= need ${need.toFixed(4)}`;
+        }
+        if (passes && (!best || c.opp.net > best.opp.net)) best = c;
       }
     }
     for (const r of rows) if (r.decision === 'trade' && best?.row !== r) r.reason = 'passed, but another candidate was better this tick';

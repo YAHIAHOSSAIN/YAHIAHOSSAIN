@@ -70,6 +70,9 @@ export function loadConfig() {
     // base-size gross gap reaches MULTISIZE_TRIGGER of the hurdle.
     baseTradeUsd: num('BASE_TRADE_USD', 0),
     multiSizeTrigger: num('MULTISIZE_TRIGGER', 0.7),
+    // Quote-saving pre-filter: only request a DEX quote when the rough MEXC-vs-DexScreener gap
+    // is at least this many bps (0 = off). Tradeable gaps are ~35+ bps at these sizes, so 30 keeps all of them.
+    prefilterBps: num('PREFILTER_BPS', 30),
     // --- Monitoring ---
     oppRetentionDays: num('OPP_RETENTION_DAYS', 7),
     // Paper mode re-quotes both legs after this delay and books THAT net (the first quote overstates profit).
@@ -99,8 +102,13 @@ export function loadConfig() {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean),
     watchlistMax: num('WATCHLIST_MAX', 8),
+    watchlistRescanMin: num('WATCHLIST_RESCAN_MIN', 60),
     minDexTvlUsd: num('MIN_DEX_TVL_USD', 200_000),
     minMexcVolumeUsd: num('MIN_MEXC_VOLUME_USD', 500_000),
+    // Live mode only trades tokens proven profitable in paper (see provenTokens in watchlist.ts).
+    liveMinPaperTrades: num('LIVE_MIN_PAPER_TRADES', 2),
+    liveMinPaperPnlUsd: num('LIVE_MIN_PAPER_PNL_USD', 0),
+    liveWatchlistMax: num('LIVE_WATCHLIST_MAX', 10),
     // --- Costs & thresholds ---
     // Must be small relative to MAX_TRADE_USD: $15 on a $50 trade would need a ~30% gap = only fake gaps pass.
     // need = max(MIN_PROFIT_USD, MIN_PROFIT_BPS of the size): mostly a percentage, with a small dollar floor.
@@ -126,6 +134,11 @@ export function loadConfig() {
     // Skip a trade if losing this % of its size (+ gas) would break the remaining daily loss budget.
     worstCaseLossPct: num('WORST_CASE_LOSS_PCT', 5),
     maxGasGwei: num('MAX_GAS_GWEI', 40),
+    // Unlimited token approval (MaxUint256) instead of exact-amount approval: the first sale of a
+    // token approves once, later sales skip the approve tx (~12s saved per sale). Risk: a compromised
+    // spender contract could drain the whole token balance from the wallet. Default off (exact
+    // approvals); owner turned it ON for the live twin only on 2026-11-21, after the warning.
+    unlimitedApproval: str('UNLIMITED_APPROVAL', 'no').toLowerCase() === 'yes',
     maxConsecutiveFails: num('MAX_CONSECUTIVE_FAILS', 3),
     minEthForGas: num('MIN_ETH_FOR_GAS', 0.01),
     txTimeoutSec: num('TX_TIMEOUT_SEC', 60),
@@ -141,6 +154,7 @@ export function loadConfig() {
     transferMaxLossPct: num('TRANSFER_MAX_LOSS_PCT', 3),
     // --- Misc ---
     dbPath: str('DB_PATH', `data/${chain.name}.sqlite`), // one database per chain
+    paperDbPath: str('PAPER_DB_PATH', ''), // live twin: read paper history from the paper bot's DB (empty = own DB)
     envPath: str('ENV_PATH', '.env'),
   };
 }

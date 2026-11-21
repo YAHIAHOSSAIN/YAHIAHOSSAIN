@@ -1,5 +1,14 @@
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Run fn over items in parallel batches of `size` (network-bound work). Results keep input order. */
+export async function mapBatches<T, R>(items: readonly T[], size: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(...(await Promise.all(items.slice(i, i + size).map(fn))));
+  }
+  return out;
+}
+
 const DHAKA_OFFSET_MS = 6 * 3600 * 1000; // Bangladesh: UTC+6, no DST
 
 /** Calendar day in Bangladesh time, e.g. "2026-11-20". Daily limits reset at Dhaka midnight. */

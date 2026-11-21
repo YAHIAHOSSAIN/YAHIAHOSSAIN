@@ -37,6 +37,8 @@ function setup(
     firmDexPrice?: number; // price the FIRM quote (after approval) sees; first quote uses dexPrice
     agg?: Aggregator; // override the fake aggregator (e.g. a BestOf of two fakes)
     now?: () => number;
+    extraTokens?: { base: string; contract: string }[]; // extra ERC20 tokens that pass the base filters
+    provenFilter?: (tokens: ScanToken[]) => ScanToken[]; // live proven-only filter
   } = {},
 ) {
   process.env.MODE = o.mode ?? 'live';
@@ -69,10 +71,11 @@ function setup(
   const orders = new Map<string, Order>();
   let lastQuote: QuoteRequest | null = null;
 
+  const extra = o.extraTokens ?? [];
   const mexc: TransferMexc = {
-    exchangeInfo: async () => [symbolInfo('XYZ'), symbolInfo('BAD')],
-    tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9000000', lastPrice: '1' }, { symbol: 'BADUSDT', quoteVolume: '9000000', lastPrice: '1' }],
-    coinConfigs: async () => [coin('XYZ', XYZ), coin('BAD', '0x2222222222222222222222222222222222222222', true, false)],
+    exchangeInfo: async () => [symbolInfo('XYZ'), symbolInfo('BAD'), ...extra.map((t) => symbolInfo(t.base))],
+    tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9000000', lastPrice: '1' }, { symbol: 'BADUSDT', quoteVolume: '9000000', lastPrice: '1' }, ...extra.map((t) => ({ symbol: `${t.base}USDT`, quoteVolume: '9000000', lastPrice: '1' }))],
+    coinConfigs: async () => [coin('XYZ', XYZ), coin('BAD', '0x2222222222222222222222222222222222222222', true, false), ...extra.map((t) => coin(t.base, t.contract))],
     bookTickers: async () => new Map([['XYZUSDT', { bid: 0.999, ask: 1.0 }], ['ETHUSDT', { bid: 2000, ask: 2000 }], ['USDCUSDT', { bid: 1, ask: 1 }]]),
     depth: async () => ({ bids: [[0.999, 1e6]], asks: [[1.0, 1e6]], ts: Date.now() }),
     balances: async () => ({ ...state.mexc }),
@@ -143,6 +146,7 @@ function setup(
     dexPricesFn: async () => new Map([[XYZ, { price: dexPrice, tvl: 1e6 }]]),
     sleep: async () => {},
     now: o.now,
+    provenFilter: o.provenFilter,
   });
   // The withdrawal lands: MEXC reports SUCCESS (7) and the wallet balance grows.
   const arrive = (tokens: number) => {
@@ -394,4 +398,45 @@ test('transfer mode sets BestOf gasInOutput so gas is compared (round-3 L7f)', a
   assert.equal(typeof bestOf.gasInOutput, 'function');
   // 150k gas x 10 gwei effective x $2000 ETH = $3.00; fake chain decimals() is 18.
   assert.equal(bestOf.gasInOutput!(150_000n, USDC), 3_000_000_000_000_000_000n);
+});
+
+test('provenFilter restricts the transfer universe to proven tokens only', async () => {
+  const ABC = '0x3333333333333333333333333333333333333333';
+  const { engine } = setup({
+    extraTokens: [{ base: 'ABC', contract: ABC }],
+    provenFilter: (t) => t.filter((x) => x.base === 'XYZ'),
+  });
+  await engine.refreshUniverse(true);
+  assert.deepEqual(engine.universe.map((t) => t.base), ['XYZ']);
+  assert.equal(engine.provenFilteredEmpty, false);
+});
+
+test('no provenFilter scans every token that passes the base filters', async () => {
+  const ABC = '0x3333333333333333333333333333333333333333';
+  const { engine } = setup({ extraTokens: [{ base: 'ABC', contract: ABC }] });
+  await engine.refreshUniverse(true);
+  assert.deepEqual(engine.universe.map((t) => t.base).sort(), ['ABC', 'XYZ']);
+});
+
+test('provenFilter empty waits instead of trading (provenFilteredEmpty)', async () => {
+  const { engine } = setup({ provenFilter: () => [] });
+  await engine.refreshUniverse(true);
+  assert.deepEqual(engine.universe, []);
+  assert.equal(engine.provenFilteredEmpty, true);
+  await engine.tick(); // must not throw or trade with an empty universe
+  assert.deepEqual(engine.universe, []);
+});
+
+test('provenFilter re-applies on rescan, so newly proven tokens join live', async () => {
+  const ABC = '0x3333333333333333333333333333333333333333';
+  let proven = ['XYZ'];
+  const { engine } = setup({
+    extraTokens: [{ base: 'ABC', contract: ABC }],
+    provenFilter: (t) => t.filter((x) => proven.includes(x.base)),
+  });
+  await engine.refreshUniverse(true);
+  assert.deepEqual(engine.universe.map((t) => t.base), ['XYZ']);
+  proven = ['XYZ', 'ABC'];
+  await engine.refreshUniverse(true);
+  assert.deepEqual(engine.universe.map((t) => t.base).sort(), ['ABC', 'XYZ']);
 });

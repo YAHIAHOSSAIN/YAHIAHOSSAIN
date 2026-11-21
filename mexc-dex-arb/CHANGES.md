@@ -1,3 +1,47 @@
+# Unlimited approval (owner decision, Muse, 2026-11-21)
+
+Yahia asked for unlimited token approval so sales no longer wait for an approve tx (~12s per
+sale). Every sale used to approve exactly the sell amount, so the allowance was spent and the
+next sale needed a fresh approve transaction. Now `UNLIMITED_APPROVAL=yes` approves MaxUint256
+once per token per spender; later sales skip the approve tx entirely (the allowance check in
+`approveExact` already returns early when the allowance covers the amount).
+
+Risk, stated to Yahia before he said yes: a compromised spender contract could drain the whole
+token balance from the wallet — exact approvals capped the exposure at one trade's amount. This
+overrides HANDOVER §4 rule "Approvals are exact amounts, never MaxUint256" by explicit owner
+decision (same pattern as the v4.68 AI-gate removal). Default stays off (exact approvals);
+only the live twin's `ecosystem.live.config.cjs` sets `UNLIMITED_APPROVAL: 'yes'`. The paper
+bot is unaffected (paper never sends real approvals).
+
+| Item | Where (file:line) | Tests |
+|---|---|---|
+| `UNLIMITED_APPROVAL` flag (default `no`) | `src/config.ts` `unlimitedApproval` (after `maxGasGwei`); `src/main.ts:112` passes `cfg.unlimitedApproval` into `new Chain(...)`; `.env.example` documents it with the risk warning | `test/infra.test.ts` "UNLIMITED_APPROVAL defaults to off (exact approvals); yes turns it on" |
+| Approval policy | `src/dex/chain.ts` `MAX_UINT256` + pure `approvalAmount(unlimited, amount)`; `approveExact` approves that target (the reset-to-zero step for USDT-style tokens is unchanged); `approvalGasNeeded` needs no change (allowance >= amount already returns 0) | `test/chain.test.ts` (new): exact by default, MaxUint256 when on; MAX_UINT256 is 2^256 - 1. Full suite 138 tests pass (135 + 3 new). |
+| Live twin turns it on | `ecosystem.live.config.cjs` `UNLIMITED_APPROVAL: 'yes'` (pm2 env wins over `.env`, which has no such key so the default `no` applies elsewhere) | Running-process env verified 2026-11-21 ~23:40 after the restart (new pid, `UNLIMITED_APPROVAL=yes` in /proc environ; Telegram "🔴 LIVE — আসল টাকা | 🤖 Bot started. MODE=LIVE STRATEGY=transfer …" received). |
+
+# Live twin -> transfer mode, CEX->DEX only (Muse, 2026-11-21)
+
+Yahia asked for the live twin to buy on MEXC, withdraw to the hot wallet, and sell on the DEX —
+transfer mode, CEX->DEX only. Two things were already true and needed no change: transfer mode is
+CEX->DEX only by design (`src/transfer.ts:1-3` header: buy cheaper on MEXC -> withdraw -> sell on
+Ethereum DEX; there is no DEX->CEX direction), and the MEXC withdraw fee is already paid from the
+bought token (`src/transfer.ts` `evaluate()`: `arriving = plan.tokensToSell - withdrawFee`; the
+arrival check uses the fee MEXC actually charged from its history). What was missing: transfer
+mode scanned EVERY MEXC ERC20 token, ignoring the live proven-only rule (NPC + BGB). Fixed below.
+Defaults are unchanged (`MODE=paper`, `STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`); only the live
+twin's `ecosystem.live.config.cjs` switches to `STRATEGY=transfer` + `ALLOW_WITHDRAWALS=yes`.
+`tsc --noEmit` passes, `npm test` passes all 132 tests (128 before + 4 new). NOT restarted live
+yet: the MEXC API key still needs Withdraw permission + withdrawal-address whitelist = hot wallet
+only, which only Yahia can enable on MEXC. Restarting before that would buy on MEXC, fail the
+withdraw, and sell back at a small loss per cycle.
+
+| Item | Where (file:line) | Tests |
+|---|---|---|
+| Transfer universe honours the live proven-only rule | `src/transfer.ts:82` optional `provenFilter` dep; `:155` applied in `refreshUniverse()` on every rescan (newly proven tokens join live without a restart); `src/main.ts:368` wires it for live mode from `paperDb.paperTokenStats()` with the same `LIVE_MIN_PAPER_TRADES` / `LIVE_MIN_PAPER_PNL_USD` / `LIVE_WATCHLIST_MAX` knobs as inventory live; `src/watchlist.ts:72` `provenTokens` generalised to `{ base: string }[]` so it works for both `Token[]` and `ScanToken[]` | `test/transfer.test.ts` "provenFilter restricts the transfer universe to proven tokens only" (XYZ kept, ABC dropped); "no provenFilter scans every token that passes the base filters"; "provenFilter re-applies on rescan, so newly proven tokens join live" |
+| Empty proven list waits instead of crash-looping | `src/transfer.ts:101` `provenFilteredEmpty` flag (`:157` set when the filter empties a non-empty universe; `:158` throttled warning); `src/main.ts:374` startup warns on Telegram and keeps running instead of throwing when only the proven list is empty (a truly empty universe still throws) | `test/transfer.test.ts` "provenFilter empty waits instead of trading (provenFilteredEmpty)" (`tick()` with an empty universe does not throw or trade) |
+| Live twin config -> transfer | `ecosystem.live.config.cjs:17` `STRATEGY: 'transfer'`; `:18` `ALLOW_WITHDRAWALS: 'yes'` (pm2 env wins over the shared `.env`, which still says `STRATEGY=inventory` / `ALLOW_WITHDRAWALS=no` — same precedence as `MODE=live` already proven by the running live twin); `src/main.ts` "Bot started" message now lists the scanned tokens | (config; running-process env to be verified after the restart) |
+| Telegram mode tag: every message starts with 📝 PAPER or 🔴 LIVE — আসল টাকা | `src/telegram.ts` optional `tag` constructor param; `send()` prepends it as the first line (a text that already starts with the tag is not doubled, so the existing `📝 PAPER …` trade lines stay as they are); `src/main.ts` passes `🔴 LIVE — আসল টাকা` for live and `📝 PAPER` for paper, including the startup-failure message | `test/telegram.test.ts` (new): tag prepended as first line; no doubling when already present; no tag = unchanged. Full suite 135 tests pass. |
+
 # Round-3 review fixes (Muse, 2026-11-21)
 
 Muse's round-3 review (`REVIEW_PROMPT_R3.md`, delivered 2026-11-21 ~08:49) was re-verified against the

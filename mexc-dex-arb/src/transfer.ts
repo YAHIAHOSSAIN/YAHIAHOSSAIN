@@ -76,6 +76,10 @@ export interface TransferDeps {
   dexPricesFn?: typeof dexPrices;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  // Live mode: restrict the universe to tokens proven profitable in paper
+  // (same rule as the inventory live watchlist). When set, refreshUniverse
+  // re-applies it on every rescan, so newly proven tokens join live.
+  provenFilter?: (tokens: ScanToken[]) => ScanToken[];
 }
 
 interface Candidate {
@@ -92,6 +96,9 @@ const withdrawCid = (id: number) => `arb${id}w`;
 
 export class TransferEngine {
   universe: ScanToken[] = [];
+  // True when the proven filter emptied a non-empty universe: live has nothing
+  // proven yet, so the bot waits instead of failing startup.
+  provenFilteredEmpty = false;
   private universeTs = 0;
   private lastNote = new Map<string, string>();
   private cooldown = new Map<string, number>(); // token -> skip exact quotes until
@@ -144,9 +151,12 @@ export class TransferEngine {
 
   async refreshUniverse(force = false): Promise<void> {
     if (!force && this.now() - this.universeTs < 10 * 60_000) return;
-    this.universe = await loadUniverse(this.d.mexc, { minVolumeUsd: this.cfg.minMexcVolumeUsd, only: this.cfg.watchlist });
+    const all = await loadUniverse(this.d.mexc, { minVolumeUsd: this.cfg.minMexcVolumeUsd, only: this.cfg.watchlist });
+    this.universe = this.d.provenFilter ? this.d.provenFilter(all) : all;
     this.universeTs = this.now();
-    log.info(`scanner universe: ${this.universe.length} MEXC ERC20 tokens (deposit+withdraw open, volume >= $${this.cfg.minMexcVolumeUsd})`);
+    this.provenFilteredEmpty = !!this.d.provenFilter && all.length > 0 && this.universe.length === 0;
+    if (this.provenFilteredEmpty) this.note('proven-empty', 'live transfer: কোনো টোকেন এখনো paper-এ প্রমাণিত হয়নি — paper-এ লাভ করা টোকেন আসলেই scan শুরু হবে');
+    log.info(`scanner universe: ${this.universe.length} MEXC ERC20 tokens (deposit+withdraw open, volume >= $${this.cfg.minMexcVolumeUsd})${this.d.provenFilter ? ' [proven-only]' : ''}`);
   }
 
   /** One scan cycle. Always advances open transfers first. */

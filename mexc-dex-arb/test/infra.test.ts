@@ -11,7 +11,10 @@ import { Telegram } from '../src/telegram.js';
 import { redact, registerSecrets } from '../src/log.js';
 import { Db } from '../src/db.js';
 import { Risk } from '../src/risk.js';
-import { ethNetwork } from '../src/watchlist.js';
+import { ethNetwork, provenTokens, type Token } from '../src/watchlist.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // --- tiny protobuf encoder for building test messages ---
 const varint = (n: number) => {
@@ -26,6 +29,42 @@ const varint = (n: number) => {
 const field = (num: number, bytes: Uint8Array | number[]) => [...varint(num * 8 + 2), ...varint(bytes.length), ...bytes];
 const s = (x: string) => [...Buffer.from(x)];
 const level = (p: string, q: string) => [...field(1, s(p)), ...field(2, s(q))];
+
+test('provenTokens keeps only paper-profitable tokens, best P&L first', () => {
+  const tok = (base: string): Token => ({
+    base, symbol: `${base}USDT`, address: `0x${base}`, decimals: 18, qtyStep: 0.001, priceDecimals: 4,
+    rules: {} as Token['rules'], dexTvlUsd: 1_000_000, mexcVolumeUsd: 100_000, depositOk: true, withdrawOk: true,
+  });
+  const tokens = ['NPC', 'BGB', 'METAON', 'FET', 'PEPE'].map(tok);
+  const stats = [
+    { symbol: 'NPC', trades: 2, wins: 2, pnl: 19.41 },
+    { symbol: 'BGB', trades: 4, wins: 4, pnl: 7.11 },
+    { symbol: 'METAON', trades: 1, wins: 1, pnl: 1.38 },
+    { symbol: 'FET', trades: 3, wins: 0, pnl: -1.95 },
+  ];
+  assert.deepEqual(provenTokens(tokens, stats, 2, 0, 10).map((t) => t.base), ['NPC', 'BGB']);
+  assert.deepEqual(provenTokens(tokens, stats, 2, 0, 1).map((t) => t.base), ['NPC']);
+  assert.deepEqual(provenTokens(tokens, [], 2, 0, 10), []);
+});
+
+test('twin: live bot reads paper history from the paper bot DB (readonly)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'avh-twin-'));
+  const file = path.join(dir, 'paper.sqlite');
+  const paper = new Db(file);
+  const row = (symbol: string, pnl: number) => paper.insertTrade({ ts: Date.now(), day: '2026-11-21', mode: 'paper', symbol, direction: 'CEX_BUY', size_usd: 300, qty: 1, buy_price: 1, sell_price: 1, expected_net: 1, cex_fee_usd: 0, gas_usd: 0, pnl_usd: pnl, status: 'paper', dex_tx: null, cex_order_id: null, note: null });
+  row('NPC', 10);
+  row('NPC', 9.41);
+  row('BGB', -1);
+  const twin = new Db(file, true);
+  const stats = twin.paperTokenStats().sort((a, b) => a.symbol.localeCompare(b.symbol));
+  assert.deepEqual(stats, [
+    { symbol: 'BGB', trades: 1, wins: 0, pnl: -1 },
+    { symbol: 'NPC', trades: 2, wins: 2, pnl: 19.41 },
+  ]);
+  twin.close();
+  paper.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
 
 test('decodes a MEXC limit-depth protobuf push', () => {
   const depth = [
@@ -244,6 +283,22 @@ test('transfer strategy refuses to start without ALLOW_WITHDRAWALS=yes; safe def
     assert.throws(() => loadConfig(), /ALLOW_WITHDRAWALS=yes/);
     process.env.ALLOW_WITHDRAWALS = 'yes';
     assert.equal(loadConfig().strategy, 'transfer');
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('UNLIMITED_APPROVAL defaults to off (exact approvals); yes turns it on', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.UNLIMITED_APPROVAL;
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    assert.equal(loadConfig().unlimitedApproval, false);
+    process.env.UNLIMITED_APPROVAL = 'yes';
+    assert.equal(loadConfig().unlimitedApproval, true);
+    process.env.UNLIMITED_APPROVAL = 'no';
+    assert.equal(loadConfig().unlimitedApproval, false);
   } finally {
     process.env = saved;
   }

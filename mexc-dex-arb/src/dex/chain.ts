@@ -12,6 +12,19 @@ const ERC20_ABI = [
 ];
 const APPROVE_GAS = 60_000n;
 
+/** MaxUint256: the unlimited-approval amount. Only used when UNLIMITED_APPROVAL=yes. */
+export const MAX_UINT256 = (1n << 256n) - 1n;
+
+/**
+ * Amount actually approved: the exact amount, or MaxUint256 when unlimited approval is on.
+ * Unlimited skips the approve tx on every later sale of the same token (allowance stays huge),
+ * saving ~12s per sale — but a compromised spender could then drain the whole token balance.
+ * Owner decision 2026-11-21: unlimited ON for the live twin only (default off everywhere else).
+ */
+export function approvalAmount(unlimited: boolean, amount: bigint): bigint {
+  return unlimited ? MAX_UINT256 : amount;
+}
+
 export type { GasInfo, TxResult } from './txsender.js';
 import { type GasInfo, type KeyValue, type TxResult, TxSender } from './txsender.js';
 
@@ -41,6 +54,7 @@ export class Chain {
     private priorityFeeGwei: number,
     unresolvedStore?: KeyValue,
     readonly chainId = 1,
+    readonly unlimitedApproval = false,
   ) {
     this.provider = new ethers.JsonRpcProvider(rpcUrl, chainId, { staticNetwork: true });
     this.sendProvider = new ethers.JsonRpcProvider(sendRpcUrl, chainId, { staticNetwork: true });
@@ -150,7 +164,7 @@ export class Chain {
     return allowance > 0n ? APPROVE_GAS * 2n : APPROVE_GAS; // USDT-style tokens need approve(0) first
   }
 
-  /** Approve exactly `amount` (never unlimited). Sent through the private RPC. */
+  /** Approve the sell amount (exact by default; MaxUint256 when UNLIMITED_APPROVAL=yes). Sent through the private RPC. */
   async approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult> {
     const c = this.erc20(token);
     let cost = 0n;
@@ -162,7 +176,8 @@ export class Chain {
       cost += r.gasCostWei;
       if (!r.ok) return { ...r, gasCostWei: cost };
     }
-    const data = c.interface.encodeFunctionData('approve', [spender, amount]);
+    const target = approvalAmount(this.unlimitedApproval, amount);
+    const data = c.interface.encodeFunctionData('approve', [spender, target]);
     const r = await this.send({ to: token, data }, await this.approveGasLimit(token, data), gas, 60);
     return { ...r, gasCostWei: cost + r.gasCostWei };
   }

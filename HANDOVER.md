@@ -82,7 +82,10 @@ Scripts:
 1. Never change the defaults: `MODE=paper`, `STRATEGY=inventory`, `ALLOW_WITHDRAWALS=no`.
 2. Never give the bot MEXC withdraw rights. Never let it move funds. Rebalancing is a Telegram ticket for a human.
 3. Never print or log keys or RPC URLs. Add any new secret to `secretsOf()`.
-4. Approvals are exact amounts, never MaxUint256.
+4. Approvals are exact amounts, never MaxUint256. — OVERRIDDEN by owner decision 2026-11-21:
+   `UNLIMITED_APPROVAL=yes` (default off) approves MaxUint256 once per token per spender, so later
+   sales skip the approve tx (~12s saved per sale). Yahia accepted the stated risk (a compromised
+   spender could drain the whole token balance). Live twin only; see CHANGES.md "Unlimited approval".
 5. `spender` and `tx.to` must be pinned:
    - 0x AllowanceHolder: `0x0000000000001fF3684f28c67538d4D072C22734`
    - 1inch v6: `0x111111125421cA6dc452d289314280a0f8842A65`

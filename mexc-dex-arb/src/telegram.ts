@@ -23,6 +23,8 @@ export class Telegram {
     private adminId = '',
     /** Persists the update offset across restarts. */
     private offsetStore?: { get(): string | undefined; set(v: string): void },
+    /** First line prepended to every message (e.g. the bot's mode tag). Empty = no tag. */
+    private tag = '',
   ) {}
 
   get enabled(): boolean {
@@ -43,7 +45,10 @@ export class Telegram {
 
   /** Never throws: alerts must not crash the bot. */
   async send(text: string): Promise<void> {
-    const msg = redact(text);
+    // One unmistakable first line on every message, so paper and live are never
+    // confused in the same chat. A text that already starts with the tag is not doubled.
+    const tagged = this.tag && !text.startsWith(this.tag) ? `${this.tag}\n${text}` : text;
+    const msg = redact(tagged);
     log.info(`[telegram] ${msg.replace(/\n/g, ' | ')}`);
     if (!this.enabled) return;
     try {

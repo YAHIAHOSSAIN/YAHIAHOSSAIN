@@ -119,9 +119,12 @@ export interface LegRow {
 export class Db {
   private db: Database.Database;
 
-  constructor(file: string) {
-    if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
-    this.db = new Database(file);
+  // Twin setup: the live bot opens the paper bot's DB readonly to read paper history
+  // (its own DB holds live trades + risk state). WAL lets a reader run beside the writer.
+  constructor(file: string, readonly = false) {
+    if (!readonly && file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
+    this.db = new Database(file, readonly ? { readonly: true } : {});
+    if (readonly) return;
     this.db.pragma('journal_mode = WAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS trades (
@@ -208,6 +211,14 @@ export class Db {
   cidsOf(tradeId: number): string[] {
     const row = this.db.prepare('SELECT cids FROM trades WHERE id = ?').get(tradeId) as { cids: string | null } | undefined;
     return row?.cids ? (JSON.parse(row.cids) as string[]) : [];
+  }
+
+  /** Per-token booked paper P&L: { symbol (base), trades, wins, pnl }. */
+  paperTokenStats(): { symbol: string; trades: number; wins: number; pnl: number }[] {
+    return this.db.prepare(
+      `SELECT symbol, COUNT(*) AS trades, SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins, COALESCE(SUM(pnl_usd), 0) AS pnl
+       FROM trades WHERE mode = 'paper' GROUP BY symbol`,
+    ).all() as { symbol: string; trades: number; wins: number; pnl: number }[];
   }
 
   insertOpportunities(rows: OpportunityRow[]): void {
