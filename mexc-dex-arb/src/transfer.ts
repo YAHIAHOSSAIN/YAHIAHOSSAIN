@@ -21,7 +21,7 @@ import type { Db, TransferRow } from './db.js';
 import type { Risk } from './risk.js';
 import type { Notifier } from './engine.js';
 import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine.js';
-import { closePrice, orderProblem } from './mexc/rules.js';
+import { closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
 import { type Gap, type ScanToken, dexPrices, findGaps, loadUniverse } from './scanner.js';
 import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
 import { log, errMsg } from './log.js';
@@ -113,8 +113,19 @@ export class TransferEngine {
   private get live() {
     return this.cfg.mode === 'live';
   }
-  private costs() {
-    return { takerFee: this.cfg.mexcTakerFee, cexSlippageBps: this.cfg.cexSlippageBps, safetyMarginUsd: this.cfg.safetyMarginUsd };
+  /** USDT per USDC, from MEXC USDCUSDT (refreshed every tick). */
+  stableRate = 1;
+  private fee(base: string) {
+    return takerFeeFor(this.universe.find((t) => t.base === base)?.rules, this.cfg.mexcTakerFee);
+  }
+  private costs(base: string) {
+    return {
+      takerFee: this.fee(base),
+      cexSlippageBps: this.cfg.cexSlippageBps,
+      safetyMarginUsd: this.cfg.safetyMarginUsd,
+      safetyMarginBps: this.cfg.safetyMarginBps,
+      stableInUsdt: this.stableRate,
+    };
   }
   private note(key: string, msg: string) {
     if (this.lastNote.get(key) !== msg) {
@@ -147,6 +158,10 @@ export class TransferEngine {
     const eth = tickers.get('ETHUSDT');
     if (!eth) throw new Error('no ETHUSDT ticker');
     const ethUsd = (eth.bid + eth.ask) / 2;
+    const st = tickers.get('USDCUSDT');
+    const rate = st ? (st.bid + st.ask) / 2 : NaN;
+    if (!(rate >= 0.99 && rate <= 1.01)) return this.note('stable', `no trading: USDC/USDT rate ${rate} unusable`);
+    this.stableRate = rate;
 
     // An earlier DEX tx with unknown outcome blocks every new send (same nonce rule as the inventory engine).
     let txBlocked = false;
@@ -208,7 +223,7 @@ export class TransferEngine {
           this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
           continue;
         }
-        const need = threshold(c.ev.costUsd, this.cfg.minProfitUsd, this.cfg.minProfitPct);
+        const need = threshold(c.ev.costUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
         log.info(`${g.token.base}: gap ${g.gapPct.toFixed(2)}%, size ${usd(c.ev.costUsd)}, exact net ${usd(c.ev.net)} (need ${usd(need)})`);
         if (c.ev.net <= need) this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
         else if (!best || c.ev.net > best.ev.net) best = c;
@@ -231,7 +246,7 @@ export class TransferEngine {
     }
     const t = g.token;
     const book = await this.d.mexc.depth(t.symbol, 20);
-    const plan = planCexBuy({ sizeUsd: size, asks: book.asks, qtyStep: t.qtyStep, takerFee: this.cfg.mexcTakerFee });
+    const plan = planCexBuy({ sizeUsd: size, asks: book.asks, qtyStep: t.qtyStep, takerFee: this.fee(t.base) });
     if (!plan || plan.tokensToSell < t.withdrawMin) return null;
     const arriving = plan.tokensToSell - t.withdrawFee;
     if (arriving <= 0) return null;
@@ -250,7 +265,7 @@ export class TransferEngine {
       usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
       gasUsd: gasUsd(q.gas + APPROVE_GAS, gas.effective, ethUsd),
       driftBps: this.cfg.transferDriftBps,
-      costs: this.costs(),
+      costs: this.costs(t.base),
     });
     return { gap: g, plan, ev, decimals };
   }
@@ -372,7 +387,7 @@ export class TransferEngine {
       }
 
       const free = (await this.d.mexc.balances())[row.base] ?? 0;
-      const amount = floorToStep(Math.min(free, row.buy_qty * (1 - this.cfg.mexcTakerFee)), row.qty_step);
+      const amount = floorToStep(Math.min(free, row.buy_qty * (1 - this.fee(row.base))), row.qty_step);
       const amountStr = amount.toFixed(decimalsOfStep(row.qty_step));
       const min = this.universe.find((t) => t.base === row.base)?.withdrawMin ?? 0;
       if (amount <= 0 || amount < min) {
@@ -495,7 +510,7 @@ export class TransferEngine {
       const first = await this.d.agg.quote(req);
 
       // Loss floor: price may have fallen while the withdrawal travelled. Hold instead of locking in a big loss.
-      const worstOut = toFloat(first.minBuyAmount, USDC_DECIMALS);
+      const worstOut = toFloat(first.minBuyAmount, USDC_DECIMALS) * this.stableRate; // in USDT, like the cost
       const floor = row.cost_usd * (1 - this.cfg.transferMaxLossPct / 100);
       if (worstOut >= floor && row.hold_alerted) this.d.db.updateTransfer(row.id!, { hold_alerted: 0 }); // recovered: alert again if it falls
       if (worstOut < floor && !row.force_sell) {
@@ -527,7 +542,7 @@ export class TransferEngine {
       txHash = r.hash;
       if (r.unknown) return this.unknownOutcome(row, `swap ${r.hash}`, gasWei, ethUsd);
       if (!r.ok) throw new Error(`swap ${r.reason}`);
-      const usdcOut = toFloat((await this.d.chain.tokenBalance(this.cfg.usdc)) - usdcBefore, USDC_DECIMALS);
+      const usdcOut = toFloat((await this.d.chain.tokenBalance(this.cfg.usdc)) - usdcBefore, USDC_DECIMALS) * this.stableRate; // USDT
       const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * ethUsd;
       const pnl = usdcOut - row.cost_usd - gasTotal;
       this.d.db.updateTransfer(row.id!, { status: 'done', usdc_out: usdcOut, gas_usd: gasTotal, pnl });
@@ -625,7 +640,7 @@ export class TransferEngine {
       await this.sleep(1500);
       const received = ((await this.d.mexc.balances()).USDT ?? 0) - usdtBefore;
       // Fallback only if the balance read is clearly off (e.g. a concurrent deposit/withdrawal).
-      return received > 0 ? received : Number(o.cummulativeQuoteQty) * (1 - this.cfg.mexcTakerFee);
+      return received > 0 ? received : Number(o.cummulativeQuoteQty) * (1 - this.fee(row.base));
     } catch (e) {
       this.d.risk.pause(`could not close ${row.base} on MEXC`, true);
       await this.d.tg.send(`🚨 ${row.base}: MEXC market sell of ${qty} FAILED (${errMsg(e)}). Trading PAUSED. Close it manually, then /start.`);
@@ -670,7 +685,7 @@ export class TransferEngine {
       ts: now, day: dhakaDay(now), mode: this.cfg.mode, symbol: row.base, direction: 'TRANSFER',
       size_usd: row.cost_usd, qty: row.buy_qty, buy_price: buyPrice, sell_price: sellPrice, expected_net: row.expected_net,
       // informational only: PnL is measured from real balances and already includes every fee
-      cex_fee_usd: row.cost_usd * this.cfg.mexcTakerFee + row.withdraw_fee * buyPrice,
+      cex_fee_usd: row.cost_usd * this.fee(row.base) + row.withdraw_fee * buyPrice,
       gas_usd: gas, pnl_usd: pnl, status, dex_tx: tx ?? null, cex_order_id: row.buy_order_id, note,
     });
   }

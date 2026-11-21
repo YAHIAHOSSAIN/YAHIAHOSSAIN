@@ -11,7 +11,7 @@ export interface Balances {
   mexc: Record<string, number>; // free balance by asset
 }
 
-export async function snapshot(chain: Chain, mexc: MexcRest, usdc: string, tokens: Token[], total = false): Promise<Balances> {
+export async function snapshot(chain: Chain, mexc: MexcRest, usdc: string, tokens: Token[], total = false, stableDecimals = 6): Promise<Balances> {
   const [eth, usdcBal, mexcBal, ...toks] = await Promise.all([
     chain.ethBalance(),
     chain.tokenBalance(usdc),
@@ -20,7 +20,7 @@ export async function snapshot(chain: Chain, mexc: MexcRest, usdc: string, token
   ]);
   return {
     walletEth: toFloat(eth, 18),
-    walletUsdc: toFloat(usdcBal, 6),
+    walletUsdc: toFloat(usdcBal, stableDecimals), // 6 for USDC, 18 for BSC USDT
     walletToken: Object.fromEntries(tokens.map((t, i) => [t.base, toFloat(toks[i], t.decimals)])),
     mexc: mexcBal,
   };
@@ -38,9 +38,9 @@ export function paperBalances(tokens: Token[]): Balances {
 }
 
 /** USD value of the assets a trade in `token` can touch (used for exact PnL). */
-export function portfolioUsd(b: Balances, token: Token, tokenUsd: number, ethUsd: number): number {
+export function portfolioUsd(b: Balances, token: Token, tokenUsd: number, ethUsd: number, stableInUsdt = 1): number {
   return (
-    b.walletUsdc +
+    b.walletUsdc * stableInUsdt + // wallet stable (USDC) valued in USDT
     (b.mexc.USDT ?? 0) +
     ((b.walletToken[token.base] ?? 0) + (b.mexc[token.base] ?? 0)) * tokenUsd +
     b.walletEth * ethUsd

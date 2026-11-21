@@ -42,6 +42,11 @@ function setup(
   process.env.RPC_URL = 'http://localhost';
   process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
   process.env.MIN_PROFIT_USD = '15';
+  // These older tests keep the pre-upgrade cost settings, so their numbers stay meaningful.
+  process.env.MIN_PROFIT_BPS = '50';
+  process.env.SAFETY_MARGIN_USD = '2';
+  process.env.SAFETY_MARGIN_BPS = '0';
+  process.env.CEX_SLIPPAGE_BPS = '20';
   process.env.PRIVATE_KEY = '0x' + '22'.repeat(32);
   process.env.MEXC_API_KEY = 'k'.repeat(10);
   process.env.MEXC_API_SECRET = 's'.repeat(10);
@@ -65,7 +70,7 @@ function setup(
     exchangeInfo: async () => [symbolInfo('XYZ'), symbolInfo('BAD')],
     tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9000000', lastPrice: '1' }, { symbol: 'BADUSDT', quoteVolume: '9000000', lastPrice: '1' }],
     coinConfigs: async () => [coin('XYZ', XYZ), coin('BAD', '0x2222222222222222222222222222222222222222', true, false)],
-    bookTickers: async () => new Map([['XYZUSDT', { bid: 0.999, ask: 1.0 }], ['ETHUSDT', { bid: 2000, ask: 2000 }]]),
+    bookTickers: async () => new Map([['XYZUSDT', { bid: 0.999, ask: 1.0 }], ['ETHUSDT', { bid: 2000, ask: 2000 }], ['USDCUSDT', { bid: 1, ask: 1 }]]),
     depth: async () => ({ bids: [[0.999, 1e6]], asks: [[1.0, 1e6]], ts: Date.now() }),
     balances: async () => ({ ...state.mexc }),
     limitOrder: async (_s, side, q, p) => {

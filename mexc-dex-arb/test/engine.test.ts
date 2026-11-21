@@ -33,11 +33,17 @@ function setup(opts: {
   minNotional?: number;
   unresolved?: boolean;
   notReady?: boolean;
+  usdcUsdt?: number;
 }) {
   process.env.MODE = opts.mode ?? 'live';
   process.env.RPC_URL = 'http://localhost';
   process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
   process.env.MIN_PROFIT_USD = '15';
+  // These older tests keep the pre-upgrade cost settings, so their numbers stay meaningful.
+  process.env.MIN_PROFIT_BPS = '50';
+  process.env.SAFETY_MARGIN_USD = '2';
+  process.env.SAFETY_MARGIN_BPS = '0';
+  process.env.CEX_SLIPPAGE_BPS = '20';
   process.env.PRIVATE_KEY = '0x' + '11'.repeat(32);
   process.env.MEXC_API_KEY = 'k'.repeat(10);
   process.env.MEXC_API_SECRET = 's'.repeat(10);
@@ -55,6 +61,7 @@ function setup(opts: {
 
   const books: Record<string, Book> = {
     ETHUSDT: { bids: [[ethUsd, 100]], asks: [[ethUsd, 100]], ts: Date.now() },
+    USDCUSDT: { bids: [[opts.usdcUsdt ?? 1, 1e6]], asks: [[opts.usdcUsdt ?? 1, 1e6]], ts: Date.now() },
     LINKUSDT: { bids: [[bid, 1000]], asks: [[bid + 0.01, 1000]], ts: Date.now() },
   };
 
@@ -368,4 +375,10 @@ test('nonce not ready (gap / unresolved): the MEXC leg never fires', async () =>
   await engine.tick();
   assert.ok(calls.includes('simulate')); // got as far as the final checks
   assert.ok(!calls.some((c) => c.startsWith('limit') || c === 'send'));
+});
+
+test('stale or unreasonable USDC/USDT rate: no trading', async () => {
+  const off = setup({ usdcUsdt: 1.05 });
+  await off.engine.tick();
+  assert.deepEqual(off.calls, []);
 });

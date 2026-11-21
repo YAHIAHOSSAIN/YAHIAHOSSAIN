@@ -2,6 +2,7 @@
 // (taken from MEXC's own deposit network info), enough DEX TVL and MEXC volume.
 import type { CoinConfig, MexcRest } from './mexc/rest.js';
 import { log, errMsg } from './log.js';
+import { type ChainProfile, networkFor } from './chains.js';
 import { type SymbolRules, rulesFrom } from './mexc/rules.js';
 
 /** exchangeInfo status: live API returns "1"; the docs example shows "ENABLED". Accept both. */
@@ -33,17 +34,17 @@ export function ethNetwork(cfg: CoinConfig) {
 type FetchFn = typeof fetch;
 
 /** Highest liquidity (USD) of any Ethereum pool for the token, from DexScreener. */
-export async function dexTvl(address: string, fetchFn: FetchFn = fetch): Promise<number> {
+export async function dexTvl(address: string, fetchFn: FetchFn = fetch, dexScreenerChain = 'ethereum'): Promise<number> {
   const res = await fetchFn(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { signal: AbortSignal.timeout(8000) });
   if (!res.ok) throw new Error(`dexscreener ${res.status}`);
   const j = (await res.json()) as { pairs?: { chainId: string; liquidity?: { usd?: number } }[] | null };
-  return Math.max(0, ...(j.pairs ?? []).filter((p) => p.chainId === 'ethereum').map((p) => p.liquidity?.usd ?? 0));
+  return Math.max(0, ...(j.pairs ?? []).filter((p) => p.chainId === dexScreenerChain).map((p) => p.liquidity?.usd ?? 0));
 }
 
 export async function buildWatchlist(
   mexc: MexcRest,
   decimalsOf: (address: string) => Promise<number>,
-  opts: { only: string[]; max: number; minTvlUsd: number; minVolumeUsd: number },
+  opts: { only: string[]; max: number; minTvlUsd: number; minVolumeUsd: number; chain?: ChainProfile },
 ): Promise<Token[]> {
   const [symbols, tickers, coins] = await Promise.all([mexc.exchangeInfo(), mexc.tickers24h(), mexc.coinConfigs()]);
   const volume = new Map(tickers.map((t) => [t.symbol, Number(t.quoteVolume)]));
@@ -60,11 +61,12 @@ export async function buildWatchlist(
   const out: Token[] = [];
   const check = async (s: (typeof candidates)[number]): Promise<Token | null> => {
     const coin = coinBy.get(s.baseAsset.toUpperCase());
-    const net = coin && ethNetwork(coin);
-    if (!net?.contract || !/^0x[0-9a-fA-F]{40}$/.test(net.contract)) return null; // not an Ethereum token on MEXC
+    // The token's contract on THIS chain, as MEXC lists it for deposits on this network (same token for sure).
+    const net = coin && (opts.chain ? networkFor(opts.chain, coin.networkList) : ethNetwork(coin));
+    if (!net?.contract || !/^0x[0-9a-fA-F]{40}$/.test(net.contract)) return null; // not on this chain at MEXC
     const address = net.contract.toLowerCase();
     try {
-      const tvl = await dexTvl(address);
+      const tvl = await dexTvl(address, fetch, opts.chain?.dexScreenerId ?? 'ethereum');
       if (tvl < opts.minTvlUsd) {
         log.info(`watchlist: skip ${s.baseAsset}, DEX TVL $${Math.round(tvl)}`);
         return null;
@@ -96,11 +98,12 @@ export async function buildWatchlist(
 }
 
 /** Refresh deposit/withdraw flags (tokens with either suspended are skipped). */
-export async function refreshStatus(mexc: MexcRest, tokens: Token[]): Promise<string[]> {
+export async function refreshStatus(mexc: MexcRest, tokens: Token[], chain?: ChainProfile): Promise<string[]> {
   const coins = new Map((await mexc.coinConfigs()).map((c) => [c.coin.toUpperCase(), c]));
   const changed: string[] = [];
   for (const t of tokens) {
-    const net = coins.get(t.base) && ethNetwork(coins.get(t.base)!);
+    const coin = coins.get(t.base);
+    const net = coin && (chain ? networkFor(chain, coin.networkList) : ethNetwork(coin));
     const dep = Boolean(net?.depositEnable && net.contract?.toLowerCase() === t.address);
     const wd = Boolean(net?.withdrawEnable);
     if (dep !== t.depositOk || wd !== t.withdrawOk) changed.push(`${t.base}: deposit ${dep ? 'on' : 'OFF'}, withdraw ${wd ? 'on' : 'OFF'}`);

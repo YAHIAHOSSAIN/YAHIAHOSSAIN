@@ -14,7 +14,8 @@
     "report": "node dist/report.js",
     "test": "tsx --test test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "check:0x": "tsx scripts/check-0x-quote.ts"
+    "check:0x": "tsx scripts/check-0x-quote.ts",
+    "networks": "tsx scripts/networks.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.0.0",

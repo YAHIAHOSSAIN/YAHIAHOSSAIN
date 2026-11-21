@@ -2,6 +2,10 @@
 //
 // net = sell value - buy value - MEXC taker fee - gas - slippage (both sides) - safety margin
 // DEX fees are already inside the aggregator's buyAmount.
+//
+// All money is measured in USDT (MEXC's quote asset). The DEX side trades a stable (USDC on most
+// chains): its amounts are converted with `stableInUsdt` (USDT per 1 DEX stable, e.g. 1.0021 for USDC).
+// Treating USDC as exactly 1 USDT made every DEX_BUY look ~20 bps better than it really was.
 import type { Level } from './mexc/rest.js';
 import { floorToStep } from './util.js';
 
@@ -10,14 +14,25 @@ export type Direction = 'DEX_BUY' | 'CEX_BUY';
 // CEX_BUY: buy token on MEXC with USDT, sell token on DEX for USDC.
 
 export interface CostParams {
-  takerFee: number; // 0.0005 = 0.05%
+  takerFee: number; // per-symbol MEXC taker fee, 0.0008 = 0.08%
   cexSlippageBps: number;
+  /** Floor of the safety margin in USD. */
   safetyMarginUsd: number;
+  /** Safety margin as a share of the trade size (bps). The larger of the two is used. */
+  safetyMarginBps?: number;
+  /** USDT per 1 unit of the DEX stable (USDC ~1.002). 1 on chains whose DEX stable is USDT. */
+  stableInUsdt?: number;
 }
+
+/** Safety margin for a trade of `sizeUsd`: max(floor in USD, bps of size). */
+export function safetyUsd(c: CostParams, sizeUsd: number): number {
+  return Math.max(c.safetyMarginUsd, (sizeUsd * (c.safetyMarginBps ?? 0)) / 10_000);
+}
+const rate = (c: CostParams) => c.stableInUsdt ?? 1;
 
 export interface Opportunity {
   direction: Direction;
-  sizeUsd: number; // USD put into the buy leg
+  sizeUsd: number; // amount put into the buy leg (DEX stable units for DEX_BUY, USDT for CEX_BUY)
   cexQty: number; // token quantity for the MEXC order
   cexLimitPrice: number; // worst acceptable MEXC price (book walk + slippage)
   dexTokens: number; // tokens bought (DEX_BUY) or sold (CEX_BUY) on the DEX
@@ -59,8 +74,9 @@ export function fillQuote(levels: Level[], quoteAmount: number): { qty: number; 
   return left <= 1e-6 ? { qty, worst } : null;
 }
 
-export function threshold(sizeUsd: number, minProfitUsd: number, minProfitPct: number): number {
-  return Math.max(minProfitUsd, (sizeUsd * minProfitPct) / 100);
+/** Required net profit: max(small USD floor, MIN_PROFIT_BPS of the size). */
+export function threshold(sizeUsd: number, minProfitUsd: number, minProfitBps: number): number {
+  return Math.max(minProfitUsd, (sizeUsd * minProfitBps) / 10_000);
 }
 
 /**
@@ -87,14 +103,15 @@ export function evaluateDexBuy(p: {
   const slippageUsd = cexSlip + Math.max(0, p.tokensOut - p.tokensMin) * sellPrice;
   // Worst case we receive exactly tokensMin; the part below the MEXC step stays as inventory.
   const dustUsd = (p.tokensMin - qty) * sellPrice;
-  const net = fill.quote - cexFeeUsd - (p.sizeUsd - dustUsd) - p.gasUsd - cexSlip - p.costs.safetyMarginUsd;
+  const costUsdt = p.sizeUsd * rate(p.costs); // the DEX stable we spend, in USDT
+  const net = fill.quote - cexFeeUsd - (costUsdt - dustUsd) - p.gasUsd - cexSlip - safetyUsd(p.costs, costUsdt);
   return {
     direction: 'DEX_BUY',
     sizeUsd: p.sizeUsd,
     cexQty: qty,
     cexLimitPrice: fill.worst * (1 - p.costs.cexSlippageBps / 10_000),
     dexTokens: p.tokensOut,
-    buyPrice: p.sizeUsd / p.tokensOut,
+    buyPrice: costUsdt / p.tokensOut,
     sellPrice,
     cexFeeUsd,
     gasUsd: p.gasUsd,
@@ -136,10 +153,11 @@ export function evaluateCexBuy(p: {
   const buyPrice = plan.costUsd / plan.qty;
   const cexFeeUsd = plan.qty * p.costs.takerFee * buyPrice;
   const cexSlip = (plan.costUsd * p.costs.cexSlippageBps) / 10_000;
-  const dexSlip = Math.max(0, p.usdcOut - p.usdcMin);
+  const outUsdt = p.usdcOut * rate(p.costs);
+  const dexSlip = Math.max(0, p.usdcOut - p.usdcMin) * rate(p.costs);
   const slippageUsd = cexSlip + dexSlip;
   // cost already includes the token fee implicitly: we paid for qty but only sell qty*(1-fee).
-  const net = p.usdcOut - plan.costUsd - p.gasUsd - slippageUsd - p.costs.safetyMarginUsd;
+  const net = outUsdt - plan.costUsd - p.gasUsd - slippageUsd - safetyUsd(p.costs, plan.costUsd);
   return {
     direction: 'CEX_BUY',
     sizeUsd: plan.costUsd,
@@ -147,7 +165,7 @@ export function evaluateCexBuy(p: {
     cexLimitPrice: plan.worst * (1 + p.costs.cexSlippageBps / 10_000),
     dexTokens: plan.tokensToSell,
     buyPrice,
-    sellPrice: p.usdcOut / plan.tokensToSell,
+    sellPrice: outUsdt / plan.tokensToSell,
     cexFeeUsd,
     gasUsd: p.gasUsd,
     slippageUsd,
@@ -204,13 +222,14 @@ export function evaluateTransfer(p: {
   const buyPrice = plan.costUsd / plan.qty;
   const cexFeeUsd = plan.qty * p.costs.takerFee * buyPrice;
   const withdrawFeeUsd = p.withdrawFeeTokens * buyPrice;
-  const slippageUsd = (plan.costUsd * p.costs.cexSlippageBps) / 10_000 + Math.max(0, p.usdcOut - p.usdcMin);
-  const driftUsd = (p.usdcOut * p.driftBps) / 10_000;
-  const net = p.usdcOut - plan.costUsd - p.gasUsd - slippageUsd - driftUsd - p.costs.safetyMarginUsd;
+  const outUsdt = p.usdcOut * rate(p.costs);
+  const slippageUsd = (plan.costUsd * p.costs.cexSlippageBps) / 10_000 + Math.max(0, p.usdcOut - p.usdcMin) * rate(p.costs);
+  const driftUsd = (outUsdt * p.driftBps) / 10_000;
+  const net = outUsdt - plan.costUsd - p.gasUsd - slippageUsd - driftUsd - safetyUsd(p.costs, plan.costUsd);
   return {
     arriving,
     buyPrice,
-    sellPrice: arriving > 0 ? p.usdcOut / arriving : 0,
+    sellPrice: arriving > 0 ? outUsdt / arriving : 0,
     cexFeeUsd,
     withdrawFeeUsd,
     slippageUsd,

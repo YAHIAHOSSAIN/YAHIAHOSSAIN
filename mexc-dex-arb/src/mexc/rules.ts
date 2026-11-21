@@ -20,6 +20,9 @@ export interface SymbolRules {
   maxNotional: number;
   orderTypes: string[];
   tradeSideType: number;
+  /** Per-symbol fees from exchangeInfo (most USDT pairs: taker 0.08%, some 0.20%, maker 0). */
+  takerFee?: number;
+  makerFee?: number;
   minNotionalMarket?: number;
   maxNotionalMarket?: number;
   /**
@@ -32,6 +35,11 @@ export interface SymbolRules {
 /** How far through the book an aggressive close may go: 2%, but stay well inside the symbol's price band. */
 export function aggressiveOffset(r: SymbolRules): number {
   return r.priceBand ? Math.min(0.02, r.priceBand * 0.5) : 0.02;
+}
+
+/** Taker fee to assume: the symbol's own fee, never below the configured override (MEXC_TAKER_FEE). */
+export function takerFeeFor(r: { takerFee?: number } | undefined, override: number): number {
+  return Math.max(override, r?.takerFee ?? 0);
 }
 
 /** Band used when exchangeInfo has no PERCENT_PRICE_BY_SIDE filter. */
@@ -68,6 +76,8 @@ export function rulesFrom(s: SymbolInfo): SymbolRules {
     maxNotional: Number(s.maxQuoteAmount) || Number.POSITIVE_INFINITY,
     orderTypes: s.orderTypes ?? ['LIMIT'],
     tradeSideType: Number(s.tradeSideType ?? 1),
+    takerFee: s.takerCommission !== undefined ? Number(s.takerCommission) : undefined,
+    makerFee: s.makerCommission !== undefined ? Number(s.makerCommission) : undefined,
     minNotionalMarket: s.quoteAmountPrecisionMarket !== undefined ? Number(s.quoteAmountPrecisionMarket) : undefined,
     maxNotionalMarket: s.maxQuoteAmountMarket !== undefined ? Number(s.maxQuoteAmountMarket) : undefined,
     priceBand: band(s),

@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { chainProfile } from './chains.js';
 
 export type Mode = 'live' | 'paper';
 export type AggregatorName = '0x' | '1inch';
@@ -26,6 +27,8 @@ export function loadConfig() {
   const strategy = str('STRATEGY', 'inventory').toLowerCase();
   if (strategy !== 'transfer' && strategy !== 'inventory') throw new Error('STRATEGY must be transfer or inventory');
   // Transfer mode needs a MEXC key that can WITHDRAW. That is off unless explicitly allowed.
+  const chain = chainProfile(str('CHAIN', 'ethereum'));
+  if (strategy === 'transfer' && chain.name !== 'ethereum') throw new Error('STRATEGY=transfer is only supported on CHAIN=ethereum');
   if (strategy === 'transfer' && str('ALLOW_WITHDRAWALS', 'no').toLowerCase() !== 'yes') {
     throw new Error('STRATEGY=transfer needs MEXC withdrawals; set ALLOW_WITHDRAWALS=yes only if you accept that risk');
   }
@@ -40,7 +43,11 @@ export function loadConfig() {
     // Private RPC for sending: never the public mempool.
     sendRpcUrl: str('SEND_RPC_URL', 'https://rpc.mevblocker.io'),
     privateKey: mode === 'live' ? str('PRIVATE_KEY') : str('PRIVATE_KEY', ''),
-    usdc: str('USDC_ADDRESS', '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48').toLowerCase(),
+    chain,
+    // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). STABLE_ADDRESS overrides the chain default.
+    usdc: str('STABLE_ADDRESS', str('USDC_ADDRESS', chain.stable.address)).toLowerCase(),
+    stableIsUsdt: chain.stable.symbol === 'USDT',
+    tickMs: num('TICK_MS', chain.tickMs ?? 0),
     // --- DEX aggregator ---
     aggregator,
     zeroExApiKey: str('ZEROX_API_KEY', ''),
@@ -48,7 +55,10 @@ export function loadConfig() {
     // --- MEXC ---
     mexcApiKey: mode === 'live' ? str('MEXC_API_KEY') : str('MEXC_API_KEY', ''),
     mexcApiSecret: mode === 'live' ? str('MEXC_API_SECRET') : str('MEXC_API_SECRET', ''),
+    // Override / floor only: the bot uses max(this, the symbol's own takerCommission from exchangeInfo).
     mexcTakerFee: num('MEXC_TAKER_FEE', 0.0005),
+    // USDCUSDT book older than this, or a rate outside 0.99-1.01: no trading.
+    stableRateMaxAgeMs: num('STABLE_RATE_MAX_AGE_MS', 30_000),
     // --- Telegram ---
     telegramToken: str('TELEGRAM_BOT_TOKEN', ''),
     telegramChatId: str('TELEGRAM_CHAT_ID', ''),
@@ -64,11 +74,16 @@ export function loadConfig() {
     minMexcVolumeUsd: num('MIN_MEXC_VOLUME_USD', 500_000),
     // --- Costs & thresholds ---
     // Must be small relative to MAX_TRADE_USD: $15 on a $50 trade would need a ~30% gap = only fake gaps pass.
-    minProfitUsd: num('MIN_PROFIT_USD', 2),
-    minProfitPct: num('MIN_PROFIT_PCT', 0.5), // percent of trade size
+    // need = max(MIN_PROFIT_USD, MIN_PROFIT_BPS of the size): mostly a percentage, with a small dollar floor.
+    minProfitUsd: num('MIN_PROFIT_USD', 0.25),
+    minProfitBps: num('MIN_PROFIT_BPS', 20),
     dexSlippageBps: num('DEX_SLIPPAGE_BPS', 30),
-    cexSlippageBps: num('CEX_SLIPPAGE_BPS', 20),
-    safetyMarginUsd: num('SAFETY_MARGIN_USD', 2),
+    // The MEXC book walk already uses the worst price reached; this is only a small extra cushion.
+    cexSlippageBps: num('CEX_SLIPPAGE_BPS', 5),
+    // safety = max(SAFETY_MARGIN_USD, SAFETY_MARGIN_BPS of the size)
+    safetyMarginUsd: num('SAFETY_MARGIN_USD', 0),
+    safetyMarginBps: num('SAFETY_MARGIN_BPS', 10),
+    // CAP on the priority fee. The tip actually used is the median of recent blocks' tips (eth_feeHistory).
     priorityFeeGwei: num('PRIORITY_FEE_GWEI', 1),
     // --- Risk limits ---
     maxTradeUsd: num('MAX_TRADE_USD', 50),
@@ -110,7 +125,9 @@ export function validateConfig(c: Config): Config {
   if (c.minProfitUsd > c.maxTradeUsd * 0.1) {
     errs.push(`MIN_PROFIT_USD=${c.minProfitUsd} is more than 10% of MAX_TRADE_USD=${c.maxTradeUsd}: only fake gaps could pass`);
   }
-  range('MIN_PROFIT_PCT', c.minProfitPct, 0, 100);
+  range('MIN_PROFIT_BPS', c.minProfitBps, 0, 10_000);
+  range('SAFETY_MARGIN_BPS', c.safetyMarginBps, 0, 1_000);
+  range('TICK_MS', c.tickMs, 0, 60_000);
   range('DEX_SLIPPAGE_BPS', c.dexSlippageBps, 1, 500);
   range('CEX_SLIPPAGE_BPS', c.cexSlippageBps, 0, 500);
   range('SAFETY_MARGIN_USD', c.safetyMarginUsd, 0, 1e6);

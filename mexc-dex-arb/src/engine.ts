@@ -19,7 +19,7 @@ import {
 } from './pricing.js';
 import { log, errMsg } from './log.js';
 import { AmbiguousRequestError } from './mexc/rest.js';
-import { bandProblem, closePrice, orderProblem } from './mexc/rules.js';
+import { bandProblem, closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
 import crypto from 'node:crypto';
 
 /** A close/unwind that only partly filled: `remaining` is what is still open. */
@@ -149,6 +149,8 @@ export interface EngineDeps {
   balances: (total?: boolean) => Promise<Balances>;
   tokens: Token[];
   sleep?: (ms: number) => Promise<void>;
+  /** Decimals of the DEX stable (read on-chain at startup; 6 for USDC, 18 for BSC USDT). */
+  stableDecimals?: number;
 }
 
 export interface Candidate {
@@ -183,11 +185,44 @@ export class Engine {
   private get taker() {
     return this.live ? this.d.chain.address : PAPER_TAKER;
   }
-  private costs() {
-    return { takerFee: this.cfg.mexcTakerFee, cexSlippageBps: this.cfg.cexSlippageBps, safetyMarginUsd: this.cfg.safetyMarginUsd };
+  /** USDT per 1 DEX stable (USDC). 1 on chains whose DEX stable is USDT. Refreshed every tick. */
+  stableRate = 1;
+  private get stableDec() {
+    return this.d.stableDecimals ?? USDC_DECIMALS;
+  }
+  /** Per-symbol taker fee (exchangeInfo), never below the MEXC_TAKER_FEE override. */
+  private fee(t: Token) {
+    return takerFeeFor(t.rules, this.cfg.mexcTakerFee);
+  }
+  private costs(t: Token) {
+    return {
+      takerFee: this.fee(t),
+      cexSlippageBps: this.cfg.cexSlippageBps,
+      safetyMarginUsd: this.cfg.safetyMarginUsd,
+      safetyMarginBps: this.cfg.safetyMarginBps,
+      stableInUsdt: this.stableRate,
+    };
   }
   private need(sizeUsd: number) {
-    return threshold(sizeUsd, this.cfg.minProfitUsd, this.cfg.minProfitPct);
+    return threshold(sizeUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
+  }
+
+  /**
+   * USDC is not USDT (MEXC USDCUSDT was ~1.0021). Read the live rate; refuse to trade on a stale or
+   * unreasonable one. Returns an error string, or null when the rate is usable.
+   */
+  async refreshStableRate(): Promise<string | null> {
+    if (this.cfg.stableIsUsdt) {
+      this.stableRate = 1;
+      return null;
+    }
+    const b = await this.d.book('USDCUSDT');
+    if (!b.bids.length || !b.asks.length) return 'USDCUSDT book empty';
+    if (Date.now() - b.ts > this.cfg.stableRateMaxAgeMs) return `USDCUSDT book is ${Math.round((Date.now() - b.ts) / 1000)}s old`;
+    const r = mid(b);
+    if (!(r >= 0.99 && r <= 1.01)) return `USDC/USDT rate ${r} outside 0.99-1.01`;
+    this.stableRate = r;
+    return null;
   }
 
   /** Log a status line only when it changes (avoids spamming every block). */
@@ -237,7 +272,10 @@ export class Engine {
     }
     this.note('gas', 'gas ok');
 
-    const ethUsd = mid(await this.d.book('ETHUSDT'));
+    const rateProblem = await this.refreshStableRate();
+    if (rateProblem) return this.note('stable', `no trading: ${rateProblem}`);
+    this.note('stable', 'stable rate ok');
+    const ethUsd = mid(await this.d.book(this.cfg.chain.nativeMexcSymbol));
     const bal = await this.d.balances();
     const books = new Map<string, Book>();
     const prices: Record<string, number> = {};
@@ -307,7 +345,7 @@ export class Engine {
     // DEX_BUY: USDC -> token on DEX, token -> USDT on MEXC.
     const sizeA = Math.floor(Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99) * 100) / 100;
     if (sizeA >= this.cfg.minTradeUsd) {
-      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(sizeA, USDC_DECIMALS), taker: this.taker, slippageBps };
+      const req = { sellToken: this.cfg.usdc, buyToken: t.address, sellAmount: toUnits(sizeA, this.stableDec), taker: this.taker, slippageBps };
       const q = await this.d.agg.price(req);
       const spender = this.spenderOf(q);
       const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
@@ -318,7 +356,7 @@ export class Engine {
         bids: b.bids,
         qtyStep: t.qtyStep,
         gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
-        costs: this.costs(),
+        costs: this.costs(t),
       });
       const problem = opp && orderProblem(t.rules, 'SELL', opp.cexQty, opp.cexLimitPrice);
       if (problem) this.note(`rule-${t.base}-A`, `${t.base} DEX_BUY skipped: MEXC would reject the sell (${problem})`);
@@ -328,7 +366,7 @@ export class Engine {
     // CEX_BUY: USDT -> token on MEXC, token -> USDC on DEX.
     const sizeB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
     if (sizeB >= this.cfg.minTradeUsd) {
-      const plan = planCexBuy({ sizeUsd: sizeB, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.cfg.mexcTakerFee });
+      const plan = planCexBuy({ sizeUsd: sizeB, asks: b.asks, qtyStep: t.qtyStep, takerFee: this.fee(t) });
       if (plan && plan.tokensToSell <= walTok) {
         const req = { sellToken: t.address, buyToken: this.cfg.usdc, sellAmount: toUnits(plan.tokensToSell, t.decimals), taker: this.taker, slippageBps };
         const q = await this.d.agg.price(req);
@@ -336,10 +374,10 @@ export class Engine {
         const approvalGas = this.live ? await this.d.chain.approvalGasNeeded(req.sellToken, spender, req.sellAmount) : 0n;
         const opp = evaluateCexBuy({
           plan,
-          usdcOut: toFloat(q.buyAmount, USDC_DECIMALS),
-          usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
+          usdcOut: toFloat(q.buyAmount, this.stableDec),
+          usdcMin: toFloat(q.minBuyAmount, this.stableDec),
           gasUsd: gasUsd(q.gas + approvalGas, gas.effective, ethUsd),
-          costs: this.costs(),
+          costs: this.costs(t),
         });
         const problem = orderProblem(t.rules, 'BUY', opp.cexQty, opp.cexLimitPrice);
         if (problem) this.note(`rule-${t.base}-B`, `${t.base} CEX_BUY skipped: MEXC would reject the buy (${problem})`);
@@ -423,18 +461,18 @@ export class Engine {
         bids: b.bids,
         qtyStep: t.qtyStep,
         gasUsd: g,
-        costs: this.costs(),
+        costs: this.costs(t),
       });
     } else {
       // Same quantity as quoted on the DEX, priced against the fresh MEXC book.
-      const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.cfg.mexcTakerFee);
+      const plan = planCexBuyQty(b.asks, c.opp.cexQty, this.fee(t));
       opp = plan
         ? evaluateCexBuy({
             plan,
-            usdcOut: toFloat(firm.buyAmount, USDC_DECIMALS),
-            usdcMin: toFloat(firm.minBuyAmount, USDC_DECIMALS),
+            usdcOut: toFloat(firm.buyAmount, this.stableDec),
+            usdcMin: toFloat(firm.minBuyAmount, this.stableDec),
             gasUsd: g,
-            costs: this.costs(),
+            costs: this.costs(t),
           })
         : null;
     }
@@ -494,7 +532,7 @@ export class Engine {
           `NOT unwinding automatically. Trading PAUSED.\nDo NOT hedge by hand until the nonce is consumed - the bot will alert you. (/cancelnonce replaces it.)`,
       );
     }
-    const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.cfg.mexcTakerFee, t.qtyStep);
+    const unwind = cexUnknown || dex.unknown ? null : unwindPlan(opp.direction, dex.ok, opp.cexQty, cexFilled, this.fee(t), t.qtyStep);
     if (cexUnknown || dex.unknown) {
       status = 'one_sided';
       notes.push('pnl unknown'); // the measured balance change may not include the final outcome yet
@@ -528,7 +566,7 @@ export class Engine {
     //    Orders are closed (filled/cancelled) by now; free + locked balances avoid counting held funds as lost.
     const { balances: after, stable } = await this.stableBalances(t, c.tokenUsd, ethUsd);
     if (!stable) notes.push('pnl approximate (balances still changing after 15 s)');
-    const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd) - portfolioUsd(before, t, c.tokenUsd, ethUsd);
+    const pnl = portfolioUsd(after, t, c.tokenUsd, ethUsd, this.stableRate) - portfolioUsd(before, t, c.tokenUsd, ethUsd, this.stableRate);
     const gasPaid = (Number(dex.gasCostWei + approvalCostWei) / 1e18) * ethUsd;
     this.d.db.updateTrade(tradeId, {
       status,
@@ -564,7 +602,7 @@ export class Engine {
     for (let i = 0; i < 6; i++) {
       await this.sleep(2500);
       const cur = await this.d.balances(true);
-      if (Math.abs(portfolioUsd(cur, t, tokenUsd, ethUsd) - portfolioUsd(prev, t, tokenUsd, ethUsd)) < 1e-6) return { balances: cur, stable: true };
+      if (Math.abs(portfolioUsd(cur, t, tokenUsd, ethUsd, this.stableRate) - portfolioUsd(prev, t, tokenUsd, ethUsd, this.stableRate)) < 1e-6) return { balances: cur, stable: true };
       prev = cur;
     }
     return { balances: prev, stable: false };

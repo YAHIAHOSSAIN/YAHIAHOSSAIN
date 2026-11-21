@@ -25,6 +25,8 @@ export interface SymbolInfo {
   maxQuoteAmountMarket?: string;
   filters?: { filterType: string; bidMultiplierUp?: string; askMultiplierDown?: string }[];
   tradeSideType?: number; // 1 all, 2 buy only, 3 sell only, 4 close only
+  takerCommission?: string; // per-symbol default fee, e.g. "0.0008"
+  makerCommission?: string;
 }
 export interface CoinNetwork {
   coin: string;

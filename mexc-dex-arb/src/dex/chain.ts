@@ -15,6 +15,16 @@ const APPROVE_GAS = 60_000n;
 export type { GasInfo, TxResult } from './txsender.js';
 import { type GasInfo, type KeyValue, type TxResult, TxSender } from './txsender.js';
 
+/** Median of recent per-block p50 tips, capped; at least 0.001 gwei so a builder still includes the tx. */
+export function pickTip(rewards: bigint[], cap: bigint): bigint {
+  const floor = 1_000_000n; // 0.001 gwei
+  if (!rewards.length) return cap;
+  const sorted = [...rewards].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const t = median < floor ? floor : median;
+  return t > cap ? cap : t;
+}
+
 export class Chain {
   readonly provider: ethers.JsonRpcProvider;
   readonly sendProvider: ethers.JsonRpcProvider;
@@ -24,9 +34,16 @@ export class Chain {
   readonly tx: TxSender;
 
   /** `unresolvedStore` persists the unresolved-tx record (SQLite state) so a restart does not forget it. */
-  constructor(rpcUrl: string, sendRpcUrl: string, privateKey: string, private priorityFeeGwei: number, unresolvedStore?: KeyValue) {
-    this.provider = new ethers.JsonRpcProvider(rpcUrl, 1, { staticNetwork: true });
-    this.sendProvider = new ethers.JsonRpcProvider(sendRpcUrl, 1, { staticNetwork: true });
+  constructor(
+    rpcUrl: string,
+    sendRpcUrl: string,
+    privateKey: string,
+    private priorityFeeGwei: number,
+    unresolvedStore?: KeyValue,
+    readonly chainId = 1,
+  ) {
+    this.provider = new ethers.JsonRpcProvider(rpcUrl, chainId, { staticNetwork: true });
+    this.sendProvider = new ethers.JsonRpcProvider(sendRpcUrl, chainId, { staticNetwork: true });
     if (privateKey) this.wallet = new ethers.Wallet(privateKey, this.provider);
     const chain = this; // eslint-disable-line @typescript-eslint/no-this-alias
     this.tx = new TxSender(
@@ -38,7 +55,7 @@ export class Chain {
         receipt: (h) => this.provider.getTransactionReceipt(h),
         knowsTx: async (h) => Boolean((await this.provider.getTransaction(h).catch(() => null)) ?? (await this.sendProvider.getTransaction(h).catch(() => null))),
         sign: async (t) => {
-          const raw = await this.wallet!.signTransaction({ chainId: 1n, type: 2, ...t });
+          const raw = await this.wallet!.signTransaction({ chainId: BigInt(chainId), type: 2, ...t });
           return { raw, hash: ethers.keccak256(raw) };
         },
         broadcast: async (raw) => {
@@ -107,7 +124,16 @@ export class Chain {
   async gas(): Promise<GasInfo> {
     const block = await this.provider.getBlock('latest');
     const baseFee = block?.baseFeePerGas ?? 0n;
-    const tip = ethers.parseUnits(String(this.priorityFeeGwei), 'gwei');
+    const cap = ethers.parseUnits(String(this.priorityFeeGwei), 'gwei');
+    // Tip = median (p50) of the last 20 blocks' tips, capped by PRIORITY_FEE_GWEI. A fixed 1 gwei was
+    // 2-7x the whole base fee on mainnet (base fee ~0.15 gwei), i.e. most of the gas cost.
+    let tip = cap;
+    try {
+      const h = (await this.provider.send('eth_feeHistory', ['0x14', 'latest', [50]])) as { reward?: string[][] };
+      tip = pickTip((h.reward ?? []).map((r) => BigInt(r[0])), cap);
+    } catch {
+      // keep the cap
+    }
     return { baseFee, tip, effective: baseFee + tip, maxFee: baseFee * 2n + tip };
   }
 

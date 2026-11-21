@@ -99,12 +99,19 @@ async function main() {
   const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei, {
     get: () => db.getState('unresolved_tx') || undefined,
     set: (v) => db.setState('unresolved_tx', v ?? ''),
-  });
-  const agg: Aggregator = cfg.aggregator === '0x' ? new ZeroEx(cfg.zeroExApiKey) : new OneInch(cfg.oneInchApiKey);
+  }, cfg.chain.chainId);
+  const agg: Aggregator =
+    cfg.aggregator === '0x' ? new ZeroEx(cfg.zeroExApiKey, fetch, cfg.chain.chainId) : new OneInch(cfg.oneInchApiKey, fetch, cfg.chain.chainId);
 
   // --- Pre-flight checks: fail at startup, not in the middle of the first trade ---
   const chainId = BigInt(await chain.provider.send('eth_chainId', []));
-  if (chainId !== 1n) throw new Error(`RPC_URL is chain ${chainId}, expected Ethereum mainnet (1)`);
+  if (chainId !== BigInt(cfg.chain.chainId)) {
+    throw new Error(`RPC_URL is chain ${chainId}, but CHAIN=${cfg.chain.name} needs ${cfg.chain.chainId}`);
+  }
+  const sendId = BigInt(await chain.sendProvider.send('eth_chainId', []));
+  if (sendId !== BigInt(cfg.chain.chainId)) throw new Error(`SEND_RPC_URL is chain ${sendId}, expected ${cfg.chain.chainId}`);
+  const stableDecimals = await chain.decimals(cfg.usdc);
+  log.info(`chain ${cfg.chain.name} (${cfg.chain.chainId}), DEX stable ${cfg.chain.stable.symbol} ${cfg.usdc} (${stableDecimals} decimals)`);
   if (!cfg.mexcApiKey || !cfg.mexcApiSecret) {
     // Coin/network info (contract addresses, deposit/withdraw status) is a signed MEXC endpoint.
     throw new Error('MEXC_API_KEY/SECRET are required even in paper mode (a read-only key is enough for paper)');
@@ -114,8 +121,8 @@ async function main() {
   // Aggregator key and route smoke test: quote 100 USDC -> WETH.
   await agg.price({
     sellToken: cfg.usdc,
-    buyToken: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
-    sellAmount: 100_000_000n,
+    buyToken: cfg.chain.wrappedNative,
+    sellAmount: 100n * 10n ** BigInt(stableDecimals),
     taker: chain.wallet?.address ?? '0x000000000000000000000000000000000000dEaD',
     slippageBps: cfg.dexSlippageBps,
   });
@@ -148,6 +155,7 @@ async function main() {
   if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg);
 
   const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
+    chain: cfg.chain,
     only: cfg.watchlist,
     max: cfg.watchlistMax,
     minTvlUsd: cfg.minDexTvlUsd,
@@ -156,14 +164,14 @@ async function main() {
   if (tokens.length === 0) throw new Error('Watchlist is empty: no token passed the filters');
   log.info(`watchlist: ${tokens.map((t) => `${t.base}(${t.address.slice(0, 8)}…, tvl $${Math.round(t.dexTvlUsd / 1000)}k)`).join(', ')}`);
 
-  const stream = new MexcBookStream(['ETHUSDT', ...tokens.map((t) => t.symbol)]);
+  const stream = new MexcBookStream([cfg.chain.nativeMexcSymbol, 'USDCUSDT', ...tokens.map((t) => t.symbol)]);
   stream.start();
   const book = async (symbol: string) => stream.get(symbol) ?? mexc.depth(symbol, 20);
   const balances =
-    cfg.mode === 'live' ? (total?: boolean) => snapshot(chain, mexc, cfg.usdc, tokens, total) : async () => paperBalances(tokens);
+    cfg.mode === 'live' ? (total?: boolean) => snapshot(chain, mexc, cfg.usdc, tokens, total, stableDecimals) : async () => paperBalances(tokens);
 
   const freshBook = (symbol: string) => mexc.depth(symbol, 20);
-  const engine = new Engine({ cfg, mexc, chain, agg, db, risk, tg, book, freshBook, balances, tokens });
+  const engine = new Engine({ cfg, mexc, chain, agg, db, risk, tg, book, freshBook, balances, tokens, stableDecimals });
 
   // --- Telegram commands ---
   const statusText = async () => {
@@ -221,7 +229,12 @@ async function main() {
       busy = lifecycle.busy = false;
     }
   };
-  chain.provider.on('block', runTick);
+  if (cfg.tickMs > 0) {
+    // Fast chains (Base 200 ms blocks): scan on a timer; runTick never overlaps itself (busy flag).
+    setInterval(() => void runTick(), cfg.tickMs);
+  } else {
+    chain.provider.on('block', runTick);
+  }
   // Watchdog: if the RPC stops emitting blocks, still scan on a timer, and alert once per hour.
   setInterval(() => {
     const idle = Date.now() - lastTick;
@@ -235,7 +248,7 @@ async function main() {
   // MEXC deposit/withdraw status every 10 minutes.
   setInterval(async () => {
     try {
-      const changed = await refreshStatus(mexc, tokens);
+      const changed = await refreshStatus(mexc, tokens, cfg.chain);
       if (changed.length) await tg.send(`ℹ️ MEXC network status changed:\n${changed.join('\n')}`);
     } catch (e) {
       log.warn(`status refresh: ${errMsg(e)}`);

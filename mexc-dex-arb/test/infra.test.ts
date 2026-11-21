@@ -130,7 +130,7 @@ test('config validation rejects dangerous values', () => {
   process.env.MODE = 'paper';
   const ok = loadConfig();
   assert.doesNotThrow(() => validateConfig(ok));
-  assert.throws(() => validateConfig({ ...ok, minProfitPct: -1 }), /MIN_PROFIT_PCT/);
+  assert.throws(() => validateConfig({ ...ok, minProfitBps: -1 }), /MIN_PROFIT_BPS/);
   assert.throws(() => validateConfig({ ...ok, dexSlippageBps: 20_000 }), /DEX_SLIPPAGE_BPS/);
   assert.throws(() => validateConfig({ ...ok, minTradeUsd: 500, maxTradeUsd: 200 }), /MIN_TRADE_USD/);
 });

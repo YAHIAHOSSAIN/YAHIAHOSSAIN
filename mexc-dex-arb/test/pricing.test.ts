@@ -26,9 +26,11 @@ test('fillBase / fillQuote walk the book', () => {
   assert.equal(fillQuote(asks, 1000), null);
 });
 
-test('threshold = max($15, 0.5% of size)', () => {
-  assert.equal(threshold(200, 15, 0.5), 15);
-  assert.equal(threshold(10_000, 15, 0.5), 50);
+test('threshold = max(USD floor, bps of size)', () => {
+  assert.equal(threshold(200, 15, 50), 15);
+  assert.equal(threshold(10_000, 15, 50), 50);
+  assert.equal(threshold(100, 0.25, 20), 0.25);
+  assert.equal(threshold(500, 0.25, 20), 1);
 });
 
 test('evaluateDexBuy: sells only what the DEX guarantees, every cost subtracted', () => {
