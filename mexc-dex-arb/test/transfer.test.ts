@@ -56,6 +56,11 @@ function setup(
     depthMaxImpactBps?: number; // DEPTH_MAX_IMPACT_BPS knob (default 70 = 0.7%)
     depthMaxSizePct?: number; // DEPTH_MAX_SIZE_PCT knob (default 1)
     dexPricesFn?: (addrs: string[]) => Promise<Map<string, { price: number; tvl: number; vol24h: number }>>; // override the fake DexScreener lookup
+    dexArbEnabled?: boolean; // DEX_ARB_ENABLED knob for this engine (default off; the transfer tick runs its own DEX-DEX scan when on)
+    checkUnresolved?: () => Promise<{ state: 'clear' | 'pending'; dropped?: boolean }>; // fake chain checkUnresolved (default: none = clear)
+    decimalsThrows?: boolean; // fake chain.decimals throws (DEX-ARB per-token skip test)
+    decimalsCalls?: string[]; // records every chain.decimals address (DEX-ARB retry test)
+    bookTickers?: Map<string, { bid: number; ask: number }>; // override the fake MEXC book tickers (stable-rate test)
     rand?: () => number; // random source for the per-tick trade size (default Math.random)
     scanExactQuotes?: number; // SCAN_EXACT_QUOTES knob for this engine (default 5)
     transferUniverseMax?: number; // TRANSFER_UNIVERSE_MAX knob for this engine (default 0 = no cap)
@@ -78,7 +83,7 @@ function setup(
   process.env.QUOTE_RPS_VELORA = '1'; // pin the code defaults (a VPS .env value cannot leak in)
   process.env.QUOTE_RPS_OPENOCEAN = '2';
   process.env.REBALANCE_LOW_X = '1'; // pin the Phase-4 knobs to their code defaults
-  process.env.DEX_ARB_ENABLED = 'no'; // (transfer never runs the DEX-DEX scan, but the config must be stable)
+  process.env.DEX_ARB_ENABLED = o.dexArbEnabled ? 'yes' : 'no'; // Phase 4: the transfer tick runs its own DEX-DEX scan when on
   process.env.MIN_PROFIT_USD = '15';
   // Pin the transfer knobs to their defaults: config.ts loads dotenv, so a
   // VPS .env that sets them (e.g. MIN_DEX_VOLUME_USD=10000 for the live
@@ -153,7 +158,7 @@ function setup(
       const norm = (h: string) => h.toLowerCase().replace(/^0x/, '');
       return state.deposits.find((d) => norm(d.txId) === norm(txId)) ? { txId, status: 1, amount: '0' } : null;
     },
-    bookTickers: async () => new Map([['XYZUSDT', { bid: 0.999, ask: 1.0 }], ['ETHUSDT', { bid: 2000, ask: 2000 }], ['BNBUSDT', { bid: 900, ask: 900 }], ['USDCUSDT', { bid: 1, ask: 1 }], ...extra.map((t) => [`${t.base}USDT`, { bid: 0.999, ask: 1.0 }] as const)]),
+    bookTickers: async () => o.bookTickers ?? new Map([['XYZUSDT', { bid: 0.999, ask: 1.0 }], ['ETHUSDT', { bid: 2000, ask: 2000 }], ['BNBUSDT', { bid: 900, ask: 900 }], ['USDCUSDT', { bid: 1, ask: 1 }], ...extra.map((t) => [`${t.base}USDT`, { bid: 0.999, ask: 1.0 }] as const)]),
     depth: async () => {
       if (o.depthThrows) throw new Error('depth down');
       return { bids: [[0.999, 1e6]], asks: o.depthAsks ?? [[1.0, 1e6]], ts: Date.now() };
@@ -229,7 +234,12 @@ function setup(
   const chain: TransferChain = {
     address: '0xMyWallet',
     gas: async () => ({ baseFee: 9n * GWEI, tip: GWEI, effective: 10n * GWEI, maxFee: 19n * GWEI }),
-    decimals: async () => 18,
+    decimals: async (addr) => {
+      o.decimalsCalls?.push(addr);
+      if (o.decimalsThrows) throw new Error('decimals down');
+      return 18;
+    },
+    ...(o.checkUnresolved ? { checkUnresolved: o.checkUnresolved } : {}),
     tokenBalance: async (t) => state.wallet[t] ?? 0n,
     ethBalance: async () => 1n * 10n ** 18n, // 1 ETH: the Phase 8 gas-reserve check passes
     approveExact: async (_t, s, amount) => {
@@ -1366,4 +1376,319 @@ test('Phase 9: paper mode never has winners (paper PnL is simulated, not live)',
   await engine.refreshUniverse(true);
   assert.deepEqual(engine.winners, []);
   assert.deepEqual(engine.universe.map((t) => t.base), ['XYZ', 'ABC']); // no cap, both in — no pinning needed
+});
+
+// ---------------- Phase 4: DEX-DEX detection in the transfer tick ----------------
+// Live bots run STRATEGY=transfer, so the inventory engine's scanDexArbTick
+// never runs live — the transfer tick runs its own copy (see src/transfer.ts
+// scanDexArbTick). Detection only: rows are recorded, nothing is ever traded,
+// sent, or approved.
+const dexArbRows = (db: Db) =>
+  db.all<{ token: string; direction: string; size_usd: number | null; aggregator: string | null; dex_out: number | null; gross_bps: number | null; gas_usd: number | null; net_usd: number | null; hurdle_usd: number | null; decision: string; reason: string | null }>(
+    "SELECT * FROM opportunities WHERE direction = 'DEX_ARB'",
+  );
+
+// Direction-aware fake aggregator for the detection scan: the buy leg
+// (stable -> token) pays buyPx per token, the sell leg (token -> stable)
+// pays sellPx. `seen` records every priced token (buy or sell leg) so the
+// rotation test can tell which tokens were scanned. quote() delegates to
+// price() — the transfer's firm quote only runs when a real transfer starts.
+const arbAgg = (buyPx: number, sellPx: number, seen: string[]): Aggregator => {
+  const price = async (r: QuoteRequest): Promise<Quote> => {
+    if (r.sellToken === USDC) {
+      seen.push(`buy:${r.buyToken}`);
+      const tokens = (r.sellAmount * 10n ** 18n) / BigInt(Math.round(buyPx * 1e6));
+      return { buyAmount: tokens, minBuyAmount: tokens, gas: 150_000n, spender: '0xspender' };
+    }
+    seen.push(`sell:${r.sellToken}`);
+    const out = (r.sellAmount * BigInt(Math.round(sellPx * 1e6))) / 10n ** 18n;
+    return { buyAmount: out, minBuyAmount: out, gas: 150_000n, spender: '0xspender' };
+  };
+  return { name: 'test-arb', price, quote: price };
+};
+
+test('DEX-ARB disabled: the scan never runs (counting agg)', async () => {
+  // No CEX gap (dexPrice 1.0), so the only quotes this tick could spend are
+  // the detection scan's. With the flag off, the aggregator is never called
+  // and no DEX_ARB rows are recorded.
+  const seen: string[] = [];
+  const { engine, db } = setup({ dexPrice: 1.0, agg: arbAgg(10, 10, seen) });
+  await engine.tick();
+  assert.deepEqual(seen, []);
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB enabled, flat market: below_hurdle row with the engine fields', async () => {
+  // Buy $200 of XYZ at $10 (20 XYZ), sell 20 XYZ at $10 ($200). Gas $3/leg,
+  // so net is -$6 against the $15 hurdle: below_hurdle, with the same fields
+  // the inventory engine records (size, aggregator, dex_out, gross, gas,
+  // net, hurdle) and the same reason text.
+  const seen: string[] = [];
+  const { engine, db, calls } = setup({ dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 10, seen) });
+  await engine.tick();
+  assert.equal(seen.length, 2); // buy leg + sell leg, nothing else
+  const rows = dexArbRows(db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].token, 'XYZ');
+  assert.equal(rows[0].decision, 'below_hurdle');
+  assert.match(rows[0].reason ?? '', /dex-arb detection only — no execution/);
+  assert.equal(rows[0].size_usd, 200);
+  assert.equal(rows[0].aggregator, 'test-arb');
+  assert.equal(rows[0].dex_out, 20);
+  assert.equal(rows[0].gross_bps, 0);
+  assert.equal(rows[0].gas_usd, 6);
+  assert.equal(rows[0].net_usd, -6);
+  assert.equal(rows[0].hurdle_usd, 15);
+  // Detection only: no transfer started, nothing was sent or withdrawn.
+  assert.equal(db.openTransfers().length, 0);
+  assert.ok(!calls.includes('send'));
+  assert.ok(!calls.some((c) => c.startsWith('withdraw')));
+});
+
+test('DEX-ARB enabled with a real spread: recorded as trade, nothing executed', async () => {
+  // Buy $200 at $10 (20 XYZ), sell 20 XYZ at $11.50 ($230). Gas $3/leg,
+  // net $24 > hurdle $15: decision 'trade' — which here means "net beat
+  // the hurdle", NOT that a trade was made.
+  const seen: string[] = [];
+  const { engine, db, calls } = setup({ dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 11.5, seen) });
+  await engine.tick();
+  const rows = dexArbRows(db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].decision, 'trade');
+  assert.equal(rows[0].reason, 'dex-arb detection only — no execution');
+  assert.equal(rows[0].net_usd, 24);
+  assert.equal(rows[0].gross_bps, 1500);
+  assert.equal(rows[0].size_usd, 200);
+  assert.equal(db.openTransfers().length, 0);
+  assert.ok(!calls.includes('send'));
+  assert.ok(!calls.some((c) => c.startsWith('withdraw')));
+});
+
+test('DEX-ARB runs on the main path too (paper mode, real CEX gap)', async () => {
+  // A passing CEX gap: the tick evaluates, finds the candidate, runs the
+  // detection scan (main path, after evaluation), then records the paper
+  // trade. Both the paper trade and the DEX_ARB row land.
+  const seen: string[] = [];
+  const { engine, db } = setup({ mode: 'paper', dexArbEnabled: true, dexPrice: 1.15, agg: arbAgg(10, 11.5, seen) });
+  await engine.tick();
+  const rows = dexArbRows(db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].decision, 'trade');
+  assert.equal(db.all('SELECT * FROM trades').length, 1);
+});
+
+test('DEX-ARB runs while a transfer is open (open-blocked tick)', async () => {
+  // Tick 1 starts a transfer (CEX gap passes, sell leg $10 vs MEXC $1);
+  // tick 2 finds it still open (withdrawal pending) and blocks new trades —
+  // but the detection scan still runs, so a second DEX_ARB row lands.
+  const seen: string[] = [];
+  const { engine, db } = setup({ dexArbEnabled: true, agg: arbAgg(10, 10, seen) });
+  await engine.tick();
+  assert.equal(db.openTransfers().length, 1);
+  assert.equal(dexArbRows(db).length, 1);
+  await engine.tick();
+  assert.equal(db.openTransfers().length, 1); // still open, withdrawal pending
+  assert.equal(dexArbRows(db).length, 2);
+});
+
+test('DEX-ARB does NOT run on an open-blocked tick when gas is over the limit (audit round 2, N1)', async () => {
+  // The gas gate sits above the open-blocked branch (same order as the
+  // inventory engine): a high-gas tick never spends quotes on detection,
+  // even while a transfer is open. Tick 1 (normal gas) starts the transfer
+  // and scans once; tick 2 runs on a second engine over the same DB with
+  // MAX_GAS_GWEI=5 (fake gas is 10 gwei) and must scan nothing.
+  const seen: string[] = [];
+  const db = new Db(':memory:');
+  const first = setup({ db, dexArbEnabled: true, agg: arbAgg(10, 10, seen) });
+  await first.engine.tick();
+  assert.equal(db.openTransfers().length, 1);
+  assert.equal(dexArbRows(db).length, 1);
+  // Tick 1 also took a CEX evaluation quote through the shared fake agg, so
+  // snapshot its count rather than assuming the scan's 2 legs alone.
+  const seenAfterTick1 = seen.length;
+  process.env.MAX_GAS_GWEI = '5';
+  try {
+    const second = setup({ db, dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 10, seen) });
+    await second.engine.tick();
+  } finally {
+    delete process.env.MAX_GAS_GWEI;
+  }
+  assert.equal(seen.length, seenAfterTick1); // tick 2 priced nothing
+  assert.equal(dexArbRows(db).length, 1); // no new row from tick 2
+});
+
+test('DEX-ARB runs when MEXC USDT is too low for a trade (cap-null tick)', async () => {
+  // A CEX gap exists but USDT is $0, so no trade can start — the detection
+  // scan does not need MEXC USDT, so it still runs.
+  const seen: string[] = [];
+  const { engine, db, state } = setup({ dexArbEnabled: true, dexPrice: 1.15, agg: arbAgg(10, 10, seen) });
+  state.mexc.USDT = 0;
+  await engine.tick();
+  assert.equal(dexArbRows(db).length, 1);
+  assert.equal(db.openTransfers().length, 0);
+});
+
+test('DEX-ARB rotation: the window advances across ticks and covers the universe', async () => {
+  // 8 tokens, 5 scanned per tick: tick 1 covers 5, tick 2 covers the other
+  // 3 plus 2 repeats — the union is all 8, and the second window differs
+  // from the first (the cursor advances instead of re-scanning the same
+  // first tokens every tick).
+  const extras = [1, 2, 3, 4, 5, 6, 7].map((i) => ({
+    base: `TK${String.fromCharCode(64 + i)}`,
+    contract: `0x400000000000000000000000000000000000000${i}`,
+  }));
+  const seen: string[] = [];
+  const { engine, db } = setup({
+    dexArbEnabled: true,
+    dexPrice: 1.0,
+    extraTokens: extras,
+    agg: arbAgg(10, 10, seen),
+    dexPricesFn: async (addrs: string[]) => new Map(addrs.map((a) => [a, { price: 1, tvl: 1e6, vol24h: 1e6 }])),
+  });
+  const distinct = (calls: string[]) => new Set(calls.map((s) => s.split(':')[1]));
+  await engine.tick();
+  assert.equal(dexArbRows(db).length, 5);
+  assert.equal(distinct(seen).size, 5);
+  const firstWindow = new Set(distinct(seen));
+  await engine.tick();
+  assert.equal(dexArbRows(db).length, 10);
+  assert.equal(distinct(seen).size, 8);
+  // Tick 2 priced 10 more legs (5 tokens); its window is not tick 1's window.
+  const secondWindow = new Set(seen.slice(10).map((s) => s.split(':')[1]));
+  assert.equal(secondWindow.size, 5);
+  assert.notDeepEqual(secondWindow, firstWindow);
+});
+
+// Audit round 1, finding 6: the early returns that skip detection must stay
+// skipped (same gates as the inventory engine), and the scan's own failure
+// modes must not crash the tick or write a row.
+test('DEX-ARB does NOT run on a risk-blocked tick (paused)', async () => {
+  const seen: string[] = [];
+  const db = new Db(':memory:');
+  db.setState('paused', '1');
+  db.setState('pause_reason', 'test pause');
+  const { engine } = setup({ db, dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 10, seen) });
+  await engine.tick();
+  assert.equal(seen.length, 0);
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB does NOT run on a gas-blocked tick', async () => {
+  // Fake gas is 10 gwei; MAX_GAS_GWEI=5 blocks new trades before the scan.
+  const seen: string[] = [];
+  process.env.MAX_GAS_GWEI = '5';
+  try {
+    const { engine, db } = setup({ dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 10, seen) });
+    await engine.tick();
+    assert.equal(seen.length, 0);
+    assert.equal(dexArbRows(db).length, 0);
+  } finally {
+    delete process.env.MAX_GAS_GWEI;
+  }
+});
+
+test('DEX-ARB does NOT run while an earlier DEX tx is unresolved', async () => {
+  const seen: string[] = [];
+  const { engine, db } = setup({
+    dexArbEnabled: true,
+    dexPrice: 1.0,
+    agg: arbAgg(10, 10, seen),
+    checkUnresolved: async () => ({ state: 'pending' as const }),
+  });
+  await engine.tick();
+  assert.equal(seen.length, 0);
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB does NOT run when the USDC/USDT peg check fails', async () => {
+  const seen: string[] = [];
+  const { engine, db } = setup({
+    dexArbEnabled: true,
+    dexPrice: 1.0,
+    agg: arbAgg(10, 10, seen),
+    bookTickers: new Map([
+      ['ETHUSDT', { bid: 2000, ask: 2000 }],
+      ['USDCUSDT', { bid: 0.5, ask: 0.5 }], // peg broken: the tick returns before any scan
+      ['XYZUSDT', { bid: 0.999, ask: 1.0 }],
+    ]),
+  });
+  await engine.tick();
+  assert.equal(seen.length, 0);
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB skips a token whose decimals lookup fails (no crash, no row)', async () => {
+  const seen: string[] = [];
+  const { engine, db } = setup({ dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 10, seen), decimalsThrows: true });
+  await engine.tick();
+  assert.equal(seen.length, 0);
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB retries a decimals-failed window next tick (audit round 3, N5)', async () => {
+  // N2's fix: the cursor advances by the tokens actually scanned, so a
+  // window that all failed decimals is retried next tick instead of being
+  // skipped for a full rotation. 8 tokens, 5 per window: tick 1 calls
+  // decimals for the first window's 5; tick 2 (still failing) must call
+  // decimals for the SAME 5 — with the old advance-by-window-size the
+  // second window would be a different 5.
+  const extras = [1, 2, 3, 4, 5, 6, 7].map((i) => ({
+    base: `TK${String.fromCharCode(64 + i)}`,
+    contract: `0x400000000000000000000000000000000000000${i}`,
+  }));
+  const calls: string[] = [];
+  const { engine, db } = setup({
+    dexArbEnabled: true,
+    dexPrice: 1.0,
+    extraTokens: extras,
+    agg: arbAgg(10, 10, []),
+    dexPricesFn: async (addrs: string[]) => new Map(addrs.map((a) => [a, { price: 1, tvl: 1e6, vol24h: 1e6 }])),
+    decimalsThrows: true,
+    decimalsCalls: calls,
+  });
+  await engine.tick();
+  assert.equal(calls.length, 5);
+  assert.equal(dexArbRows(db).length, 0);
+  await engine.tick();
+  assert.equal(calls.length, 10);
+  assert.deepEqual(new Set(calls.slice(5)), new Set(calls.slice(0, 5))); // same window retried
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB survives a failing opportunities write (scan error cannot kill the tick)', async () => {
+  // The DEX-ARB write is wrapped in the scan (log.warn); a DB failure must
+  // not propagate out of the tick — the scan still priced the token's legs.
+  const seen: string[] = [];
+  const db = new Db(':memory:');
+  const orig = db.insertOpportunities.bind(db);
+  db.insertOpportunities = (rows) => {
+    if (rows.some((r) => r.direction === 'DEX_ARB')) throw new Error('db down');
+    return orig(rows);
+  };
+  const { engine } = setup({ db, dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 10, seen) });
+  await engine.tick(); // must resolve, not throw
+  assert.equal(seen.length, 2); // both legs were priced before the write failed
+  assert.equal(dexArbRows(db).length, 0); // the write failed, so no row landed
+});
+
+test('DEX-ARB with an empty universe records nothing (no crash)', async () => {
+  // MIN_DEX_VOLUME_USD far above the fake volume drops every token.
+  const seen: string[] = [];
+  const { engine, db } = setup({ dexArbEnabled: true, dexPrice: 1.0, agg: arbAgg(10, 10, seen), minDexVolumeUsd: 1e9 });
+  await engine.tick();
+  assert.equal(seen.length, 0);
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB with no TVL-known tokens records nothing (no quote spent)', async () => {
+  const seen: string[] = [];
+  const { engine, db } = setup({
+    dexArbEnabled: true,
+    dexPrice: 1.0,
+    agg: arbAgg(10, 10, seen),
+    dexPricesFn: async () => new Map(),
+  });
+  await engine.tick();
+  assert.equal(seen.length, 0);
+  assert.equal(dexArbRows(db).length, 0);
 });

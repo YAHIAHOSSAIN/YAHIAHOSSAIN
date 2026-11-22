@@ -21,7 +21,7 @@ module.exports = {
         DB_PATH: 'data/ethereum-live.sqlite',
         PAPER_DB_PATH: 'data/ethereum.sqlite',
         MAX_TRADE_USD: '500', // owner decision 2026-11-23: $300 -> $500 (ladder caps at $500; MIN $100, gap 2%, loss floor unchanged)
-        MIN_TRADE_USD: '100', // random size $100–300 per trade (owner decision 2026-11-22)
+        MIN_TRADE_USD: '100', // depth ladder $100–500 per trade; random size only for unknown-TVL pools
         TRANSFER_DRIFT_BPS: '100', // drift reserve 1.5% -> 1.0% (owner decision 2026-11-22)
         UNLIMITED_APPROVAL: 'yes', // owner decision 2026-11-21: approve MaxUint256 once per token, skip the approve tx on later sales (~12s saved per sale). Risk accepted: a compromised spender could drain the token balance.
         // Live watchlist (owner decision 2026-11-22): 100 tokens by volume — MEXC 24h vol >= $10k

@@ -80,8 +80,10 @@ export function loadConfig() {
       velora: num('QUOTE_RPS_VELORA', 1),
       openocean: num('QUOTE_RPS_OPENOCEAN', 2),
     },
-    // Multi-size quoting: base size = BASE_TRADE_USD (default MAX_TRADE_USD/2); 0.5x and 2x are tried when the
-    // base-size gross gap reaches MULTISIZE_TRIGGER of the hurdle.
+    // Multi-size quoting: known pools use the depth ladder (100%/75%/50% of
+    // depthSafeSize, largest first); BASE_TRADE_USD (default MAX_TRADE_USD/2)
+    // is only the unknown-TVL fallback base, with 0.5x and 2x tried when its
+    // gross gap reaches MULTISIZE_TRIGGER of the hurdle.
     baseTradeUsd: num('BASE_TRADE_USD', 0),
     multiSizeTrigger: num('MULTISIZE_TRIGGER', 0.7),
     // Quote-saving pre-filter: only request a DEX quote when the rough MEXC-vs-DexScreener gap

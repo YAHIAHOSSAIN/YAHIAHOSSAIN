@@ -526,6 +526,10 @@ export function readWinners(db) {
 // does), so a transfer-mode DB returns total 0 / null best — the page then
 // shows the "no gap data" warning instead of a chart.
 export function readGapStats(db) {
+  // The gap chart shows tradeable CEX-DEX gaps only. DEX_ARB rows are
+  // detection-only (no execution exists), so they are excluded here — their
+  // own stats come from readDexArbStats. (tokensHour/tokensLastHour still
+  // count them: a scanned token is a "token seen".)
   const dayAgo = Date.now() - 24 * 3600 * 1000;
   const b = db
     .prepare(
@@ -539,14 +543,14 @@ export function readGapStats(db) {
          COUNT(*) total,
          MAX(CASE WHEN decision != 'rule' THEN gross_bps END) maxBps,
          MAX(CASE WHEN decision != 'rule' THEN net_usd END) maxNet
-       FROM opportunities WHERE ts >= ?`,
+       FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB'`,
     )
     .get(dayAgo);
   const hourly = db
     .prepare(
       `SELECT CAST(strftime('%H', ts/1000, 'unixepoch', '+6 hours') AS INTEGER) hr,
               MAX(gross_bps) bestBps, MAX(net_usd) bestNet, COUNT(*) n
-       FROM opportunities WHERE ts >= ? AND decision != 'rule' GROUP BY hr ORDER BY hr`,
+       FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND decision != 'rule' GROUP BY hr ORDER BY hr`,
     )
     .all(dayAgo);
   return {
@@ -674,7 +678,7 @@ export function readStatus(c) {
       .get(hourAgo);
     const bestHour = db
       .prepare(
-        `SELECT token, gross_bps, net_usd FROM opportunities WHERE ts >= ? AND decision IN ('below_hurdle','trade') AND gross_bps IS NOT NULL ORDER BY gross_bps DESC LIMIT 1`,
+        `SELECT token, gross_bps, net_usd FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND decision IN ('below_hurdle','trade') AND gross_bps IS NOT NULL ORDER BY gross_bps DESC LIMIT 1`,
       )
       .get(hourAgo);
     const openTransfers = db
@@ -738,8 +742,9 @@ export function readLive(c) {
       .prepare(`SELECT COUNT(*) c FROM transfers WHERE status IN ('buying','withdrawing','selling')`)
       .get();
     const stuck = db.prepare(`SELECT COUNT(*) c FROM transfers WHERE status = 'stuck'`).get();
-    // Live token count (L4): distinct tokens with a recorded gap in the last
-    // hour — the live equivalent of the paper "গত ১ ঘণ্টায় টোকেন দেখেছে" line.
+    // Live token count (L4): distinct tokens seen (any opportunity row, incl.
+    // DEX_ARB detection) in the last hour — the live equivalent of the paper
+    // "গত ১ ঘণ্টায় টোকেন দেখেছে" line.
     const hourAgo = Date.now() - 3600 * 1000;
     const tokensHour = db
       .prepare(`SELECT COUNT(DISTINCT token) c FROM opportunities WHERE ts >= ?`)

@@ -5,7 +5,7 @@
 // (mexc-dex-arb-bsc-live). BSC universe is big: 259 MEXC tokens have a BSC
 // network with deposit+withdraw+contract (verified 2026-11-22 via `npm run
 // networks` — matched names: BSC | BNB Smart Chain(BEP20)). Same live
-// settings as Ethereum ($300 size, 2% gap threshold, unlimited approval).
+// settings as Ethereum ($500 size, 2% gap threshold, unlimited approval).
 // BSC differences: the DEX stable is USDT with 18 decimals (not USDC 6) — the
 // stableDecimals fix (2026-11-22) threads the on-chain decimals into the
 // transfer engine, without which every BSC amount would be off by 1e12. Gas
@@ -17,7 +17,7 @@
 // only). Do NOT start until those are ready.
 // NOTE (M2): live chains share ONE MEXC account + hot wallet but keep
 // separate DBs/risk — all draw from the same MEXC USDT balance, so combined
-// live exposure is 3x $300/cycle once Ethereum + Arbitrum + BSC all run.
+// live exposure is 3x $500/cycle once Ethereum + Arbitrum + BSC all run.
 module.exports = {
   apps: [
     {
@@ -33,7 +33,7 @@ module.exports = {
         SEND_RPC_URL: 'https://bsc.rpc.blxrbdn.com', // bloXroute Protect: private sends, no public mempool (free, no key; verified chain 56, 2026-11-22)
         DB_PATH: 'data/bsc-live.sqlite',
         MAX_TRADE_USD: '500', // owner decision 2026-11-23: $300 -> $500 (ladder caps at $500; MIN $100, gap 2%, loss floor unchanged)
-        MIN_TRADE_USD: '100', // random size $100–300 per trade (owner decision 2026-11-22)
+        MIN_TRADE_USD: '100', // depth ladder $100–500 per trade; random size only for unknown-TVL pools
         TRANSFER_DRIFT_BPS: '100', // drift reserve 1.5% -> 1.0% (owner decision 2026-11-22)
         UNLIMITED_APPROVAL: 'yes', // owner decision 2026-11-21: approve MaxUint256 once per token, skip the approve tx on later sales (~12s saved per sale). Risk accepted: a compromised spender could drain the token balance.
         MIN_MEXC_VOLUME_USD: '10000',

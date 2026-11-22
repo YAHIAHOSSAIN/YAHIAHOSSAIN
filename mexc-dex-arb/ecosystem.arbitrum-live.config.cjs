@@ -5,7 +5,7 @@
 // Arbitrum universe is small: only 16 MEXC tokens have an ARB network with
 // deposit+withdraw+contract (verified 2026-11-22 via `CHAIN=arbitrum npm run
 // networks` — matched names: ARB | Arbitrum One(ARB)); the $10k/$10k volume
-// filters cut it further. Same live settings as Ethereum ($300 size, 2% gap
+// filters cut it further. Same live settings as Ethereum ($500 size, 2% gap
 // threshold, unlimited approval).
 // Requires: PRIVATE_KEY in .env, Arbitrum ETH in the hot wallet (>= 0.01,
 // MIN_ETH_FOR_GAS — the wallet held only ~0.00013 ETH on Arbitrum at build
@@ -14,7 +14,7 @@
 // hot wallet only). Do NOT start until those are ready.
 // NOTE (M2): two live chains share ONE MEXC account + hot wallet but keep
 // separate DBs/risk — both draw from the same MEXC USDT balance, so combined
-// live exposure is 2x $300 per cycle. NOTE (gas): the OP-stack l1Fee capture
+// live exposure is 2x $500 per cycle. NOTE (gas): the OP-stack l1Fee capture
 // does not apply to Arbitrum receipts (they carry gasUsedForL1, not l1Fee),
 // so the receipt-level gas omits the L1 data portion; the pre-trade gate adds
 // a conservative L1_FEE_USD=0.10 estimate per transfer instead (typical
@@ -35,7 +35,7 @@ module.exports = {
         SEND_RPC_URL: 'https://arbitrum.publicnode.com', // mevblocker is Ethereum-only; Arbitrum uses publicnode for sends too
         DB_PATH: 'data/arbitrum-live.sqlite',
         MAX_TRADE_USD: '500', // owner decision 2026-11-23: $300 -> $500 (ladder caps at $500; MIN $100, gap 2%, loss floor unchanged)
-        MIN_TRADE_USD: '100', // random size $100–300 per trade (owner decision 2026-11-22)
+        MIN_TRADE_USD: '100', // depth ladder $100–500 per trade; random size only for unknown-TVL pools
         TRANSFER_DRIFT_BPS: '100', // drift reserve 1.5% -> 1.0% (owner decision 2026-11-22)
         UNLIMITED_APPROVAL: 'yes', // owner decision 2026-11-21: approve MaxUint256 once per token, skip the approve tx on later sales (~12s saved per sale). Risk accepted: a compromised spender could drain the token balance.
         MIN_MEXC_VOLUME_USD: '10000',

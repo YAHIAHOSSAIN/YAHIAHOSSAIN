@@ -18,7 +18,7 @@ import { BestOf, ZEROX_ALLOWANCE_HOLDER, type Aggregator, type Quote } from './d
 import type { GasInfo, TxResult } from './dex/chain.js';
 import type { Book, CoinConfig, DepositRecord, Order, SymbolInfo, WithdrawRecord } from './mexc/rest.js';
 import { AmbiguousRequestError } from './mexc/rest.js';
-import type { Db, TransferRow } from './db.js';
+import type { Db, OpportunityRow, TransferRow } from './db.js';
 import type { Risk } from './risk.js';
 import type { Notifier } from './engine.js';
 import { RecycleEngine } from './recycle.js';
@@ -26,6 +26,8 @@ import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine
 import { closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
 import { type Gap, type ScanToken, MAX_PINNED_WINNERS, dexPrices, findGaps, loadUniverse } from './scanner.js';
 import { depthRejectReason, depthSafeSize, estimatedImpact, topDepthRejects, type DepthRejectDetail } from './dex/depth.js';
+import { scanDexArb } from './dex/dexarb.js';
+import type { Token } from './watchlist.js';
 import { explorerTxUrl } from './chains.js';
 import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
 import { hurdleBps } from './config.js';
@@ -41,6 +43,10 @@ const SELL_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000]; // after attempt
 const SELL_FAST_RETRY_MS = 25_000;
 const MAX_SELL_ATTEMPTS = 4;
 const FALSE_GAP_COOLDOWN_MS = 10 * 60_000;
+// Phase 4: DEX-DEX detection scans at most this many tokens per tick (see
+// scanDexArbTick): the live quote budget is 3–4 calls/s per aggregator, so a
+// full-universe scan would burn it and warn per skipped token.
+const DEX_ARB_TOKENS_PER_TICK = 5;
 
 export interface TransferMexc {
   exchangeInfo(): Promise<SymbolInfo[]>;
@@ -119,7 +125,7 @@ const WITHDRAW_MANUAL = 10;
 const buyCid = (chain: string, id: number) => `${chain}${id}b`;
 const withdrawCid = (chain: string, id: number) => `${chain}${id}w`;
 
-/** Random whole-dollar trade size in [minUsd, maxUsd] (owner decision 2026-11-22: random $100–300 per trade so thin DEX pools get a smaller size instead of always $300). `rand` is injectable for tests. */
+/** Random whole-dollar trade size in [minUsd, maxUsd] (owner decision 2026-11-22: random $100–500 per trade so thin DEX pools get a smaller size instead of always $500). Only the unknown-TVL fallback uses it now — known pools size from the depth ladder (see depthSizes). `rand` is injectable for tests. */
 export function pickTradeSize(minUsd: number, maxUsd: number, rand: () => number = Math.random): number {
   if (maxUsd <= minUsd) return minUsd;
   return minUsd + Math.floor(rand() * (maxUsd - minUsd + 1));
@@ -170,6 +176,10 @@ export class TransferEngine {
   /** Phase 6: per-candidate reject detail for this tick (token/liq/impact/reason),
    * flushed as ONE summary row at the end of the tick (see flushDepthRejects). */
   private depthRejectDetails: DepthRejectDetail[] = [];
+  /** Phase 4: DEX-DEX detection rotation — next universe index to scan from (see scanDexArbTick). */
+  private dexArbCursor = 0;
+  /** Phase 4: on-chain token decimals for the detection scan, cached per process (decimals never change). */
+  private dexArbDecimals = new Map<string, number>();
 
   /** Record one depth rejection for this tick's summary row. */
   private noteDepthReject(token: string, size: number, liq: number, reason: string): void {
@@ -193,6 +203,114 @@ export class TransferEngine {
       });
     } catch (e) {
       log.warn(`depth rejects record: ${errMsg(e)}`);
+    }
+  }
+
+  /**
+   * Phase 4: DEX-DEX detection only — the inventory engine's scanDexArbTick,
+   * wired into the transfer tick (live bots run STRATEGY=transfer, so the
+   * engine's copy never runs live). Detection only: never trades, sends,
+   * approves or opens a position. Same ordering as the engine (after
+   * candidate evaluation, before execute), same row fields and reason text.
+   *
+   * One deliberate difference from the engine: the engine scans its whole
+   * watchlist every tick, but the live quote budget is 3–4 calls/s per
+   * aggregator (Kyber 3 RPS) while a full universe scan needs 2 quotes per
+   * token (~150 quotes on Ethereum). An unbounded scan would burn the
+   * budget and log a QuoteBudgetError warning per skipped token, and the
+   * same first few tokens would win the budget every tick. So each tick
+   * scans a rotating window of DEX_ARB_TOKENS_PER_TICK TVL-known tokens
+   * (decimals cached per process); the whole universe is covered over a
+   * few minutes and the trading quotes keep priority (detection runs after
+   * evaluation). A 'trade' decision here means "net beat the hurdle", not
+   * "a trade was made".
+   */
+  private async scanDexArbTick(gas: GasInfo, nativeUsd: number, dex: Map<string, { price: number; tvl: number; vol24h: number }>): Promise<void> {
+    const known = this.universe.filter((t) => (dex.get(t.address.toLowerCase())?.tvl ?? 0) > 0);
+    if (!known.length) return;
+    const window: ScanToken[] = [];
+    for (let i = 0; i < DEX_ARB_TOKENS_PER_TICK && i < known.length; i++) {
+      window.push(known[(this.dexArbCursor + i) % known.length]);
+    }
+    const tokens: Token[] = [];
+    await Promise.all(window.map(async (t) => {
+      let dec = this.dexArbDecimals.get(t.address);
+      if (dec === undefined) {
+        try {
+          dec = await this.d.chain.decimals(t.address);
+        } catch (e) {
+          log.warn(`dex-arb ${t.base}: decimals lookup failed (${errMsg(e)})`);
+          return;
+        }
+        this.dexArbDecimals.set(t.address, dec);
+      }
+      tokens.push({
+        base: t.base, symbol: t.symbol, address: t.address, decimals: dec,
+        qtyStep: t.qtyStep, priceDecimals: t.priceDecimals, rules: t.rules,
+        dexTvlUsd: dex.get(t.address.toLowerCase())!.tvl, mexcVolumeUsd: t.volumeUsd,
+        depositOk: true, withdrawOk: true,
+      });
+    }));
+    // Advance by the tokens actually scanned, not the window size: if every
+    // window token failed its decimals lookup, the cursor stays put and those
+    // tokens are retried next tick instead of being skipped for a full
+    // rotation. A partially failed window advances by its success count, so
+    // a mid-window failure is retried after the rotation wraps (~3-5 min) —
+    // advancing to the first failed token instead would pin the cursor
+    // forever on a persistently failing token and re-price the same
+    // successes every tick. Detection-only data, so the delay is negligible.
+    this.dexArbCursor = (this.dexArbCursor + tokens.length) % known.length;
+    if (!tokens.length) return;
+    const opps = await scanDexArb(tokens, this.d.agg, gas, nativeUsd, {
+      stableAddress: this.cfg.usdc,
+      stableDecimals: this.stableDec(),
+      taker: this.live ? this.d.chain.address : PAPER_TAKER,
+      slippageBps: this.cfg.dexSlippageBps,
+      minTradeUsd: this.cfg.minTradeUsd,
+      maxTradeUsd: this.cfg.maxTradeUsd,
+      hurdleUsd: (size) => threshold(size, this.cfg.minProfitUsd, hurdleBps(this.cfg)),
+      stableInUsdt: this.stableRate,
+      l1FeeUsd: this.cfg.l1FeeUsd,
+      maxImpactPct: this.cfg.depthMaxImpactBps / 100,
+      maxSizePct: this.cfg.depthMaxSizePct,
+    });
+    if (!opps.length) return;
+    const now = this.now();
+    const rows: OpportunityRow[] = [];
+    for (const o of opps) {
+      log.info(`DEX-ARB ${o.token}: buy ${usd(o.buyInUsd)} -> sell ${usd(o.sellOutUsd)}, net ${usd(o.netUsd)}`);
+      const passes = o.netUsd > o.hurdleUsd;
+      rows.push({
+        ts: now, chain: this.cfg.chain.name, token: o.token, direction: 'DEX_ARB',
+        size_usd: o.sizeUsd, mexc_bid: null, mexc_ask: null, book_age_ms: null,
+        aggregator: o.buySource ?? this.d.agg.name,
+        dex_out: o.tokensBought, dex_min_out: null, usdc_usdt: this.stableRate,
+        gross_bps: ((o.sellOutUsd - o.buyInUsd) / o.sizeUsd) * 10_000,
+        fee_bps: null, // no MEXC leg on a DEX-DEX row, so no taker fee (the
+        // inventory engine's blankRow carries the taker fee instead).
+        gas_usd: o.gasUsd, net_usd: o.netUsd, hurdle_usd: o.hurdleUsd,
+        decision: passes ? 'trade' : 'below_hurdle',
+        reason: passes
+          ? 'dex-arb detection only — no execution'
+          : `net ${o.netUsd.toFixed(4)} <= hurdle ${o.hurdleUsd.toFixed(4)} (dex-arb detection only — no execution)`,
+      });
+    }
+    try {
+      this.d.db.insertOpportunities(rows);
+    } catch (e) {
+      log.warn(`dex-arb record: ${errMsg(e)}`);
+    }
+  }
+
+  /** Run the DEX-DEX detection scan when enabled (no-op otherwise). */
+  private async maybeScanDexArb(gas: GasInfo, nativeUsd: number, dex: Map<string, { price: number; tvl: number; vol24h: number }>): Promise<void> {
+    if (!this.cfg.dexArbEnabled) return;
+    try {
+      await this.scanDexArbTick(gas, nativeUsd, dex);
+    } catch (e) {
+      // Detection must never kill a trade tick: a scan bug costs at most the
+      // DEX-ARB rows for this tick, never the transfer that follows it.
+      log.warn(`dex-arb scan: ${errMsg(e)} (detection only — skipped this tick)`);
     }
   }
 
@@ -327,7 +445,7 @@ export class TransferEngine {
    * No chain-specific impact ceiling: on Ethereum the small sizes are already hopeless
    * because the $4+ gas makes their net fail the hurdle, and the ceiling never binds the
    * size anyway — at the $150k pool floor the safe size is $525, above MAX_TRADE_USD
-   * ($300 live), so a DEPTH_MAX_IMPACT_BPS_ETH knob would change nothing. If the floor
+   * ($500 live), so a DEPTH_MAX_IMPACT_BPS_ETH knob would change nothing. If the floor
    * is ever lowered or MAX raised, revisit.
    */
   private depthSizes(g: Gap, cap: number): number[] | null {
@@ -509,17 +627,33 @@ export class TransferEngine {
     if (block) return this.note('block', `new trades blocked: ${block}`);
     this.note('block', 'new trades enabled');
     if (txBlocked) return;
-    if (this.d.db.blockingTransfers().length >= this.cfg.maxOpenTransfers) return this.note('open', 'waiting for open transfer to finish');
-    this.note('open', 'no open transfer');
+    // The gas gate sits above every scan site (same order as the inventory
+    // engine): a high-gas tick never spends quotes on detection, even while
+    // a transfer is open.
     if (this.lastGasGwei > this.cfg.maxGasGwei) return this.note('gas', `gas ${this.lastGasGwei.toFixed(1)} gwei > ${this.cfg.maxGasGwei}, no new trades`);
     this.note('gas', 'gas ok');
+    if (this.d.db.blockingTransfers().length >= this.cfg.maxOpenTransfers) {
+      // An open transfer blocks NEW trades, but not DEX-DEX detection (the
+      // inventory engine scans on every tick that passes its own
+      // gas/unresolved gates, and detection never trades): scan, then wait.
+      this.note('open', 'waiting for open transfer to finish');
+      await this.maybeScanDexArb(gas, nativeUsd, dex);
+      return;
+    }
+    this.note('open', 'no open transfer');
 
     // Skip tokens whose exact quote recently showed the gap was not real, so they cannot starve the rest.
     // Never two transfers of the same token at once (they would share one wallet balance), even after
     // an old one stopped blocking because of a long withdrawal.
     const busyTokens = new Set([...this.d.db.openTransfers(), ...this.d.db.stuckTransfers()].map((t) => t.base));
     const fresh = gaps.filter((g) => (this.cooldown.get(g.token.base) ?? 0) <= now && !busyTokens.has(g.token.base));
-    if (!fresh.length) return;
+    if (!fresh.length) {
+      // No CEX gap this tick — a DEX-DEX spread does not need one, so the
+      // detection scan still runs (same as the inventory engine, which
+      // scans on every tick that reaches it).
+      await this.maybeScanDexArb(gas, nativeUsd, dex);
+      return;
+    }
 
     const usdt = this.live ? ((await this.d.mexc.balances()).USDT ?? 0) : 1e12;
     // Phase 2: no shared random size per tick — each candidate sizes from its own pool
@@ -527,6 +661,9 @@ export class TransferEngine {
     const cap = this.usdtCap(usdt);
     if (cap === null) {
       this.note('usdt', `MEXC USDT too low for a trade (${usd(usdt)})`);
+      // MEXC USDT funds the CEX leg only; DEX-DEX detection does not need
+      // it, so the scan still runs.
+      await this.maybeScanDexArb(gas, nativeUsd, dex);
       return;
     }
     // Phase 5: candidates are evaluated in parallel, bounded by the
@@ -576,6 +713,10 @@ export class TransferEngine {
     }
     if (this.lastDepthRejects > 0) log.info(`depth rejects this tick: ${this.lastDepthRejects} (thin pools, no exact quote spent)`);
     this.flushDepthRejects(now);
+    // Phase 4: DEX-DEX detection only (flag-gated, never trades) — same
+    // ordering as the inventory engine: after candidate evaluation, before
+    // execute.
+    await this.maybeScanDexArb(gas, nativeUsd, dex);
     if (!best) return;
     if (!this.live) return this.recordPaper(best);
     await this.start(best, gas, nativeUsd);

@@ -100,7 +100,7 @@ export interface RemoteSnapshot {
   balances: { mexcUsdt: number | null; walletNative: number | null; walletUsdc: number | null; nativeSymbol: string };
   openTransfers: number;
   stuckTransfers: number;
-  /** Distinct tokens with a recorded gap in the last hour (L4); null when the DB has no opportunities table. */
+  /** Distinct tokens seen (any opportunity row, incl. DEX_ARB detection) in the last hour (L4); null when the DB has no opportunities table. */
   tokensLastHour: number | null;
 }
 
@@ -205,6 +205,8 @@ export function buildSnapshot(db: Db, ctx: RemoteSnapshotCtx): RemoteSnapshot {
   } catch { inventory = []; }
   // Gap stats (last 24h). Transfer mode writes almost no opportunity rows,
   // so this is usually total 0 / null best — the dashboard shows its warning.
+  // Tradeable CEX-DEX gaps only: DEX_ARB rows are detection-only, so they are
+  // excluded here (their own stats come from readDexArbStats below).
   let gaps: RemoteSnapshot['gaps'] = {
     buckets: { lt30: 0, b30_50: 0, b50_100: 0, b100_200: 0, b200_300: 0, b300p: 0, total: 0 },
     bestBps: null, bestNet: null, hourly: [],
@@ -221,13 +223,13 @@ export function buildSnapshot(db: Db, ctx: RemoteSnapshotCtx): RemoteSnapshot {
          COUNT(*) total,
          MAX(CASE WHEN decision != 'rule' THEN gross_bps END) maxBps,
          MAX(CASE WHEN decision != 'rule' THEN net_usd END) maxNet
-       FROM opportunities WHERE ts >= ?`,
+       FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB'`,
       now - 24 * 3600 * 1000,
     )[0];
     const hourly = db.all<{ hr: number; bestBps: number; bestNet: number | null; n: number }>(
       `SELECT CAST(strftime('%H', ts/1000, 'unixepoch', '+6 hours') AS INTEGER) hr,
               MAX(gross_bps) bestBps, MAX(net_usd) bestNet, COUNT(*) n
-       FROM opportunities WHERE ts >= ? AND decision != 'rule' GROUP BY hr ORDER BY hr`,
+       FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND decision != 'rule' GROUP BY hr ORDER BY hr`,
       now - 24 * 3600 * 1000,
     );
     if (b) {
@@ -287,8 +289,9 @@ export function buildSnapshot(db: Db, ctx: RemoteSnapshotCtx): RemoteSnapshot {
     )[0];
     if (r) dexArb = { count: r.c || 0, bestNet: r.bestNet ?? null, tradeDecisions: r.tradeDecisions || 0 };
   } catch { /* old DB: zeros */ }
-  // L4: distinct tokens with a recorded gap in the last hour — same query as
-  // the status server's readLive. Null when the DB has no opportunities table.
+  // L4: distinct tokens seen (any opportunity row, incl. DEX_ARB detection)
+  // in the last hour — same query as the status server's readLive. Null when
+  // the DB has no opportunities table.
   let tokensLastHour: number | null = null;
   try {
     const r = db.all<{ c: number }>(

@@ -132,6 +132,12 @@ test('snapshot: numbers match the DB; in-flight trades never count', () => {
   assert.deepEqual(s.config.aggregators, ['0x', 'kyber']);
   // L4: 1 distinct token (LINK) with a gap in the last hour.
   assert.equal(s.tokensLastHour, 1);
+  // Gap stats exclude DEX_ARB (detection-only): the fixture's only
+  // opportunity rows are the two LINK DEX_ARB rows, so the chart is empty
+  // while tokensLastHour still counts LINK as a token seen.
+  assert.equal(s.gaps.buckets.total, 0);
+  assert.equal(s.gaps.bestBps, null);
+  assert.equal(s.gaps.bestNet, null);
   // L5: seeded transfer was never recycled.
   assert.equal(s.transfers[0].recycle_status, null);
   assert.equal(s.transfers[0].recycled_usdt, null);
