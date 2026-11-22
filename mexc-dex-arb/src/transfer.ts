@@ -259,7 +259,7 @@ export class TransferEngine {
       .slice(0, MAX_PINNED_WINNERS)
       .map((s) => ({ base: s.symbol, pnl: s.pnl, trades: s.trades }));
     this.winnerSet = new Set(this.winners.map((w) => w.base));
-    const all = await loadUniverse(this.d.mexc, {
+    const { tokens: all, dropped } = await loadUniverse(this.d.mexc, {
       minVolumeUsd: this.cfg.minMexcVolumeUsd,
       only: this.cfg.watchlist,
       minDexVolumeUsd: this.cfg.minDexVolumeUsd,
@@ -270,6 +270,29 @@ export class TransferEngine {
       // (loadUniverse still drops any winner that fails the safety filters).
       pin: this.winnerSet,
     }, this.d.dexPricesFn);
+    // Grok v2 review / board audit M1: the pool-liquidity floor in
+    // loadUniverse used to drop known-thin pools with only a log line, so
+    // the dashboard Depth section stayed empty. Record every such drop
+    // through the same noteDepthReject path the tick-level filter uses.
+    // Size for the impact figure is MIN_TRADE_USD (the smallest trade we
+    // would attempt); refreshUniverse runs before the USDT cap is known.
+    for (const d of dropped) {
+      this.lastDepthRejects++;
+      this.noteDepthReject(d.base, this.cfg.minTradeUsd, d.tvl, d.reason);
+      log.info(`${d.base}: depth reject — ${d.reason} (pool ${usd(d.tvl)}, universe-build)`);
+    }
+    // Flush HERE, not at the end of the tick: refreshUniverse also runs at
+    // startup (runTransfer calls it before the tick loop), and every tick
+    // resets these counters at its start — so a tick-end flush would lose
+    // the drops entirely. A tick that returns early (no fresh gaps /
+    // blocked / gas) never reaches its end-of-tick flush either. Reset
+    // after flushing so the tick-end flush only covers the candidates
+    // evaluated in this tick (no double count).
+    if (dropped.length) {
+      this.flushDepthRejects();
+      this.lastDepthRejects = 0;
+      this.depthRejectDetails = [];
+    }
     this.universe = this.d.provenFilter ? this.d.provenFilter(all) : all;
     this.universeTs = this.now();
     this.provenFilteredEmpty = !!this.d.provenFilter && all.length > 0 && this.universe.length === 0;

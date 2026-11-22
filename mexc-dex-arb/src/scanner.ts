@@ -37,6 +37,18 @@ const SKIP = new Set(['USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'USDE', 'PYUSD', '
  * the cap is a safety bound on universe size, not a tuning knob. */
 export const MAX_PINNED_WINNERS = 10;
 
+/** One token dropped at universe-build time by the pool-liquidity floor:
+ * its symbol, its known pool TVL, and why it was dropped. Returned by
+ * loadUniverse so the caller can record it through the same depth-rejects
+ * path the engine uses (Grok v2 review / board audit M1: without this the
+ * dashboard Depth section stays empty, because the drops only existed in
+ * a log line). Unknown TVL (0) is never a drop — it is kept, fail-open. */
+export interface UniverseDrop {
+  base: string;
+  tvl: number;
+  reason: string;
+}
+
 /** All tradable MEXC/USDT ERC20 tokens with deposits AND withdrawals open and enough volume.
  * Sorted by MEXC 24h volume desc, so a `max` cap keeps the biggest tokens. With
  * `minDexVolumeUsd` set, tokens also need that much 24h DEX volume (DexScreener h24);
@@ -47,12 +59,16 @@ export const MAX_PINNED_WINNERS = 10;
  * but fall below the `max` cut are appended after the top-`max` list (up to
  * MAX_PINNED_WINNERS) — a winner stays in the universe even if it slips out
  * of the top-100 by volume, as long as it still passes the base safety
- * filters. A pinned token that fails a filter is dropped like any token. */
+ * filters. A pinned token that fails a filter is dropped like any token.
+ * Returns the surviving tokens plus `dropped`: every token the
+ * pool-liquidity floor removed (known TVL below the floor), so the caller
+ * can record them as depth rejects — otherwise they vanish into a log
+ * line and the dashboard Depth section never sees them. */
 export async function loadUniverse(
   mexc: Pick<MexcRest, 'exchangeInfo' | 'tickers24h' | 'coinConfigs'>,
   opts: { minVolumeUsd: number; only: string[]; minDexVolumeUsd?: number; minPoolLiquidityUsd?: number; max?: number; chain?: ChainProfile; pin?: Set<string> },
   dexPricesFn: typeof dexPrices = dexPrices,
-): Promise<ScanToken[]> {
+): Promise<{ tokens: ScanToken[]; dropped: UniverseDrop[] }> {
   const [symbols, tickers, coins] = await Promise.all([mexc.exchangeInfo(), mexc.tickers24h(), mexc.coinConfigs()]);
   const volume = new Map(tickers.map((t) => [t.symbol, Number(t.quoteVolume)]));
   const coinBy = new Map(coins.map((c) => [c.coin.toUpperCase(), c]));
@@ -87,6 +103,7 @@ export async function loadUniverse(
   out.sort((a, b) => b.volumeUsd - a.volumeUsd);
   const minDexVol = opts.minDexVolumeUsd ?? 0;
   const minPoolLiq = opts.minPoolLiquidityUsd ?? 0;
+  const dropped: UniverseDrop[] = [];
   if ((minDexVol > 0 || minPoolLiq > 0) && out.length) {
     try {
       // One DexScreener call serves both filters: it already returns the
@@ -101,10 +118,16 @@ export async function loadUniverse(
         const before = out.length;
         // tvl 0 / no entry = no DexScreener data, not a known-thin pool:
         // keep it (fail-open); the depth filter in tick() and the exact
-        // quote decide later. Only a KNOWN tvl below the floor drops.
+        // quote decide later. Only a KNOWN tvl below the floor drops — and
+        // every such drop is returned (see `dropped`), so the caller can
+        // record it as a depth reject instead of losing it in this log.
         out = out.filter((t) => {
           const tvl = vols.get(t.address)?.tvl ?? 0;
-          return tvl === 0 || tvl >= minPoolLiq;
+          if (tvl !== 0 && tvl < minPoolLiq) {
+            dropped.push({ base: t.base, tvl, reason: `pool $${Math.round(tvl / 1000)}k < $${Math.round(minPoolLiq / 1000)}k` });
+            return false;
+          }
+          return true;
         });
         log.info(`loadUniverse: pool liquidity >= $${minPoolLiq} keeps ${out.length}/${before} tokens`);
       }
@@ -121,9 +144,9 @@ export async function loadUniverse(
     // already passed the filters above.
     const extra = out.slice(max).filter((t) => opts.pin!.has(t.base)).slice(0, MAX_PINNED_WINNERS);
     if (extra.length) log.info(`loadUniverse: pinning ${extra.length} winner(s) past the top-${max} cut: ${extra.map((t) => t.base).join(', ')}`);
-    return [...out.slice(0, max), ...extra];
+    return { tokens: [...out.slice(0, max), ...extra], dropped };
   }
-  return max ? out.slice(0, max) : out;
+  return { tokens: max ? out.slice(0, max) : out, dropped };
 }
 
 type FetchFn = typeof fetch;

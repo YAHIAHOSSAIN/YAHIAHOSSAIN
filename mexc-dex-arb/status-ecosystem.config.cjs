@@ -14,7 +14,7 @@ module.exports = {
         CHAIN: 'ethereum',
         MODE: 'paper',
         MAX_TRADE_USD: 300,
-        LIVE_MAX_TRADE_USD: 300,
+        LIVE_MAX_TRADE_USD: 500, // live bots raised $300 -> $500 (owner decision 2026-11-23); display only
         WATCHLIST_MAX: 50,
         DB_PATH: 'data/ethereum.sqlite',
       },

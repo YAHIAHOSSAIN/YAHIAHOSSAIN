@@ -62,7 +62,7 @@ test('loadUniverse uses the chain contract, not the Ethereum one', async () => {
   };
   // Only the Arbitrum contract has DEX volume.
   const dexFn = (async (addrs: string[]) => new Map(addrs.map((a) => [a, { price: 1, tvl: 1e6, vol24h: a === ARB.toLowerCase() ? 50_000 : 0 }]))) as never;
-  const u = await loadUniverse(fake as never, { minVolumeUsd: 1, only: [], minDexVolumeUsd: 10_000, chain: chainProfile('arbitrum') }, dexFn);
+  const { tokens: u } = await loadUniverse(fake as never, { minVolumeUsd: 1, only: [], minDexVolumeUsd: 10_000, chain: chainProfile('arbitrum') }, dexFn);
   assert.equal(u.length, 1);
   assert.equal(u[0].address, ARB.toLowerCase());
   assert.equal(u[0].netWork, 'ARB');
@@ -92,15 +92,36 @@ test('loadUniverse drops a token below the pool-liquidity floor, using the same 
     calls++;
     return new Map(addrs.map((a) => [a, { price: 1, tvl: a === XYZ_A.toLowerCase() ? 42_000 : 500_000, vol24h: 1e6 }]));
   }) as never;
-  const u = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
+  const { tokens: u } = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
   assert.equal(calls, 1); // no second API call for the liquidity filter
   assert.deepEqual(u.map((t) => t.base), ['ABC']); // XYZ's $42k pool is below the $150k floor
+});
+
+// Grok v2 review / board audit M1: the floor drop used to exist only in a
+// log line, so the dashboard Depth section stayed empty. The drop must be
+// returned (symbol + TVL + reason) for the caller to record as a depth reject.
+test('loadUniverse reports the tokens it drops on the pool-liquidity floor', async () => {
+  const { loadUniverse } = await import('../src/scanner.js');
+  const dexFn = (async (addrs: string[]) =>
+    new Map(addrs.map((a) => [a, { price: 1, tvl: a === XYZ_A.toLowerCase() ? 42_000 : 500_000, vol24h: 1e6 }]))) as never;
+  const { tokens, dropped } = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
+  assert.deepEqual(tokens.map((t) => t.base), ['ABC']);
+  assert.deepEqual(dropped, [{ base: 'XYZ', tvl: 42_000, reason: 'pool $42k < $150k' }]);
+});
+
+test('loadUniverse reports no drops when nothing is below the floor', async () => {
+  const { loadUniverse } = await import('../src/scanner.js');
+  const dexFn = (async (addrs: string[]) =>
+    new Map(addrs.map((a) => [a, { price: 1, tvl: 500_000, vol24h: 1e6 }]))) as never;
+  const { tokens, dropped } = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
+  assert.deepEqual(tokens.map((t) => t.base).sort(), ['ABC', 'XYZ']);
+  assert.deepEqual(dropped, []);
 });
 
 test('loadUniverse keeps the list when the DexScreener call throws (fail-open)', async () => {
   const { loadUniverse } = await import('../src/scanner.js');
   const dexFn = (async () => { throw new Error('dexscreener down'); }) as never;
-  const u = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
+  const { tokens: u } = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
   assert.deepEqual(u.map((t) => t.base).sort(), ['ABC', 'XYZ']);
 });
 
@@ -110,7 +131,7 @@ test('loadUniverse keeps a token whose pool tvl is 0/unknown (fail-open)', async
   const dexFn = (async (addrs: string[]) => new Map(
     addrs.filter((a) => a === XYZ_A.toLowerCase()).map((a) => [a, { price: 1, tvl: 0, vol24h: 1e6 }]),
   )) as never;
-  const u = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
+  const { tokens: u } = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [], minPoolLiquidityUsd: 150_000 }, dexFn);
   assert.deepEqual(u.map((t) => t.base).sort(), ['ABC', 'XYZ']);
 });
 
@@ -121,7 +142,7 @@ test('loadUniverse with no liquidity floor does not call DexScreener at all', as
     calls++;
     return new Map(addrs.map((a) => [a, { price: 1, tvl: 1e6, vol24h: 1e6 }]));
   }) as never;
-  const u = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [] }, dexFn);
+  const { tokens: u } = await loadUniverse(uniFake as never, { minVolumeUsd: 1, only: [] }, dexFn);
   assert.equal(calls, 0);
   assert.deepEqual(u.map((t) => t.base).sort(), ['ABC', 'XYZ']);
 });
@@ -154,13 +175,13 @@ test('Phase 9: loadUniverse pins a winner past the max cut (top-max list unchang
     { base: 'CCC', contract: A3, vol: 7e6 },
   ];
   // Without a pin, max=1 keeps only the biggest token.
-  const plain = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1 }, pinDex({}));
+  const { tokens: plain } = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1 }, pinDex({}));
   assert.deepEqual(plain.map((t) => t.base), ['AAA']);
   // With CCC pinned, it is appended after the top-1 cut.
-  const pinned = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1, pin: new Set(['CCC']) }, pinDex({}));
+  const { tokens: pinned } = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1, pin: new Set(['CCC']) }, pinDex({}));
   assert.deepEqual(pinned.map((t) => t.base), ['AAA', 'CCC']);
   // A pinned token already inside the top-max keeps its volume rank (no duplicate, no extra slot).
-  const inside = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 2, pin: new Set(['AAA']) }, pinDex({}));
+  const { tokens: inside } = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 2, pin: new Set(['AAA']) }, pinDex({}));
   assert.deepEqual(inside.map((t) => t.base), ['AAA', 'BBB']);
 });
 
@@ -172,10 +193,10 @@ test('Phase 9: a pinned winner that fails a safety filter is still dropped', asy
     { base: 'CCC', contract: A3, vol: 7e6 },
   ];
   // CCC's pool is $42k, below the $150k floor: pinning must not rescue it.
-  const u = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1, minPoolLiquidityUsd: 150_000, pin: new Set(['CCC']) }, pinDex({ [A3.toLowerCase()]: 42_000 }));
+  const { tokens: u } = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1, minPoolLiquidityUsd: 150_000, pin: new Set(['CCC']) }, pinDex({ [A3.toLowerCase()]: 42_000 }));
   assert.deepEqual(u.map((t) => t.base), ['AAA']);
   // CCC below the MEXC volume floor: dropped before pinning even applies.
-  const u2 = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 8.5e6, only: [], max: 1, pin: new Set(['CCC']) }, pinDex({}));
+  const { tokens: u2 } = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 8.5e6, only: [], max: 1, pin: new Set(['CCC']) }, pinDex({}));
   assert.deepEqual(u2.map((t) => t.base), ['AAA']);
 });
 
@@ -188,7 +209,7 @@ test('Phase 9: pinned winners past the cut are capped at 10', async () => {
     vol: (12 - i) * 1e6, // T00 biggest, T11 smallest
   }));
   const pin = new Set(tokens.slice(1).map((t) => t.base)); // pin all 11 below the top-1 cut
-  const u = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1, pin }, pinDex({}));
+  const { tokens: u } = await loadUniverse(pinFake(tokens) as never, { minVolumeUsd: 1, only: [], max: 1, pin }, pinDex({}));
   assert.equal(u.length, 11); // top-1 + 10 pinned
   assert.equal(u[0].base, 'T00');
   assert.deepEqual(u.slice(1).map((t) => t.base), tokens.slice(1, 11).map((t) => t.base)); // best volume first

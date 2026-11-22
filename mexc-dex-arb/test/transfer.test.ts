@@ -570,7 +570,7 @@ test('loadUniverse respects WATCHLIST', async () => {
     tickers24h: async () => [{ symbol: 'XYZUSDT', quoteVolume: '9e6', lastPrice: '1' }, { symbol: 'ABCUSDT', quoteVolume: '9e6', lastPrice: '1' }],
     coinConfigs: async () => [coin('XYZ', XYZ), coin('ABC', '0x3333333333333333333333333333333333333333')],
   };
-  const u = await loadUniverse(fake as never, { minVolumeUsd: 1, only: ['ABC'] });
+  const { tokens: u } = await loadUniverse(fake as never, { minVolumeUsd: 1, only: ['ABC'] });
   assert.deepEqual(u.map((t) => t.base), ['ABC']);
 });
 
@@ -606,9 +606,9 @@ test('loadUniverse filters by DEX 24h volume and caps at max, best MEXC volume f
     price: 1, tvl: 1e6,
     vol24h: a === XYZ ? 50_000 : a === ABC ? 10_000 : 30_000,
   }]))) as never;
-  const u = await loadUniverse(fake as never, { minVolumeUsd: 1, only: [], minDexVolumeUsd: 20_000, max: 2 }, dexFn);
+  const { tokens: u } = await loadUniverse(fake as never, { minVolumeUsd: 1, only: [], minDexVolumeUsd: 20_000, max: 2 }, dexFn);
   assert.deepEqual(u.map((t) => t.base), ['XYZ', 'DEF']); // ABC dropped (DEX vol 10k); sorted by MEXC vol desc
-  const capped = await loadUniverse(fake as never, { minVolumeUsd: 1, only: [], minDexVolumeUsd: 20_000, max: 1 }, dexFn);
+  const { tokens: capped } = await loadUniverse(fake as never, { minVolumeUsd: 1, only: [], minDexVolumeUsd: 20_000, max: 1 }, dexFn);
   assert.deepEqual(capped.map((t) => t.base), ['XYZ']);
 });
 
@@ -904,6 +904,63 @@ test('tick() logs a depth rejection for a thin pool and books no trade', async (
   assert.equal(detail.length, 1);
   assert.equal(detail[0].token, 'XYZ');
   assert.equal(detail[0].liq_usd, 42_000);
+  assert.match(detail[0].reason, /pool \$42k < \$150k/);
+});
+
+// Grok v2 review / board audit M1: the pool-liquidity floor in loadUniverse
+// used to drop known-thin pools with only a log line, so the dashboard
+// Depth section stayed empty. refreshUniverse must record every such drop
+// through the same depth-rejects path, so the tick's flush persists it.
+test('refreshUniverse records universe-build depth drops in depth_rejects', async () => {
+  const ABC = '0x3333333333333333333333333333333333333333';
+  // XYZ is thin at universe-load ($42k); ABC is deep ($1M) so the tick has
+  // a live candidate and proceeds to the end-of-tick flush.
+  const dexPricesFn = async (addrs: string[]) =>
+    new Map(addrs.map((a) => [a, { price: 1.15, tvl: a === XYZ.toLowerCase() ? 42_000 : 1_000_000, vol24h: 1e6 }]));
+  const { engine, db } = setup({
+    mode: 'paper', minDexTvlUsd: 0,
+    extraTokens: [{ base: 'ABC', contract: ABC }],
+    dexPricesFn,
+  });
+  await engine.tick();
+  // lastDepthRejects is 0 by design here: refreshUniverse flushed the
+  // universe drop immediately and reset the per-tick counter, so the
+  // tick-end flush only covers candidates evaluated in the tick. The
+  // persisted row below is the source of truth.
+  assert.equal(engine.lastDepthRejects, 0);
+  const rejects = db.all<Record<string, unknown>>('SELECT * FROM depth_rejects');
+  assert.equal(rejects.length, 1);
+  assert.equal(rejects[0].total, 1);
+  assert.equal(rejects[0].chain, 'ethereum');
+  const detail = JSON.parse(String(rejects[0].detail)) as { token: string; liq_usd: number; impact_pct: number; reason: string }[];
+  assert.equal(detail.length, 1);
+  assert.equal(detail[0].token, 'XYZ');
+  assert.equal(detail[0].liq_usd, 42_000);
+  assert.match(detail[0].reason, /pool \$42k < \$150k/);
+});
+
+// The flush must happen in refreshUniverse, not at the end of the tick:
+// refreshUniverse also runs at startup (before any tick), every tick
+// resets the counters at its start, and a tick with no fresh gaps returns
+// early — all three would lose the drops before a tick-end flush. Here
+// ABC has no gap, so the tick returns early, yet the universe drop must
+// still be persisted.
+test('refreshUniverse persists universe-build drops even when the tick returns early (no gaps)', async () => {
+  const ABC = '0x3333333333333333333333333333333333333333';
+  const dexPricesFn = async (addrs: string[]) =>
+    new Map(addrs.map((a) => [a, { price: a === ABC.toLowerCase() ? 1.0 : 1.15, tvl: a === XYZ.toLowerCase() ? 42_000 : 1_000_000, vol24h: 1e6 }]));
+  const { engine, db } = setup({
+    mode: 'paper', minDexTvlUsd: 0,
+    extraTokens: [{ base: 'ABC', contract: ABC }],
+    dexPricesFn,
+  });
+  await engine.tick();
+  assert.equal(db.all('SELECT * FROM trades').length, 0); // no gap -> no trade, tick returned early
+  const rejects = db.all<Record<string, unknown>>('SELECT * FROM depth_rejects');
+  assert.equal(rejects.length, 1);
+  assert.equal(rejects[0].total, 1);
+  const detail = JSON.parse(String(rejects[0].detail)) as { token: string; reason: string }[];
+  assert.equal(detail[0].token, 'XYZ');
   assert.match(detail[0].reason, /pool \$42k < \$150k/);
 });
 

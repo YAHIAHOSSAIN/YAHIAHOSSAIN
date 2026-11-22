@@ -34,7 +34,7 @@ module.exports = {
         RPC_URL: 'https://arbitrum.publicnode.com',
         SEND_RPC_URL: 'https://arbitrum.publicnode.com', // mevblocker is Ethereum-only; Arbitrum uses publicnode for sends too
         DB_PATH: 'data/arbitrum-live.sqlite',
-        MAX_TRADE_USD: '300',
+        MAX_TRADE_USD: '500', // owner decision 2026-11-23: $300 -> $500 (ladder caps at $500; MIN $100, gap 2%, loss floor unchanged)
         MIN_TRADE_USD: '100', // random size $100–300 per trade (owner decision 2026-11-22)
         TRANSFER_DRIFT_BPS: '100', // drift reserve 1.5% -> 1.0% (owner decision 2026-11-22)
         UNLIMITED_APPROVAL: 'yes', // owner decision 2026-11-21: approve MaxUint256 once per token, skip the approve tx on later sales (~12s saved per sale). Risk accepted: a compromised spender could drain the token balance.
@@ -42,6 +42,7 @@ module.exports = {
         MIN_DEX_VOLUME_USD: '10000',
         TRANSFER_UNIVERSE_MAX: '100',
         SCAN_MIN_GAP_PCT: '2',
+        DEX_ARB_ENABLED: 'yes', // owner decision 2026-11-23: DEX-DEX detection on (detection only — no trade/execution)
         L1_FEE_USD: '0.10', // conservative estimate of the Arbitrum L1 data fee per transfer (see NOTE above)
       },
       autorestart: true,

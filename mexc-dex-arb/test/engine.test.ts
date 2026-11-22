@@ -432,13 +432,18 @@ test('a traded candidate is logged as trade; paused ticks are logged as paused',
   assert.ok(opps(s2.db).every((r) => r.decision === 'paused'));
 });
 
-test('multi-size: near the hurdle, 0.5x and 2x of the base size are quoted and the best net is used', async () => {
-  const { engine, priced, calls } = setup({});
+test('multi-size: near the hurdle, the depth ladder (100/75/50% of safe size) is quoted and the best net is used', async () => {
+  // Grok v2 review: the inventory ladder is the transfer ladder. $50k pool
+  // (floor lowered to 0, or the pool-floor reject would fire first): safe
+  // size is 0.7% of the $25k half = $175, ladder $175 / $131 / $87. At a
+  // 10% gap the $175 gross (~$17.40) is below the $15 need but close
+  // (0.7 * need = $10.50), so the smaller steps are quoted too; the $87
+  // gross (~$8.65) is no longer close, so the ladder stops there. No size
+  // passes, so no trade is booked — the largest net ($175) is the best.
+  const { engine, priced, db } = setup({ dexTvlUsd: 50_000, minPoolLiquidityUsd: 0, bid: 11 });
   await engine.tick();
-  // DEX_BUY quotes in USDC base units: base = MAX_TRADE_USD/2 = 100, then 50 and 200
-  const usdc = priced.filter((x) => x % 1_000_000n === 0n && x <= 1_000_000_000n).map((x) => Number(x / 1_000_000n));
-  assert.ok(usdc.includes(100) && usdc.includes(50) && usdc.includes(200), String(usdc));
-  assert.ok(calls.includes('limit SELL 19.98 @ 11.177')); // the $200 size won (largest net)
+  assert.deepEqual(usdcSizes(priced), [175, 131, 87]);
+  assert.equal(trades(db).total.trades, 0);
 });
 
 test('legs: a live trade writes one dex and one mexc leg with latency', async () => {
@@ -559,11 +564,13 @@ test('depth-derived base: a shallow pool shrinks the base to the safe size', asy
 
 test('depth-derived base: multi-size is seeded from the depth-derived base', async () => {
   // Same $20k pool, but a 20% gap (MEXC bid 12 vs DEX 10): the $70 gross
-  // ($13.92) reaches 0.7 * need, so 0.5x ($35) and 2x ($140) are tried —
-  // the $140 quote is depth-rejected (1.4% impact > 0.7%), the $35 one is not.
+  // ($13.92) reaches 0.7 * need, so the ladder's next step ($52) is tried —
+  // its gross (~$10.34) is no longer close, so the $35 step is never
+  // quoted. (The old 0.5x/2x trigger is gone: the 2x step would have been
+  // depth-rejected at 1.4% impact anyway.)
   const { engine, priced } = setup({ dexTvlUsd: 20_000, minPoolLiquidityUsd: 0, bid: 12 });
   await engine.tick();
-  assert.deepEqual(usdcSizes(priced), [70, 35]); // 140 never quoted
+  assert.deepEqual(usdcSizes(priced), [70, 52]); // 35 never quoted
 });
 
 test('depth-derived base: unknown TVL keeps the old $100 base (and its multi-size)', async () => {

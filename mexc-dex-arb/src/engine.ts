@@ -583,6 +583,31 @@ export class Engine {
         rows.push(this.blankRow(t, 'inventory', `max size ${usd(cap)} < MIN_TRADE_USD (not enough ${dir === 'DEX_BUY' ? 'wallet stable / MEXC token' : 'MEXC USDT / wallet token'})`, dir));
         return null;
       }
+      if (t.dexTvlUsd > 0) {
+        // Grok v2 review: the inventory ladder is the transfer ladder —
+        // 100% / 75% / 50% of the depth-safe size, largest first (same shape
+        // as transfer depthSizes, whole dollars, capped by the direction
+        // cap, at least MIN_TRADE_USD). Largest passing size wins; a smaller
+        // size is only tried when the larger one is below the hurdle but
+        // close (the multi-size trigger). A pool whose safe size is below
+        // MIN falls through to one MIN_TRADE_USD quote so evalAt records
+        // the depth reject instead of silently skipping.
+        const safe = depthSafeSize(t.dexTvlUsd, { maxImpactPct: this.cfg.depthMaxImpactBps / 100, maxSizePct: this.cfg.depthMaxSizePct });
+        let sizes = [...new Set([1, 0.75, 0.5].map((f) => Math.floor(safe * f + 1e-9)).map((s) => Math.min(s, cap)).filter((s) => s >= this.cfg.minTradeUsd))];
+        if (!sizes.length) sizes = [this.cfg.minTradeUsd];
+        let best: Candidate | null = null;
+        for (const size of sizes) {
+          const c = await this.evalAt(t, b, bal, gas, ethUsd, dir, size, rows);
+          if (!c) break; // MEXC book too thin / depth reject: smaller sizes are out of scope here
+          if (!best || c.opp.net > best.opp.net) best = c;
+          const need = c.need ?? this.need(c.opp.sizeUsd);
+          if (c.opp.net > need) break; // passes: take the largest passing size, stop
+          if (c.opp.grossUsd < this.cfg.multiSizeTrigger * need) break; // not close: smaller sizes only shrink the gross
+        }
+        return best;
+      }
+      // Unknown TVL: the old behaviour — one base size, then 0.5x/2x when
+      // close (fail-open; the depth filter in evalAt still gates the quote).
       const sizes = [Math.max(this.cfg.minTradeUsd, Math.min(base, cap))];
       const results: Candidate[] = [];
       const first = await this.evalAt(t, b, bal, gas, ethUsd, dir, sizes[0], rows);
