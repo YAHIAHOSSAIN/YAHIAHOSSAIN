@@ -28,14 +28,17 @@ export function approvalAmount(unlimited: boolean, amount: bigint): bigint {
 export type { GasInfo, TxResult } from './txsender.js';
 import { type GasInfo, type KeyValue, type TxResult, TxSender } from './txsender.js';
 
-/** Median of recent per-block p50 tips, capped; at least 0.001 gwei so a builder still includes the tx. */
-export function pickTip(rewards: bigint[], cap: bigint): bigint {
+/** Median of recent per-block p50 tips, capped; at least 0.001 gwei so a builder still includes the tx.
+ * Phase 5: `builderTipGwei` (default 0) is added on top of the capped median — an optional
+ * extra bid for builder inclusion. 0 leaves the old median-tip path exactly as it was. */
+export function pickTip(rewards: bigint[], cap: bigint, builderTipGwei = 0): bigint {
   const floor = 1_000_000n; // 0.001 gwei
-  if (!rewards.length) return cap;
+  const extra = BigInt(Math.round(builderTipGwei * 1e9));
+  if (!rewards.length) return cap + extra;
   const sorted = [...rewards].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const median = sorted[Math.floor(sorted.length / 2)];
   const t = median < floor ? floor : median;
-  return t > cap ? cap : t;
+  return (t > cap ? cap : t) + extra;
 }
 
 export class Chain {
@@ -55,6 +58,8 @@ export class Chain {
     unresolvedStore?: KeyValue,
     readonly chainId = 1,
     readonly unlimitedApproval = false,
+    /** Phase 5: optional extra builder tip in gwei (BUILDER_TIP_GWEI, default 0 = off). */
+    private builderTipGwei = 0,
   ) {
     this.provider = new ethers.JsonRpcProvider(rpcUrl, chainId, { staticNetwork: true });
     this.sendProvider = new ethers.JsonRpcProvider(sendRpcUrl, chainId, { staticNetwork: true });
@@ -67,10 +72,13 @@ export class Chain {
         },
         confirmedNonce: () => this.provider.getTransactionCount(this.address, 'latest'),
         receipt: (h) => this.provider.getTransactionReceipt(h),
-        // Raw receipt for the OP-stack L1 fee (ethers' receipt type has no l1Fee field).
+        // Raw receipt for the L1 data fee (ethers' receipt type has no l1Fee field).
+        // OP-stack chains carry `l1Fee`; Arbitrum receipts carry `gasUsedForL1` instead.
         rawReceipt: async (h) => {
-          const raw = (await this.provider.send('eth_getTransactionReceipt', [h]).catch(() => null)) as { l1Fee?: string } | null;
-          return raw?.l1Fee ? { l1Fee: BigInt(raw.l1Fee) } : null;
+          const raw = (await this.provider.send('eth_getTransactionReceipt', [h]).catch(() => null)) as { l1Fee?: string; gasUsedForL1?: string } | null;
+          if (raw?.l1Fee) return { l1Fee: BigInt(raw.l1Fee) };
+          if (raw?.gasUsedForL1) return { gasUsedForL1: BigInt(raw.gasUsedForL1) };
+          return null;
         },
         knowsTx: async (h) => Boolean((await this.provider.getTransaction(h).catch(() => null)) ?? (await this.sendProvider.getTransaction(h).catch(() => null))),
         sign: async (t) => {
@@ -146,12 +154,14 @@ export class Chain {
     const cap = ethers.parseUnits(String(this.priorityFeeGwei), 'gwei');
     // Tip = median (p50) of the last 20 blocks' tips, capped by PRIORITY_FEE_GWEI. A fixed 1 gwei was
     // 2-7x the whole base fee on mainnet (base fee ~0.15 gwei), i.e. most of the gas cost.
-    let tip = cap;
+    // The builder tip (BUILDER_TIP_GWEI, default 0) is added on top in both paths.
+    const extra = BigInt(Math.round(this.builderTipGwei * 1e9));
+    let tip = cap + extra;
     try {
       const h = (await this.provider.send('eth_feeHistory', ['0x14', 'latest', [50]])) as { reward?: string[][] };
-      tip = pickTip((h.reward ?? []).map((r) => BigInt(r[0])), cap);
+      tip = pickTip((h.reward ?? []).map((r) => BigInt(r[0])), cap, this.builderTipGwei);
     } catch {
-      // keep the cap
+      // keep cap + builder tip
     }
     return { baseFee, tip, effective: baseFee + tip, maxFee: baseFee * 2n + tip };
   }

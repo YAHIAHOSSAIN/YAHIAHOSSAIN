@@ -1,4 +1,5 @@
-// DEX quotes from 0x (Swap API v2, AllowanceHolder), 1inch (Swap API v6) and KyberSwap (Aggregator API v1).
+// DEX quotes from 0x (Swap API v2, AllowanceHolder), 1inch (Swap API v6), KyberSwap (Aggregator API v1),
+// Velora (ex-ParaSwap, Market API v6.2) and OpenOcean (Enterprise API v4).
 // All route across many DEXs; DEX pool fees are already in the output amount.
 // BestOf queries several of them and uses the best quote after gas; Limited wraps each in a rate limiter.
 import { log, redact } from '../log.js';
@@ -41,6 +42,22 @@ export const ONEINCH_ROUTER_V6 = '0x111111125421ca6dc452d289314280a0f8842a65';
 // KyberSwap MetaAggregationRouterV2: docs.kyberswap.com/developer-guide/aggregator-api/contracts
 // ("deployed at the same address across all supported chains"); live /routes returned it on all four chains.
 export const KYBER_ROUTER_V2 = '0x6131b5fae19ea4f9d964eac0408e4408b66337b5';
+// Velora (ex-ParaSwap) Augustus V6.2 router: same address on every chain (CREATE2 deployment).
+// Verified: Arbiscan labels it "Velora: Augustus V6.2" on Arbitrum, and Tether's WDK Velora
+// integration docs pin this exact address for the EVM module ("The target is the Augustus v6.2
+// router, 0x6a000f20005980200259b80c5102003040001068"). The API's returned contractAddress is
+// still checked against it on every call, so a per-chain difference would fail soft, never
+// approve a wrong address. For Market swaps through Augustus v6.2 the router IS the direct
+// ERC-20 spender (no separate TokenTransferProxy — that was the v5 flow).
+export const VELORA_ROUTER_V6_2 = '0x6a000f20005980200259b80c5102003040001068';
+// OpenOcean Exchange V2: one address on every standard EVM network (per the official
+// openocean-finance/OpenOceanExchangeV2 deployment docs: "Most networks (Ethereum, BSC,
+// Polygon, Arbitrum, etc.) ... Consistent contract address"). Verified: Etherscan labels it
+// "OpenOcean: Exchange V2" on Ethereum, Arbiscan the same on Arbitrum, and the official
+// Enterprise API docs show it as the "exchange" in their BSC quote example. The API's
+// returned exchange/to is still checked against this map on every call.
+export const OPENOCEAN_EXCHANGE_V2 = '0x6352a56caadc4f1e25cd6c75970fa768a3304e64';
+export const OPENOCEAN_EXCHANGE: Record<number, string> = { 1: OPENOCEAN_EXCHANGE_V2, 56: OPENOCEAN_EXCHANGE_V2, 42161: OPENOCEAN_EXCHANGE_V2 };
 
 function requireAddress(kind: string, got: string | undefined, allowed: string): string {
   if (!got || got.toLowerCase() !== allowed) throw new Error(`${kind} ${got} is not the allowlisted contract ${allowed}`);
@@ -271,6 +288,209 @@ export class Kyber implements Aggregator {
       spender: KYBER_ROUTER_V2,
       source: 'kyber',
       tx: { to, data: b.data.data, value: BigInt(b.data.transactionValue || '0') },
+    };
+  }
+}
+
+interface VeloraPrice {
+  priceRoute?: {
+    srcToken?: string;
+    srcAmount?: string;
+    destToken?: string;
+    destAmount: string;
+    gasCost?: string | null;
+    contractAddress?: string;
+    tokenTransferProxy?: string;
+    version?: string | null;
+  } & Record<string, unknown>;
+  // v6.2 may also surface the route under `route`; the raw object is passed
+  // to /transactions unmodified either way.
+  route?: Record<string, unknown>;
+}
+interface VeloraTx {
+  from?: string;
+  to: string;
+  chainId?: number;
+  value?: string | null;
+  data: string;
+  gasPrice?: string | null;
+  gas?: string | null;
+}
+
+/**
+ * Velora (ex-ParaSwap) Market API, version 6.2 (docs.velora.xyz, API free tier: no key,
+ * pass partner=<app> on each call; 1 RPS / 5,000 req/day). GET /prices/?...&version=6.2,
+ * then POST /transactions/{network} with the priceRoute EXACTLY as /prices returned it
+ * (the API rejects a modified route, hmac included). srcDecimals/destDecimals are optional
+ * ("improves accuracy") and are omitted: QuoteRequest carries no decimals, so the API
+ * resolves them from its token list; a token it cannot resolve fails soft (BestOf skips it).
+ * priceRoute.gasCost is treated as the gas-units estimate (ParaSwap convention).
+ */
+export class Velora implements Aggregator {
+  name = 'velora';
+  private base = 'https://api.velora.xyz';
+  constructor(
+    private chainId = 1,
+    private partner = 'mexc-dex-arb',
+    private fetchFn: FetchFn = fetch,
+  ) {}
+  private minOut(amount: bigint, bps: number) {
+    return (amount * BigInt(10_000 - bps)) / 10_000n;
+  }
+  private async prices(r: QuoteRequest): Promise<{ route: Record<string, unknown>; destAmount: string; gas: string }> {
+    const q = new URLSearchParams({
+      srcToken: r.sellToken,
+      destToken: r.buyToken,
+      amount: r.sellAmount.toString(),
+      side: 'SELL',
+      network: String(this.chainId),
+      version: '6.2',
+      partner: this.partner,
+    });
+    const d = await getJson<VeloraPrice>(this.fetchFn, `${this.base}/prices/?${q}`, { accept: 'application/json' });
+    const route = (d.priceRoute ?? d.route) as VeloraPrice['priceRoute'];
+    if (!route || typeof route.destAmount !== 'string') throw new Error('velora: no route for this pair');
+    // The quote must be for API version 6.2 (WDK Velora docs) and for our exact request.
+    if (route.version && route.version !== '6.2') throw new Error(`velora: priceRoute version ${route.version} is not 6.2`);
+    if (route.srcToken && route.srcToken.toLowerCase() !== r.sellToken.toLowerCase()) throw new Error('velora: priceRoute srcToken does not match the request');
+    if (route.destToken && route.destToken.toLowerCase() !== r.buyToken.toLowerCase()) throw new Error('velora: priceRoute destToken does not match the request');
+    if (route.srcAmount && BigInt(route.srcAmount) !== r.sellAmount) throw new Error('velora: priceRoute srcAmount does not match the request');
+    // For Market swaps through Augustus v6.2 the router is the direct spender; reject anything else.
+    requireAddress('velora router', route.contractAddress, VELORA_ROUTER_V6_2);
+    return { route: route as Record<string, unknown>, destAmount: route.destAmount, gas: route.gasCost ?? '300000' };
+  }
+
+  async price(r: QuoteRequest): Promise<Quote> {
+    const p = await this.prices(r);
+    const buy = BigInt(p.destAmount);
+    return { buyAmount: buy, minBuyAmount: this.minOut(buy, r.slippageBps), gas: BigInt(p.gas), spender: VELORA_ROUTER_V6_2, source: 'velora' };
+  }
+
+  async quote(r: QuoteRequest): Promise<Quote> {
+    const p = await this.prices(r); // fresh route: /transactions rejects a stale/modified priceRoute
+    const body = {
+      srcToken: r.sellToken,
+      destToken: r.buyToken,
+      srcAmount: r.sellAmount.toString(),
+      priceRoute: p.route, // unmodified, exactly as /prices returned it
+      slippage: r.slippageBps,
+      userAddress: r.taker,
+      partner: this.partner,
+    };
+    const t = await getJson<VeloraTx>(this.fetchFn, `${this.base}/transactions/${this.chainId}`, { accept: 'application/json', 'content-type': 'application/json' }, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    const to = requireAddress('velora tx.to', t.to, VELORA_ROUTER_V6_2);
+    const buy = BigInt(p.destAmount);
+    return {
+      buyAmount: buy,
+      minBuyAmount: this.minOut(buy, r.slippageBps),
+      gas: BigInt(t.gas ?? p.gas),
+      spender: VELORA_ROUTER_V6_2,
+      source: 'velora',
+      tx: { to, data: t.data, value: BigInt(t.value ?? '0') },
+    };
+  }
+}
+
+interface OpenOceanQuoteData {
+  inAmount?: string;
+  outAmount: string;
+  estimatedGas?: string | number;
+  exchange?: string;
+  minOutAmount?: string;
+}
+interface OpenOceanSwapData extends OpenOceanQuoteData {
+  from?: string;
+  to?: string;
+  value?: string;
+  data?: string;
+  gasPrice?: string;
+  chainId?: number;
+}
+interface OpenOceanQuote {
+  code: number;
+  data?: OpenOceanQuoteData;
+  error?: string;
+}
+interface OpenOceanSwap {
+  code: number;
+  data?: OpenOceanSwapData;
+  error?: string;
+}
+
+/**
+ * OpenOcean Enterprise API v4 (docs.openocean.finance/docs/swap-api/enterprise).
+ * Free public API, no key (keys only raise the rate limit; public default is 2 RPS).
+ * GET /v4/:chain/quote (indicative, no account -> no calldata) and /v4/:chain/swap
+ * (firm, account=taker -> calldata). The exchange contract address comes back in the
+ * response and is allowlisted per chain — a chain with no verified exchange address
+ * throws at construction and is never traded on. NOTE: the public API applies a tiered
+ * trading fee (0.01% stable / 0.1% correlated / 0.25% common / 0.5% exotic pairs,
+ * docs "API Pricing & Access"); it is expected to be baked into outAmount, but that
+ * must be confirmed on paper before enabling live (see CHANGES.md).
+ */
+export class OpenOcean implements Aggregator {
+  name = 'openocean';
+  private base = 'https://open-api-enterprise.openocean.finance/v4';
+  private exchange: string;
+  constructor(
+    private chainId = 1,
+    private fetchFn: FetchFn = fetch,
+  ) {
+    const ex = OPENOCEAN_EXCHANGE[chainId];
+    if (!ex) throw new Error(`openocean: no verified exchange contract for chain ${chainId} — aggregator disabled on this chain`);
+    this.exchange = ex;
+  }
+  private minOut(amount: bigint, bps: number) {
+    return (amount * BigInt(10_000 - bps)) / 10_000n;
+  }
+  private params(r: QuoteRequest, extra: Record<string, string> = {}): URLSearchParams {
+    return new URLSearchParams({
+      inTokenAddress: r.sellToken,
+      outTokenAddress: r.buyToken,
+      amountDecimals: r.sellAmount.toString(),
+      // Gas price in wei; only feeds the API's gas-cost estimate — our own gas
+      // pricing happens in txsender. 1 Gwei is a neutral placeholder.
+      gasPriceDecimals: '1000000000',
+      slippage: String(r.slippageBps / 100), // percent, range 0.05–50
+      ...extra,
+    });
+  }
+  private check<D>(d: { code: number; data?: D; error?: string }, what: string): D {
+    if (d.code !== 200 || !d.data) throw new Error(`openocean ${what}: code ${d.code}${d.error ? ` ${d.error}` : ''}`);
+    return d.data;
+  }
+
+  async price(r: QuoteRequest): Promise<Quote> {
+    const d = await getJson<OpenOceanQuote>(this.fetchFn, `${this.base}/${this.chainId}/quote?${this.params(r)}`, { accept: 'application/json' });
+    const data = this.check(d, 'quote');
+    requireAddress('openocean exchange', data.exchange, this.exchange);
+    const buy = BigInt(data.outAmount);
+    return {
+      buyAmount: buy,
+      minBuyAmount: this.minOut(buy, r.slippageBps),
+      gas: BigInt(String(data.estimatedGas ?? '300000')),
+      spender: this.exchange,
+      source: 'openocean',
+    };
+  }
+
+  async quote(r: QuoteRequest): Promise<Quote> {
+    const d = await getJson<OpenOceanSwap>(this.fetchFn, `${this.base}/${this.chainId}/swap?${this.params(r, { account: r.taker })}`, { accept: 'application/json' });
+    const data = this.check(d, 'swap');
+    requireAddress('openocean exchange', data.exchange, this.exchange);
+    const to = requireAddress('openocean tx.to', data.to, this.exchange);
+    if (!data.data) throw new Error('openocean swap: no calldata in response');
+    const buy = BigInt(data.outAmount);
+    return {
+      buyAmount: buy,
+      minBuyAmount: data.minOutAmount ? BigInt(data.minOutAmount) : this.minOut(buy, r.slippageBps),
+      gas: BigInt(String(data.estimatedGas ?? '300000')),
+      spender: this.exchange,
+      source: 'openocean',
+      tx: { to, data: data.data, value: BigInt(data.value ?? '0') },
     };
   }
 }

@@ -18,7 +18,7 @@ module.exports = {
     name: `mexc-dex-arb-${chain}`,
     script: 'dist/main.js',
     cwd: __dirname,
-    env: { CHAIN: chain, DB_PATH: `data/${chain}.sqlite` },
+    env: { CHAIN: chain, MODE: 'paper', DB_PATH: `data/${chain}.sqlite` },
     autorestart: true,
     // Keep restarting (with growing delay) instead of giving up silently after a few crashes.
     max_restarts: 1000,

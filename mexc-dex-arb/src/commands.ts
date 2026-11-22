@@ -13,7 +13,7 @@ export interface ChainLike {
  * /start handler shared by both strategies: critical pauses need "/start confirm", and even then
  * the bot re-checks that nothing is still unresolved (pending DEX tx, executing trade) before resuming.
  */
-export function startHandler(risk: Risk, statusText: () => Promise<string>, stillUnresolved: () => Promise<string | null>) {
+export function startHandler(risk: Risk, statusText: () => Promise<string>, stillUnresolved: () => Promise<string | null>, explorer = 'etherscan.io') {
   return async (args: string[]) => {
     const confirm = args[0]?.toLowerCase() === 'confirm';
     if (risk.paused && risk.critical && !confirm) {
@@ -21,7 +21,7 @@ export function startHandler(risk: Risk, statusText: () => Promise<string>, stil
     }
     if (risk.paused && risk.critical) {
       const open = await stillUnresolved();
-      if (open) return `⛔ Not resuming: ${open}\nResolve it first (check etherscan / MEXC), then /start confirm again.`;
+      if (open) return `⛔ Not resuming: ${open}\nResolve it first (check ${explorer} / MEXC), then /start confirm again.`;
     }
     risk.resume(confirm);
     const block = risk.blockReason();

@@ -2,7 +2,7 @@
 // so the two bots sharing one chat can never be confused.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Telegram } from '../src/telegram.js';
+import { Telegram, makeModeTag } from '../src/telegram.js';
 
 function capture() {
   const sent: string[] = [];
@@ -32,4 +32,17 @@ test('Telegram send() without a tag sends the text unchanged', async () => {
   const tg = new Telegram('123456:TOKENTOKEN', '777', fetchFn, '42');
   await tg.send('plain message');
   assert.deepEqual(sent, ['plain message']);
+});
+
+test('makeModeTag names the mode and the chain', async () => {
+  assert.equal(makeModeTag('live', 'arbitrum'), '🔴 LIVE — আসল টাকা · arbitrum');
+  assert.equal(makeModeTag('paper', 'ethereum'), '📝 PAPER · ethereum');
+  assert.equal(makeModeTag('live', 'ethereum'), '🔴 LIVE — আসল টাকা · ethereum');
+});
+
+test('Telegram send() prepends a chain tag as the first line', async () => {
+  const { sent, fetchFn } = capture();
+  const tg = new Telegram('123456:TOKENTOKEN', '777', fetchFn, '42', undefined, makeModeTag('live', 'arbitrum'));
+  await tg.send('Bot started. MODE=LIVE STRATEGY=transfer');
+  assert.deepEqual(sent, ['🔴 LIVE — আসল টাকা · arbitrum\nBot started. MODE=LIVE STRATEGY=transfer']);
 });

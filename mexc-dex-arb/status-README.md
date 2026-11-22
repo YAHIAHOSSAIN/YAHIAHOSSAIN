@@ -4,6 +4,22 @@ Yahia terminal ছাড়া VPS-এর বটটা দেখতে চেয
 উত্তর: ফোনের browser-এ খুললেই বট চলছে কিনা, আজ কয়টা paper ট্রেড, লাভ/লস
 কত, শেষ scan কখন — সব এক পাতায়।
 
+## Details dashboard — Premium look (LIVE 2026-11-22 ~14:55 ঢাকা, Yahia-র OK)
+
+- Demo v2 approve করে বসানো: উপরে ৪টা hero stat card (মোট লাভ/লস, ট্রেড +
+  জয়ের হার, ২৪ ঘণ্টার সেরা gap, সেরা টোকেন), তার নিচে আজকের strip
+- প্রতিটা trade-এর detail: কেনা → বেচা দাম, প্রথম net vs booked net,
+  গ্যাস+ফি, লাভ/লস pill (সাম্প্রতিক ১২টা)
+- Gap chart: distribution (৬ bucket) + ঘণ্টায় সেরা gap — গত ২৪ ঘণ্টার
+  opportunities থেকে; live-এ ডেটা নেই বলে warning দেখায় (transfer mode
+  gap save করে না — gap-record fix হলে chart আসবে)
+- টোকেন ranking (জয়ের হারের bar-সহ), দিন অনুযায়ী card (৭ দিন), live-এ
+  transfer-এর তালিকা + note
+- Local test (টেস্ট DB): hero ২৪ ট্রেড +$16.66, ১৩ জয়, NPC সেরা +$19.41;
+  live gap bestBps null → warning ঠিকমতো দেখায়; page 200
+- VPS verify: paper ২৫ ট্রেড +$17.42, live ২ ট্রেড −$5.55; public
+  https://arb.alphahelper.online-এ নতুন section-গুলো দেখা যাচ্ছে
+
 ## Live section (যোগ হয়েছে 2026-11-21 ~21:50 ঢাকা, Yahia-র OK)
 
 - পেজের নিচে **🔴 Live — আসল টাকা** অংশ: live twin-এর অবস্থা (pm2

@@ -11,7 +11,7 @@ const GWEI = 1_000_000_000n;
 /** New defaults: fee per symbol, 5 bps CEX slippage, safety 10 bps, need = max($0.25, 20 bps). */
 function defaults() {
   const saved = { ...process.env };
-  for (const k of ['MIN_PROFIT_USD', 'MIN_PROFIT_BPS', 'SAFETY_MARGIN_USD', 'SAFETY_MARGIN_BPS', 'CEX_SLIPPAGE_BPS', 'MAX_TRADE_USD', 'CHAIN', 'STRATEGY', 'MODE']) delete process.env[k];
+  for (const k of ['MIN_PROFIT_USD', 'MIN_PROFIT_BPS', 'SAFETY_MARGIN_USD', 'SAFETY_MARGIN_BPS', 'CEX_SLIPPAGE_BPS', 'MAX_TRADE_USD', 'MIN_TRADE_USD', 'TRANSFER_DRIFT_BPS', 'CHAIN', 'STRATEGY', 'MODE', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED', 'MIN_PROFIT_BPS_ETH', 'BUILDER_TIP_GWEI']) delete process.env[k];
   process.env.RPC_URL = 'http://x';
   const c = validateConfig(loadConfig());
   process.env = saved;

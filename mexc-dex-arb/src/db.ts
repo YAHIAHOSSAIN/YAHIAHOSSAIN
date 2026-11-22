@@ -26,6 +26,12 @@ export interface TradeRow {
   cex_order_id: string | null;
   note: string | null;
   requoted_net?: number | null;
+  /** Winning aggregator for the trade's DEX quote (q.source ?? agg name); null for old rows / trades with no DEX quote. */
+  aggregator?: string | null;
+  /** Best-pool TVL the depth-derived size was computed from; null when unknown (fail-open) or for live transfer trades (the transfer row carries no TVL). */
+  pool_tvl_usd?: number | null;
+  /** Largest depth-safe size for that pool at the impact cap; null when the TVL was unknown. */
+  safe_size_usd?: number | null;
 }
 
 // One buy -> withdraw -> sell cycle. Persisted so a restart resumes it where it stopped.
@@ -61,6 +67,18 @@ export interface TransferRow {
   force_sell: number; // 1 = /sell command: sell even below the loss floor
   hold_alerted: number;
   sell_tx: string | null; // DEX sale tx hash, written before broadcast (crash safety)
+  // Phase 8 recycle: the USDC proceeds go back to MEXC and are sold for USDT on MEXC spot.
+  recycle_status: string | null; // '' | 'address' | 'sent' | 'credited' | 'sold' | 'done'
+  recycle_held: number; // 1 = held for a human (/recycle to resume)
+  recycled_usdc: number | null; // USDC actually sent to MEXC
+  recycled_usdt: number | null; // USDT actually received from the USDCUSDT sell
+  recycle_address: string | null; // MEXC USDC deposit address (from the API, never hardcoded)
+  recycle_tx: string | null; // deposit tx hash, written before broadcast (crash safety)
+  recycle_order_id: string | null; // our client order id of the USDCUSDT market sell
+  recycle_note: string | null; // hold reason / resume note
+  recycle_deadline: number; // ms timestamp: the deposit must credit on MEXC by this
+  recycle_mexc_before: number | null; // MEXC free USDC just before the deposit send
+  recycle_usdt_before: number | null; // MEXC free USDT just before the market sell
 }
 
 const TRANSFER_MIGRATIONS = [
@@ -69,6 +87,18 @@ const TRANSFER_MIGRATIONS = [
   'ALTER TABLE transfers ADD COLUMN force_sell INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE transfers ADD COLUMN hold_alerted INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE transfers ADD COLUMN sell_tx TEXT',
+  // Phase 8 recycle (same PRAGMA + ALTER TABLE pattern; old rows stay NULL/0 = never recycled).
+  'ALTER TABLE transfers ADD COLUMN recycle_status TEXT',
+  'ALTER TABLE transfers ADD COLUMN recycle_held INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE transfers ADD COLUMN recycled_usdc REAL',
+  'ALTER TABLE transfers ADD COLUMN recycled_usdt REAL',
+  'ALTER TABLE transfers ADD COLUMN recycle_address TEXT',
+  'ALTER TABLE transfers ADD COLUMN recycle_tx TEXT',
+  'ALTER TABLE transfers ADD COLUMN recycle_order_id TEXT',
+  'ALTER TABLE transfers ADD COLUMN recycle_note TEXT',
+  'ALTER TABLE transfers ADD COLUMN recycle_deadline INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE transfers ADD COLUMN recycle_mexc_before REAL',
+  'ALTER TABLE transfers ADD COLUMN recycle_usdt_before REAL',
 ];
 
 /** One evaluated candidate (paper and live), written for EVERY candidate, traded or not. */
@@ -94,7 +124,36 @@ export interface OpportunityRow {
   reason: string | null;
 }
 
-/** One executed leg of a live trade. */
+/** One tick's depth-filter rejections, summarised (Phase 6): one row per tick
+ * per bot, never one row per rejected candidate (~100/tick would explode).
+ * `detail` is JSON of the top ~10 rejects: [{token, liq_usd, impact_pct, reason}]. */
+export interface DepthRejectRow {
+  ts: number;
+  chain: string;
+  total: number;
+  detail: string;
+}
+
+/** Public (non-secret) bot config for the status dashboard (Phase 6, option b):
+ * written by the bot at startup into the existing `state` table, read by the
+ * read-only status server — it never reads .env. Values only, never secrets. */
+export interface PublicConfig {
+  aggregators: string[];
+  dexArbEnabled: boolean;
+  minPoolLiquidityUsd: number;
+  depthMaxImpactBps: number;
+  strategy: string;
+}
+
+/** Publish the bot's public config into the DB so the dashboard can show it
+ * without reading .env. Self-updating: a restart with new env rewrites it. */
+export function publishPublicConfig(db: Db, cfg: PublicConfig): void {
+  db.setState('cfg:aggregators', cfg.aggregators.join(','));
+  db.setState('cfg:dex_arb_enabled', cfg.dexArbEnabled ? 'yes' : 'no');
+  db.setState('cfg:min_pool_liquidity_usd', String(cfg.minPoolLiquidityUsd));
+  db.setState('cfg:depth_max_impact_bps', String(cfg.depthMaxImpactBps));
+  db.setState('cfg:strategy', cfg.strategy);
+}
 export interface LegRow {
   trade_id: number;
   leg: 'dex' | 'mexc' | 'unwind';
@@ -153,6 +212,17 @@ export class Db {
     if (!tcols.has('cids')) this.db.exec('ALTER TABLE trades ADD COLUMN cids TEXT');
     // trades.requoted_net: paper mode books the net after a simulated latency + re-quote, not the first quote.
     if (!tcols.has('requoted_net')) this.db.exec('ALTER TABLE trades ADD COLUMN requoted_net REAL');
+    // trades.aggregator / pool_tvl_usd / safe_size_usd (Phase 6): winning
+    // aggregator per trade + the depth context its size was derived from.
+    if (!tcols.has('aggregator')) this.db.exec('ALTER TABLE trades ADD COLUMN aggregator TEXT');
+    if (!tcols.has('pool_tvl_usd')) this.db.exec('ALTER TABLE trades ADD COLUMN pool_tvl_usd REAL');
+    if (!tcols.has('safe_size_usd')) this.db.exec('ALTER TABLE trades ADD COLUMN safe_size_usd REAL');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS depth_rejects (
+        ts INTEGER NOT NULL, chain TEXT NOT NULL, total INTEGER NOT NULL, detail TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS depth_rejects_ts ON depth_rejects(ts);
+    `);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS opportunities (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, chain TEXT, token TEXT NOT NULL, direction TEXT,
@@ -188,11 +258,17 @@ export class Db {
     return Number(this.db
       .prepare(
         `INSERT INTO trades (ts, day, mode, symbol, direction, size_usd, qty, buy_price, sell_price, expected_net,
-          cex_fee_usd, gas_usd, pnl_usd, status, dex_tx, cex_order_id, note)
+          cex_fee_usd, gas_usd, pnl_usd, status, dex_tx, cex_order_id, note, aggregator, pool_tvl_usd, safe_size_usd)
          VALUES (@ts, @day, @mode, @symbol, @direction, @size_usd, @qty, @buy_price, @sell_price, @expected_net,
-          @cex_fee_usd, @gas_usd, @pnl_usd, @status, @dex_tx, @cex_order_id, @note)`,
+          @cex_fee_usd, @gas_usd, @pnl_usd, @status, @dex_tx, @cex_order_id, @note, @aggregator, @pool_tvl_usd, @safe_size_usd)`,
       )
-      .run(t).lastInsertRowid);
+      .run({ ...t, aggregator: t.aggregator ?? null, pool_tvl_usd: t.pool_tvl_usd ?? null, safe_size_usd: t.safe_size_usd ?? null }).lastInsertRowid);
+  }
+
+  /** One summary row per tick (Phase 6): callers pass the tick total + the
+   * top-10 detail JSON (see topDepthRejects); zero-reject ticks write nothing. */
+  insertDepthRejects(r: DepthRejectRow): void {
+    this.db.prepare('INSERT INTO depth_rejects (ts, chain, total, detail) VALUES (@ts, @chain, @total, @detail)').run(r);
   }
 
   updateTrade(id: number, fields: Partial<TradeRow>): void {
@@ -218,6 +294,20 @@ export class Db {
     return this.db.prepare(
       `SELECT symbol, COUNT(*) AS trades, SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins, COALESCE(SUM(pnl_usd), 0) AS pnl
        FROM trades WHERE mode = 'paper' GROUP BY symbol`,
+    ).all() as { symbol: string; trades: number; wins: number; pnl: number }[];
+  }
+
+  /** Per-token booked LIVE P&L: { symbol (base), trades, wins, pnl }.
+   * Only finished live trades: 'ok' (completed DEX sale, PnL measured from
+   * real balances) and 'one_sided' (failed transfer, booked negative PnL) —
+   * a token with one win and one bigger loss is not a winner. In-flight
+   * ('executing'/'approval') rows never count (their PnL is 0 anyway), and
+   * inventory-engine failure statuses ('dex_failed'/'cex_failed') never
+   * occur in transfer mode. Phase 9: the winner list is built from this. */
+  liveTokenStats(): { symbol: string; trades: number; wins: number; pnl: number }[] {
+    return this.db.prepare(
+      `SELECT symbol, COUNT(*) AS trades, SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins, COALESCE(SUM(pnl_usd), 0) AS pnl
+       FROM trades WHERE mode = 'live' AND status IN ('ok', 'one_sided') GROUP BY symbol`,
     ).all() as { symbol: string; trades: number; wins: number; pnl: number }[];
   }
 
@@ -340,6 +430,29 @@ export class Db {
 
   stuckTransfers(): TransferRow[] {
     return this.db.prepare(`SELECT * FROM transfers WHERE status = 'stuck' ORDER BY id`).all() as TransferRow[];
+  }
+
+  /** Done transfers whose USDC proceeds have not been recycled yet (Phase 8):
+   * the tick loop picks these up, including after a restart. Held ones wait for /recycle. */
+  transfersNeedingRecycle(): TransferRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM transfers WHERE status = 'done' AND usdc_out IS NOT NULL AND usdc_out > 0
+         AND recycle_held = 0 AND (recycle_status IS NULL OR recycle_status <> 'done') ORDER BY id`,
+      )
+      .all() as TransferRow[];
+  }
+
+  /** Done transfers whose proceeds are STILL in the hot wallet (recycle never sent):
+   * the one-time catch-up sweep subtracts these from the live balance, so it
+   * only sweeps the pre-existing leftover, never another transfer's proceeds. */
+  transfersRecyclePending(): TransferRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM transfers WHERE status = 'done' AND usdc_out IS NOT NULL AND usdc_out > 0
+         AND (recycle_status IS NULL OR recycle_status IN ('', 'address')) ORDER BY id`,
+      )
+      .all() as TransferRow[];
   }
 
   getTransfer(id: number): TransferRow | undefined {

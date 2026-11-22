@@ -9,26 +9,36 @@
 //    never blindly repeated.
 //  - A withdrawal is only ever sent to our own hot wallet, and never re-sent automatically.
 //  - Failed DEX sales back off (2m, 10m, 30m) and then wait for a human (/sell <id>, /clear <id>).
+//    The FIRST retry after a failed swap is fast (~25 s) while the fresh quote is still
+//    profitable (Phase 7); a fresh quote at/below the loss floor holds instead, as before.
 //  - If arrival-time price would lose more than TRANSFER_MAX_LOSS_PCT, the tokens are held (alert).
 //  - An unknown on-chain outcome pauses trading instead of retrying.
 import type { Config } from './config.js';
 import { BestOf, ZEROX_ALLOWANCE_HOLDER, type Aggregator, type Quote } from './dex/aggregator.js';
 import type { GasInfo, TxResult } from './dex/chain.js';
-import type { Book, CoinConfig, Order, SymbolInfo, WithdrawRecord } from './mexc/rest.js';
+import type { Book, CoinConfig, DepositRecord, Order, SymbolInfo, WithdrawRecord } from './mexc/rest.js';
 import { AmbiguousRequestError } from './mexc/rest.js';
 import type { Db, TransferRow } from './db.js';
 import type { Risk } from './risk.js';
 import type { Notifier } from './engine.js';
+import { RecycleEngine } from './recycle.js';
 import { USDC_DECIMALS, cancelAndConfirm, clientId, placeSafely } from './engine.js';
 import { closePrice, orderProblem, takerFeeFor } from './mexc/rules.js';
-import { type Gap, type ScanToken, dexPrices, findGaps, loadUniverse } from './scanner.js';
+import { type Gap, type ScanToken, MAX_PINNED_WINNERS, dexPrices, findGaps, loadUniverse } from './scanner.js';
+import { depthRejectReason, depthSafeSize, estimatedImpact, topDepthRejects, type DepthRejectDetail } from './dex/depth.js';
+import { explorerTxUrl } from './chains.js';
 import { evaluateTransfer, gasUsd, planCexBuy, threshold } from './pricing.js';
+import { hurdleBps } from './config.js';
 import { log, errMsg } from './log.js';
-import { decimalsOfStep, dhakaDay, floorToStep, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+import { decimalsOfStep, dhakaDay, floorToStep, mapBatches, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
 
 const APPROVE_GAS = 60_000n;
 const PAPER_TAKER = '0x000000000000000000000000000000000000dEaD';
 const SELL_BACKOFF_MS = [2 * 60_000, 10 * 60_000, 30 * 60_000]; // after attempt 1, 2, 3; attempt 4 -> stuck
+// Phase 7: fast retry after the FIRST failed swap only, while the fresh quote is still
+// profitable (live ACN #3: first swap reverted, quote stayed profitable, +$15.79 after
+// the 2-min wait). Later retries keep SELL_BACKOFF_MS. Hardcoded: no env knob.
+const SELL_FAST_RETRY_MS = 25_000;
 const MAX_SELL_ATTEMPTS = 4;
 const FALSE_GAP_COOLDOWN_MS = 10 * 60_000;
 
@@ -46,12 +56,18 @@ export interface TransferMexc {
   cancelOrder(symbol: string, orderId: string): Promise<Order>;
   withdraw(p: { coin: string; netWork: string; address: string; amount: string; contractAddress?: string; withdrawOrderId?: string }): Promise<string>;
   findWithdraw(coin: string, sinceTs: number, ref: { id?: string | null; withdrawOrderId?: string }): Promise<WithdrawRecord | null>;
+  /** Phase 8 recycle: MEXC USDC deposit address (GET, else POST-generate) + deposit history for credit attribution. */
+  depositAddress(coin: string, network: string): Promise<string | null>;
+  depositHistory(coin: string, sinceTs: number): Promise<DepositRecord[]>;
+  findDeposit(coin: string, sinceTs: number, txId: string): Promise<DepositRecord | null>;
 }
 export interface TransferChain {
   readonly address: string;
   gas(): Promise<GasInfo>;
   decimals(token: string): Promise<number>;
   tokenBalance(token: string): Promise<bigint>;
+  /** Native balance (ETH/BNB) — Phase 8 gas-reserve sanity check before the USDC deposit send. */
+  ethBalance(): Promise<bigint>;
   approveExact(token: string, spender: string, amount: bigint, gas: GasInfo): Promise<TxResult>;
   simulate(tx: { to: string; data: string; value: bigint }): Promise<bigint>;
   send(
@@ -76,6 +92,10 @@ export interface TransferDeps {
   dexPricesFn?: typeof dexPrices;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  /** Random source for the per-tick trade size (default Math.random; tests inject a fixed one). */
+  rand?: () => number;
+  /** DEX-stable decimals, read on-chain at startup (6 for USDC, 18 for BSC USDT). Falls back to 6. */
+  stableDecimals?: number;
   // Live mode: restrict the universe to tokens proven profitable in paper
   // (same rule as the inventory live watchlist). When set, refreshUniverse
   // re-applies it on every rescan, so newly proven tokens join live.
@@ -87,15 +107,49 @@ interface Candidate {
   plan: NonNullable<ReturnType<typeof planCexBuy>>;
   ev: ReturnType<typeof evaluateTransfer>;
   decimals: number;
+  /** Winning aggregator for the candidate's DEX quote (q.source ?? agg name). */
+  aggregator?: string;
 }
 
 const WITHDRAW_FAILED = new Set([8, 9]); // FAILED, CANCEL
 const WITHDRAW_MANUAL = 10;
-const buyCid = (id: number) => `arb${id}b`;
-const withdrawCid = (id: number) => `arb${id}w`;
+// Client order ids must be unique per chain: all three live twins share one
+// MEXC account and their transfer ids each restart at 1, so a bare `arb{id}b`
+// would collide — an ambiguous buy could adopt the other twin's order.
+const buyCid = (chain: string, id: number) => `${chain}${id}b`;
+const withdrawCid = (chain: string, id: number) => `${chain}${id}w`;
+
+/** Random whole-dollar trade size in [minUsd, maxUsd] (owner decision 2026-11-22: random $100–300 per trade so thin DEX pools get a smaller size instead of always $300). `rand` is injectable for tests. */
+export function pickTradeSize(minUsd: number, maxUsd: number, rand: () => number = Math.random): number {
+  if (maxUsd <= minUsd) return minUsd;
+  return minUsd + Math.floor(rand() * (maxUsd - minUsd + 1));
+}
+
+/**
+ * Phase 9: winners' gaps first, so a reappearing gap on a proven winner is
+ * never starved by the exact-quote slice (`scanExactQuotes`) or the
+ * aggregator quote budget. Each group keeps its gap-size order (the input
+ * is already biggest-gap-first from findGaps): winners are prioritised,
+ * never re-ranked against each other by PnL. A token with no winner entry
+ * keeps its normal place behind every winner — priority only, never a gate.
+ */
+export function winnersFirst(gaps: Gap[], winners: Set<string>): Gap[] {
+  if (!winners.size) return gaps;
+  const w: Gap[] = [];
+  const rest: Gap[] = [];
+  for (const g of gaps) (winners.has(g.token.base) ? w : rest).push(g);
+  return [...w, ...rest];
+}
 
 export class TransferEngine {
   universe: ScanToken[] = [];
+  // Phase 9: profit-winners — tokens with positive booked net PnL in THIS
+  // twin's own live trades (total > $0, min 1 trade), best PnL first, capped
+  // at MAX_PINNED_WINNERS. Refreshed with the universe (every 10 min), so a
+  // token stops being a winner as soon as its live total goes to/below $0.
+  // Paper mode has no live trades, so its list is always empty.
+  winners: { base: string; pnl: number; trades: number }[] = [];
+  private winnerSet = new Set<string>();
   // True when the proven filter emptied a non-empty universe: live has nothing
   // proven yet, so the bot waits instead of failing startup.
   provenFilteredEmpty = false;
@@ -105,12 +159,51 @@ export class TransferEngine {
   private alerted = new Set<string>();
   private sleep: (ms: number) => Promise<void>;
   private now: () => number;
+  private rand: () => number;
+  /** Phase 8 USDC recycle loop (+ one-time catch-up sweep). */
+  private recycle: RecycleEngine;
   lastGasGwei = 0;
   lastTopGaps: Gap[] = [];
+  /** Phase 5: depth rejects this tick (thin pools dropped before any exact quote).
+   * Reset at the start of every tick; the status server (Phase 6) can read it. */
+  lastDepthRejects = 0;
+  /** Phase 6: per-candidate reject detail for this tick (token/liq/impact/reason),
+   * flushed as ONE summary row at the end of the tick (see flushDepthRejects). */
+  private depthRejectDetails: DepthRejectDetail[] = [];
+
+  /** Record one depth rejection for this tick's summary row. */
+  private noteDepthReject(token: string, size: number, liq: number, reason: string): void {
+    this.depthRejectDetails.push({ token, liq_usd: liq, impact_pct: estimatedImpact(size, liq), reason });
+  }
+
+  /**
+   * Phase 6: persist this tick's depth rejects as ONE summary row
+   * (ts, chain, total, top-10 detail JSON). Zero-reject ticks write nothing,
+   * so a quiet day costs no rows. Never throws — a failed write is logged
+   * and the tick goes on.
+   */
+  flushDepthRejects(now = this.now()): void {
+    if (this.lastDepthRejects === 0 || !this.depthRejectDetails.length) return;
+    try {
+      this.d.db.insertDepthRejects({
+        ts: now,
+        chain: this.cfg.chain.name,
+        total: this.lastDepthRejects,
+        detail: JSON.stringify(topDepthRejects(this.depthRejectDetails)),
+      });
+    } catch (e) {
+      log.warn(`depth rejects record: ${errMsg(e)}`);
+    }
+  }
 
   constructor(private d: TransferDeps) {
     this.sleep = d.sleep ?? realSleep;
     this.now = d.now ?? Date.now;
+    this.rand = d.rand ?? Math.random;
+    this.recycle = new RecycleEngine({
+      cfg: d.cfg, mexc: d.mexc, chain: d.chain, db: d.db, tg: d.tg,
+      sleep: this.sleep, now: this.now, stableDecimals: d.stableDecimals,
+    });
   }
 
   private get cfg() {
@@ -118,6 +211,10 @@ export class TransferEngine {
   }
   private get live() {
     return this.cfg.mode === 'live';
+  }
+  /** DEX-stable decimals (6 for USDC, 18 for BSC USDT); read on-chain at startup, falls back to 6 (same pattern as the inventory engine). */
+  private stableDec(): number {
+    return this.d.stableDecimals ?? USDC_DECIMALS;
   }
   /** USDT per USDC, from MEXC USDCUSDT (refreshed every tick). */
   stableRate = 1;
@@ -151,32 +248,139 @@ export class TransferEngine {
 
   async refreshUniverse(force = false): Promise<void> {
     if (!force && this.now() - this.universeTs < 10 * 60_000) return;
-    const all = await loadUniverse(this.d.mexc, { minVolumeUsd: this.cfg.minMexcVolumeUsd, only: this.cfg.watchlist });
+    // Phase 9: winners come from this twin's OWN live trades (booked PnL in
+    // the trades table — 'ok' sales + 'one_sided' failures, both measured).
+    // Live-only, no paper seeding: paper PnL is a simulated estimate, never
+    // measured from real balances, so it must not make a token a winner.
+    const stats = this.d.db.liveTokenStats();
+    this.winners = stats
+      .filter((s) => s.pnl > 0)
+      .sort((a, b) => b.pnl - a.pnl)
+      .slice(0, MAX_PINNED_WINNERS)
+      .map((s) => ({ base: s.symbol, pnl: s.pnl, trades: s.trades }));
+    this.winnerSet = new Set(this.winners.map((w) => w.base));
+    const all = await loadUniverse(this.d.mexc, {
+      minVolumeUsd: this.cfg.minMexcVolumeUsd,
+      only: this.cfg.watchlist,
+      minDexVolumeUsd: this.cfg.minDexVolumeUsd,
+      minPoolLiquidityUsd: this.cfg.minPoolLiquidityUsd,
+      max: this.cfg.transferUniverseMax,
+      chain: this.cfg.chain,
+      // Phase 9: winners below the volume cut are pinned into the universe
+      // (loadUniverse still drops any winner that fails the safety filters).
+      pin: this.winnerSet,
+    }, this.d.dexPricesFn);
     this.universe = this.d.provenFilter ? this.d.provenFilter(all) : all;
     this.universeTs = this.now();
     this.provenFilteredEmpty = !!this.d.provenFilter && all.length > 0 && this.universe.length === 0;
     if (this.provenFilteredEmpty) this.note('proven-empty', 'live transfer: কোনো টোকেন এখনো paper-এ প্রমাণিত হয়নি — paper-এ লাভ করা টোকেন আসলেই scan শুরু হবে');
-    log.info(`scanner universe: ${this.universe.length} MEXC ERC20 tokens (deposit+withdraw open, volume >= $${this.cfg.minMexcVolumeUsd})${this.d.provenFilter ? ' [proven-only]' : ''}`);
+    if (this.winners.length) log.info(`profit winners (priority): ${this.winners.map((w) => `${w.base} +$${w.pnl.toFixed(2)} (${w.trades} trades)`).join(', ')}`);
+    log.info(`scanner universe: ${this.universe.length} MEXC ERC20 tokens (MEXC vol >= $${this.cfg.minMexcVolumeUsd}, DEX 24h vol >= $${this.cfg.minDexVolumeUsd}, pool liquidity >= $${this.cfg.minPoolLiquidityUsd}${this.cfg.transferUniverseMax ? `, max ${this.cfg.transferUniverseMax}` : ''})${this.d.provenFilter ? ' [proven-only]' : ''}`);
   }
 
   /** One scan cycle. Always advances open transfers first. */
+  /** USDT-balance cap on the trade size: floor(min(MAX_TRADE_USD, usdt * 0.99)). Null when even the minimum trade is unaffordable. */
+  private usdtCap(usdt: number): number | null {
+    const cap = Math.floor(Math.min(this.cfg.maxTradeUsd, usdt * 0.99));
+    return cap < this.cfg.minTradeUsd ? null : cap;
+  }
+
+  /** Random whole-dollar trade size in [MIN_TRADE_USD, usdtCap] — since Phase 2 only the
+   * fail-open fallback for a candidate whose pool TVL is unknown (known pools size from depth
+   * instead, see depthSizes). Null when even the minimum trade is unaffordable. */
+  private tradeSize(usdt: number): number | null {
+    const cap = this.usdtCap(usdt);
+    if (cap === null) return null;
+    return pickTradeSize(this.cfg.minTradeUsd, cap, this.rand);
+  }
+
+  /**
+   * Depth-derived size ladder for one candidate (Phase 2): 100% / 75% / 50% of the largest
+   * depth-safe size, each floored to whole dollars, capped by the USDT balance, deduped,
+   * largest first. Returns null when the token must be skipped: a known-thin pool (below
+   * the liquidity floor) or a safe size below MIN_TRADE_USD. Unknown TVL (<= 0) is NOT
+   * handled here — the caller uses the random fallback instead.
+   *
+   * No chain-specific impact ceiling: on Ethereum the small sizes are already hopeless
+   * because the $4+ gas makes their net fail the hurdle, and the ceiling never binds the
+   * size anyway — at the $150k pool floor the safe size is $525, above MAX_TRADE_USD
+   * ($300 live), so a DEPTH_MAX_IMPACT_BPS_ETH knob would change nothing. If the floor
+   * is ever lowered or MAX raised, revisit.
+   */
+  private depthSizes(g: Gap, cap: number): number[] | null {
+    const liq = g.tvlUsd;
+    const base = g.token.base;
+    if (liq < this.cfg.minPoolLiquidityUsd) {
+      this.lastDepthRejects++;
+      const reason = `pool $${Math.round(liq / 1000)}k < $${Math.round(this.cfg.minPoolLiquidityUsd / 1000)}k`;
+      this.noteDepthReject(base, cap, liq, reason);
+      log.info(`${base}: depth reject — ${reason} (pool ${usd(liq)}, gap ${g.gapPct.toFixed(2)}%)`);
+      return null;
+    }
+    const impactPct = this.cfg.depthMaxImpactBps / 100;
+    const safe = depthSafeSize(liq, { maxImpactPct: impactPct, maxSizePct: this.cfg.depthMaxSizePct });
+    // Float dust: 0.7% of a $10k pool computes as 34.999... not 35 — the
+    // same 1e-9 slack depth.ts uses for boundary comparisons.
+    const full = Math.floor(safe + 1e-9);
+    if (full < this.cfg.minTradeUsd) {
+      this.lastDepthRejects++;
+      const reason = `depth size $${full} < MIN_TRADE_USD $${this.cfg.minTradeUsd}`;
+      this.noteDepthReject(base, full, liq, reason);
+      log.info(`${base}: depth size $${full} < MIN_TRADE_USD $${this.cfg.minTradeUsd} (pool ${usd(liq)}), skipping`);
+      return null;
+    }
+    const sizes = [...new Set([1, 0.75, 0.5].map((f) => Math.min(Math.floor(safe * f + 1e-9), cap)).filter((s) => s >= this.cfg.minTradeUsd))];
+    log.info(`${base}: depth size $${sizes[0]} (pool $${Math.round(liq / 1000)}k, impact ${impactPct.toFixed(2)}%)${sizes.length > 1 ? `; ladder ${sizes.map((s) => `$${s}`).join(' / ')}` : ''}`);
+    return sizes;
+  }
+
+  /**
+   * Evaluate one candidate at descending depth-derived sizes (Phase 2).
+   * Quote-budget aware: the 100% size is tried first; when its net already passes the hurdle
+   * it is taken at once (largest size = largest absolute profit) and no smaller size is
+   * quoted. A smaller size is only tried when the larger one is below the hurdle but its
+   * gross is close (the MULTISIZE_TRIGGER pattern from the inventory engine). Returns the
+   * best-net candidate tried, or null when no size evaluated (MEXC book too thin for the
+   * size / depth reject). Throws when the exact quote itself fails — the tick loop cools
+   * the token down, as before.
+   */
+  private async evaluateSized(g: Gap, gas: GasInfo, nativeUsd: number, sizes: number[]): Promise<Candidate | null> {
+    let best: Candidate | null = null;
+    for (const size of sizes) {
+      const c = await this.evaluate(g, gas, nativeUsd, size);
+      if (!c) break; // MEXC book cannot fill this size (or depth reject): smaller sizes are out of scope here
+      const need = threshold(c.ev.costUsd, this.cfg.minProfitUsd, hurdleBps(this.cfg));
+      log.info(`${g.token.base}: gap ${g.gapPct.toFixed(2)}%, size ${usd(c.ev.costUsd)}, exact net ${usd(c.ev.net)} (need ${usd(need)})`);
+      if (!best || c.ev.net > best.ev.net) best = c;
+      if (c.ev.net > need) break; // passes: take the largest passing size, stop
+      if (c.ev.grossUsd < this.cfg.multiSizeTrigger * need) break; // not close: smaller sizes only shrink the gross
+    }
+    return best;
+  }
+
   async tick(): Promise<void> {
+    this.lastDepthRejects = 0; // per-tick count, read by the status server (Phase 6)
+    this.depthRejectDetails = [];
     const gas = await this.d.chain.gas();
     this.lastGasGwei = Number(gas.effective) / 1e9;
     const tickers = await this.d.mexc.bookTickers();
-    const eth = tickers.get('ETHUSDT');
-    if (!eth) throw new Error('no ETHUSDT ticker');
-    const ethUsd = (eth.bid + eth.ask) / 2;
+    // Gas is paid in the chain's native token: price it in that token (BSC
+    // gas in BNB, not ETH — the old code overstated BSC gas ~3x).
+    const native = tickers.get(this.cfg.chain.nativeMexcSymbol);
+    if (!native) throw new Error(`no ${this.cfg.chain.nativeMexcSymbol} ticker`);
+    const nativeUsd = (native.bid + native.ask) / 2;
     const st = tickers.get('USDCUSDT');
     const rate = st ? (st.bid + st.ask) / 2 : NaN;
     if (!(rate >= 0.99 && rate <= 1.01)) return this.note('stable', `no trading: USDC/USDT rate ${rate} unusable`);
-    this.stableRate = rate;
+    // The DEX stable IS USDT on BSC, so its USDT rate is exactly 1 (the
+    // USDC/USDT peg above is only a sanity check there).
+    this.stableRate = this.cfg.chain.stable.symbol === 'USDT' ? 1 : rate;
 
     // BestOf must compare quotes AFTER gas, like the inventory engine does (round-3, L7f).
     // The transfer's buy token is always the stable, so gas converts straight to stable units.
     if (this.d.agg instanceof BestOf) {
       const dec = await this.d.chain.decimals(this.cfg.usdc);
-      this.d.agg.gasInOutput = (units) => toUnits(gasUsd(units, gas.effective, ethUsd) / this.stableRate, dec);
+      this.d.agg.gasInOutput = (units) => toUnits(gasUsd(units, gas.effective, nativeUsd) / this.stableRate, dec);
     }
 
     // An earlier DEX tx with unknown outcome blocks every new send (same nonce rule as the inventory engine).
@@ -192,21 +396,85 @@ export class TransferEngine {
     for (const row of this.d.db.openTransfers()) {
       if (txBlocked && row.status === 'selling') continue; // would only be refused
       try {
-        await this.advance(row, gas, ethUsd);
+        await this.advance(row, gas, nativeUsd);
       } catch (e) {
         log.error(`transfer #${row.id} ${row.base}: ${errMsg(e)}`);
       }
     }
 
+    // Phase 8: recycle completed sells (done rows are not "open", so they are
+    // picked up here — including after a restart) plus the one-time catch-up
+    // sweep of USDC already sitting in the hot wallet.
+    for (const done of this.d.db.transfersNeedingRecycle()) {
+      try {
+        await this.recycle.advanceTransfer(done, gas, nativeUsd);
+      } catch (e) {
+        log.warn(`transfer #${done.id} recycle: ${errMsg(e)} (retried next scan)`);
+      }
+    }
+    try {
+      await this.recycle.catchUp(gas, nativeUsd);
+    } catch (e) {
+      log.warn(`catch-up sweep: ${errMsg(e)} (retried next scan)`);
+    }
+
     await this.refreshUniverse();
     const dex = await (this.d.dexPricesFn ?? dexPrices)(this.universe.map((t) => t.address));
     const now = this.now();
-    const gaps = findGaps(this.universe, tickers, dex, {
+    let gaps = findGaps(this.universe, tickers, dex, {
       minTvlUsd: this.cfg.minDexTvlUsd,
       minGapPct: this.cfg.scanMinGapPct,
       maxGapPct: this.cfg.scanMaxGapPct,
     });
-    this.lastTopGaps = gaps.slice(0, 5);
+    // Phase 9: winners' gaps go first — the thin-book check below and the
+    // exact-quote slice both take from the front of this list, so a
+    // reappearing gap on a proven winner is never starved by the slice cap
+    // or the quote budget. Priority only: unproven tokens still trade
+    // normally whenever slots remain (no proven-only gate is re-added).
+    gaps = winnersFirst(gaps, this.winnerSet);
+    // Record the best rough gaps every tick (incl. below-threshold ones):
+    // transfer mode used to keep them in memory only, so the best
+    // sub-threshold gap was invisible and the dashboard gap chart had no
+    // live data. Top 5 per 20s tick = ~21,600 rows/day, pruned by the
+    // 7-day opportunity retention. Rough rows only: no exact quote was
+    // taken, so net_usd/size_usd stay NULL and the KPI would-have PnL
+    // (which needs a non-NULL net) ignores them.
+    const allGaps = findGaps(this.universe, tickers, dex, {
+      minTvlUsd: this.cfg.minDexTvlUsd,
+      minGapPct: 0,
+      maxGapPct: this.cfg.scanMaxGapPct,
+    });
+    // Thin-book pre-filter (2026-11-22): a rough gap means nothing if MEXC
+    // cannot fill the trade size — FOLD showed 2.1% but its top-20 asks
+    // totalled only $165.96 < $300, so planCexBuy always returned null and
+    // evaluate() skipped it silently. Check depth for the few
+    // above-threshold candidates only (scanExactQuotes); a failed depth
+    // read is fail-open (the token stays a candidate and evaluate()
+    // decides). Thin tokens are dropped from `gaps` (so the scan note and
+    // the evaluate loop see no tradable gap) and recorded with decision
+    // 'rule' / reason 'thin-book' instead of 'trade'.
+    const thinBook = new Map<string, number>();
+    if (gaps.length) {
+      // Depth is checked against the smallest trade we would attempt (MIN_TRADE_USD):
+      // a book that cannot fill $100 is hopeless at any size; a bigger roll is
+      // decided by planCexBuy inside evaluate().
+      const size = this.cfg.minTradeUsd;
+      for (const g of gaps.slice(0, this.cfg.scanExactQuotes)) {
+        try {
+          const book = await this.d.mexc.depth(g.token.symbol, 20);
+          const askValue = book.asks.reduce((s, [p, q]) => s + p * q, 0);
+          if (askValue < size) {
+            thinBook.set(g.token.base, askValue);
+            log.info(`${g.token.base}: thin MEXC book — top-20 asks ${usd(askValue)} < trade size ${usd(size)}, skipping`);
+          }
+        } catch (e) {
+          log.warn(`${g.token.base} depth check: ${errMsg(e)} (fail-open)`);
+        }
+      }
+      gaps = gaps.filter((g) => !thinBook.has(g.token.base));
+    }
+    this.lastTopGaps = allGaps.slice(0, 5);
+    this.recordGaps(allGaps.slice(0, 5), tickers, now, thinBook);
     this.note(
       'gaps',
       gaps.length
@@ -231,36 +499,82 @@ export class TransferEngine {
     if (!fresh.length) return;
 
     const usdt = this.live ? ((await this.d.mexc.balances()).USDT ?? 0) : 1e12;
-    let best: Candidate | null = null;
-    for (const g of fresh.slice(0, this.cfg.scanExactQuotes)) {
+    // Phase 2: no shared random size per tick — each candidate sizes from its own pool
+    // depth (depthSizes + evaluateSized), capped by the USDT balance.
+    const cap = this.usdtCap(usdt);
+    if (cap === null) {
+      this.note('usdt', `MEXC USDT too low for a trade (${usd(usdt)})`);
+      return;
+    }
+    // Phase 5: candidates are evaluated in parallel, bounded by the
+    // aggregator's own quote budget (QUOTE_RPS_*): one in-flight quote per
+    // rps token, so the parallel batch cannot burn the budget and trip
+    // QuoteBudgetError on its own candidates. The per-candidate size ladder
+    // stays sequential (each smaller size is only quoted when the larger one
+    // is below the hurdle but close — see evaluateSized). Winner selection
+    // is unchanged: the highest-net passing candidate wins, exactly one
+    // transfer starts per tick, and a failing candidate cools down as before.
+    const quoteConcurrency = Math.max(1, Math.min(this.cfg.scanExactQuotes, this.cfg.quoteRps[this.cfg.aggregator] ?? 1));
+    const evaluated = await mapBatches(fresh.slice(0, this.cfg.scanExactQuotes), quoteConcurrency, async (g): Promise<Candidate | null> => {
+      // Per-candidate sizing: a known pool gets its depth ladder; unknown TVL stays
+      // fail-open with one random size (the old behaviour).
+      let sizes: number[];
+      if (g.tvlUsd > 0) {
+        const ladder = this.depthSizes(g, cap);
+        if (!ladder) return null; // thin pool / safe size below MIN: logged inside depthSizes
+        sizes = ladder;
+      } else {
+        log.info(`${g.token.base}: depth-unknown (no pool TVL from DexScreener), allowing — the exact quote still gates the trade`);
+        const size = this.tradeSize(usdt);
+        if (size === null) return null; // unaffordable (cannot happen: cap was checked above)
+        sizes = [size];
+      }
       try {
-        const c = await this.evaluate(g, gas, ethUsd, usdt);
+        const c = await this.evaluateSized(g, gas, nativeUsd, sizes);
         if (!c) {
           this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
-          continue;
+          return null;
         }
-        const need = threshold(c.ev.costUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
-        log.info(`${g.token.base}: gap ${g.gapPct.toFixed(2)}%, size ${usd(c.ev.costUsd)}, exact net ${usd(c.ev.net)} (need ${usd(need)})`);
-        if (c.ev.net <= need) this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
-        else if (!best || c.ev.net > best.ev.net) best = c;
+        const need = threshold(c.ev.costUsd, this.cfg.minProfitUsd, hurdleBps(this.cfg));
+        if (c.ev.net <= need) {
+          this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
+          return null;
+        }
+        return c;
       } catch (e) {
         log.warn(`${g.token.base} evaluate: ${errMsg(e)}`);
         this.cooldown.set(g.token.base, now + FALSE_GAP_COOLDOWN_MS);
+        return null;
       }
+    });
+    let best: Candidate | null = null;
+    for (const c of evaluated) {
+      if (c && (!best || c.ev.net > best.ev.net)) best = c;
     }
+    if (this.lastDepthRejects > 0) log.info(`depth rejects this tick: ${this.lastDepthRejects} (thin pools, no exact quote spent)`);
+    this.flushDepthRejects(now);
     if (!best) return;
     if (!this.live) return this.recordPaper(best);
-    await this.start(best, gas, ethUsd);
+    await this.start(best, gas, nativeUsd);
   }
 
-  /** Exact, size-specific numbers: MEXC depth walk + withdraw fee + aggregator quote + gas + drift reserve. */
-  async evaluate(g: Gap, gas: GasInfo, ethUsd: number, usdt: number): Promise<Candidate | null> {
-    const size = Math.min(this.cfg.maxTradeUsd, usdt * 0.99);
-    if (size < this.cfg.minTradeUsd) {
-      this.note('usdt', `MEXC USDT too low for a trade (${usd(usdt)})`);
+  /** Exact, size-specific numbers: MEXC depth walk + withdraw fee + aggregator quote + gas + drift reserve.
+   * `size` is the tick's pre-rolled trade size (same size the depth filter used). */
+  async evaluate(g: Gap, gas: GasInfo, nativeUsd: number, size: number): Promise<Candidate | null> {
+    const t = g.token;
+    // Depth re-check with the actual size, before spending an exact quote
+    // (the tick filter already ran; this guards direct callers too).
+    const reason = depthRejectReason(size, g.tvlUsd, {
+      maxImpactPct: this.cfg.depthMaxImpactBps / 100,
+      minLiqUsd: this.cfg.minPoolLiquidityUsd,
+      maxSizePct: this.cfg.depthMaxSizePct,
+    });
+    if (reason) {
+      this.lastDepthRejects++;
+      this.noteDepthReject(t.base, size, g.tvlUsd, reason);
+      log.info(`${t.base}: depth reject — ${reason} (size ${usd(size)}, pool ${usd(g.tvlUsd)})`);
       return null;
     }
-    const t = g.token;
     const book = await this.d.mexc.depth(t.symbol, 20);
     const plan = planCexBuy({ sizeUsd: size, asks: book.asks, qtyStep: t.qtyStep, takerFee: this.fee(t.base) });
     if (!plan || plan.tokensToSell < t.withdrawMin) return null;
@@ -277,23 +591,72 @@ export class TransferEngine {
     const ev = evaluateTransfer({
       plan,
       withdrawFeeTokens: t.withdrawFee,
-      usdcOut: toFloat(q.buyAmount, USDC_DECIMALS),
-      usdcMin: toFloat(q.minBuyAmount, USDC_DECIMALS),
-      gasUsd: gasUsd(q.gas + APPROVE_GAS, gas.effective, ethUsd) + this.cfg.l1FeeUsd,
+      usdcOut: toFloat(q.buyAmount, this.stableDec()),
+      usdcMin: toFloat(q.minBuyAmount, this.stableDec()),
+      gasUsd: gasUsd(q.gas + APPROVE_GAS, gas.effective, nativeUsd) + this.cfg.l1FeeUsd,
       driftBps: this.cfg.transferDriftBps,
       costs: this.costs(t.base),
     });
-    return { gap: g, plan, ev, decimals };
+    return { gap: g, plan, ev, decimals, aggregator: q.source ?? this.d.agg.name };
+  }
+
+  /** Write the tick's best rough gaps to the opportunities table so the gap
+   *  charts (dashboard + KPI) can see sub-threshold gaps. Rough rows only:
+   *  no exact quote was taken, so net_usd/size_usd stay NULL and the KPI
+   *  would-have PnL (which needs a non-NULL net) ignores them. A failed
+   *  write must never kill the tick — it is logged and the tick goes on. */
+  private recordGaps(gaps: Gap[], tickers: Map<string, { bid: number; ask: number }>, now: number, thinBook: Map<string, number> = new Map()): void {
+    if (!gaps.length) return;
+    try {
+      this.d.db.insertOpportunities(
+        gaps.map((g) => {
+          const t = tickers.get(g.token.symbol);
+          const thin = thinBook.has(g.token.base);
+          return {
+            ts: now,
+            chain: this.cfg.chain.name,
+            token: g.token.base,
+            direction: 'CEX_BUY',
+            size_usd: null,
+            mexc_bid: t?.bid ?? null,
+            mexc_ask: g.ask,
+            book_age_ms: null,
+            aggregator: 'dexscreener',
+            dex_out: g.dexPrice,
+            dex_min_out: null,
+            usdc_usdt: this.stableRate,
+            gross_bps: Math.round(g.gapPct * 100),
+            fee_bps: null,
+            gas_usd: null,
+            net_usd: null,
+            hurdle_usd: null,
+            // A thin-book gap cleared the rough threshold but MEXC cannot
+            // fill the trade size, so it is not a trade candidate: decision
+            // 'rule' keeps it out of the dashboard's best-gap displays
+            // (which only count below_hurdle/trade) while the row still
+            // shows the gap existed.
+            decision: thin ? 'rule' : g.gapPct >= this.cfg.scanMinGapPct ? 'trade' : 'below_hurdle',
+            reason: thin ? 'thin-book' : 'transfer-scan',
+          };
+        }),
+      );
+    } catch (e) {
+      log.warn(`gap record: ${errMsg(e)}`);
+    }
   }
 
   private async recordPaper(c: Candidate) {
     const t = c.gap.token;
     const now = this.now();
+    const tvl = c.gap.tvlUsd > 0 ? c.gap.tvlUsd : null;
     this.d.db.insertTrade({
       ts: now, day: dhakaDay(now), mode: 'paper', symbol: t.base, direction: 'TRANSFER',
       size_usd: c.ev.costUsd, qty: c.plan.qty, buy_price: c.ev.buyPrice, sell_price: c.ev.sellPrice,
       expected_net: c.ev.net, cex_fee_usd: c.ev.cexFeeUsd + c.ev.withdrawFeeUsd, gas_usd: c.ev.gasUsd,
       pnl_usd: c.ev.net, status: 'paper', dex_tx: null, cex_order_id: null, note: `gap ${c.gap.gapPct.toFixed(2)}%`,
+      aggregator: c.aggregator ?? null,
+      pool_tvl_usd: tvl,
+      safe_size_usd: tvl === null ? null : depthSafeSize(tvl, { maxImpactPct: this.cfg.depthMaxImpactBps / 100, maxSizePct: this.cfg.depthMaxSizePct }),
     });
     await this.d.tg.send(
       `📝 PAPER TRANSFER ${t.base}: buy MEXC @ ${c.ev.buyPrice.toPrecision(6)} -> sell DEX @ ${c.ev.sellPrice.toPrecision(6)}\n` +
@@ -304,7 +667,7 @@ export class TransferEngine {
   }
 
   /** Create the persisted transfer and run its first steps right away. */
-  private async start(c: Candidate, gas: GasInfo, ethUsd: number) {
+  private async start(c: Candidate, gas: GasInfo, nativeUsd: number) {
     const t = c.gap.token;
     const now = this.now();
     const id = this.d.db.insertTransfer({
@@ -313,6 +676,9 @@ export class TransferEngine {
       buy_qty: c.plan.qty, cost_usd: c.ev.costUsd, buy_order_id: null, withdraw_amount: null, withdraw_id: null,
       wallet_before: null, received: null, usdc_out: null, gas_usd: 0, expected_net: c.ev.net, pnl: null,
       sell_attempts: 0, alerted_timeout: 0, note: null, withdraw_fee: t.withdrawFee, next_try: 0, force_sell: 0, hold_alerted: 0, sell_tx: null,
+      // Phase 8 recycle (fresh transfer: nothing recycled yet).
+      recycle_status: null, recycle_held: 0, recycled_usdc: null, recycled_usdt: null, recycle_address: null, recycle_tx: null,
+      recycle_order_id: null, recycle_note: null, recycle_deadline: 0, recycle_mexc_before: null, recycle_usdt_before: null,
     });
     log.info(`transfer #${id} ${t.base}: START gap ${c.gap.gapPct.toFixed(2)}% expected ${usd(c.ev.net)}`);
     const row = this.d.db.getTransfer(id)!;
@@ -332,15 +698,15 @@ export class TransferEngine {
       return this.fail(now2, `MEXC buy rejected: ${errMsg(e)}`, 0, false);
     }
     const next = this.d.db.getTransfer(id)!;
-    if (next.status === 'withdrawing') await this.advance(next, gas, ethUsd);
+    if (next.status === 'withdrawing') await this.advance(next, gas, nativeUsd);
   }
 
   /** Move one transfer forward as far as it can go right now. */
-  async advance(row: TransferRow, gas: GasInfo, ethUsd: number): Promise<void> {
+  async advance(row: TransferRow, gas: GasInfo, nativeUsd: number): Promise<void> {
     if (row.status === 'buying') {
       if (!row.buy_order_id) {
         // Crashed or timed out while placing: find the order by our client id, never guess.
-        const o = await this.d.mexc.getOrderByClientId(row.symbol, buyCid(row.id!));
+        const o = await this.d.mexc.getOrderByClientId(row.symbol, buyCid(this.cfg.chain.name, row.id!));
         if (!o) return this.fail(row, 'MEXC buy was never placed', 0, false);
         this.d.db.updateTransfer(row.id!, { buy_order_id: o.orderId });
         row = this.reload(row);
@@ -349,15 +715,26 @@ export class TransferEngine {
       row = this.reload(row);
       if (row.status !== 'withdrawing') return;
     }
-    if (row.status === 'withdrawing') return this.withdrawStep(row, gas, ethUsd);
-    if (row.status === 'selling') return this.sellStep(row, gas, ethUsd);
+    if (row.status === 'withdrawing') await this.withdrawStep(row, gas, nativeUsd);
+    else if (row.status === 'selling') await this.sellStep(row, gas, nativeUsd);
+    // Phase 8: a sell that just completed (here, or via withdrawStep's arrival
+    // path above) starts its recycle in the same scan; a restart resumes it
+    // from the tick loop's transfersNeedingRecycle() instead.
+    const done = this.reload(row);
+    if (done.status === 'done') {
+      try {
+        await this.recycle.advanceTransfer(done, gas, nativeUsd);
+      } catch (e) {
+        log.warn(`transfer #${row.id} recycle: ${errMsg(e)} (retried next scan)`);
+      }
+    }
   }
 
   private async buy(row: TransferRow, limitPrice: number) {
     const f = 10 ** row.price_decimals;
     const px = (Math.ceil(limitPrice * f) / f).toFixed(row.price_decimals);
     const qty = row.buy_qty.toFixed(decimalsOfStep(row.qty_step));
-    const cid = buyCid(row.id!);
+    const cid = buyCid(this.cfg.chain.name, row.id!);
     const { orderId } = await placeSafely(this.d.mexc, row.symbol, cid, () => this.d.mexc.limitOrder(row.symbol, 'BUY', qty, px, cid), this.sleep);
     this.d.db.updateTransfer(row.id!, { buy_order_id: orderId });
     log.info(`transfer #${row.id} MEXC BUY ${qty} ${row.base} @ ${px} id=${orderId}`);
@@ -381,13 +758,13 @@ export class TransferEngine {
     this.d.db.updateTransfer(row.id!, { status: 'withdrawing', buy_qty: filled, cost_usd: cost });
   }
 
-  private async withdrawStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
+  private async withdrawStep(row: TransferRow, gas: GasInfo, nativeUsd: number) {
     const since = row.ts - 60_000;
 
     if (!row.withdraw_id) {
       if (row.withdraw_amount) {
         // A request was sent before but its result was lost (timeout / restart). Look it up; NEVER resend.
-        const rec = await this.d.mexc.findWithdraw(row.base, since, { withdrawOrderId: withdrawCid(row.id!) });
+        const rec = await this.d.mexc.findWithdraw(row.base, since, { withdrawOrderId: withdrawCid(this.cfg.chain.name, row.id!) });
         if (rec) {
           this.d.db.updateTransfer(row.id!, { withdraw_id: rec.id });
           return;
@@ -420,7 +797,7 @@ export class TransferEngine {
           address: this.d.chain.address, // ONLY ever our own hot wallet
           amount: amountStr,
           contractAddress: row.address,
-          withdrawOrderId: withdrawCid(row.id!),
+          withdrawOrderId: withdrawCid(this.cfg.chain.name, row.id!),
         });
         this.d.db.updateTransfer(row.id!, { withdraw_id: id });
         await this.d.tg.send(`📤 TRANSFER #${row.id} ${row.base}: bought ${row.buy_qty} on MEXC for ${usd(row.cost_usd)}, withdrawing ${amountStr} to wallet`);
@@ -437,7 +814,7 @@ export class TransferEngine {
       return;
     }
 
-    const rec = await this.d.mexc.findWithdraw(row.base, since, { id: row.withdraw_id, withdrawOrderId: withdrawCid(row.id!) }).catch(() => undefined);
+    const rec = await this.d.mexc.findWithdraw(row.base, since, { id: row.withdraw_id, withdrawOrderId: withdrawCid(this.cfg.chain.name, row.id!) }).catch(() => undefined);
     const bal = await this.d.chain.tokenBalance(row.address);
     const diff = bal - BigInt(row.wallet_before ?? '0');
     // Fee actually charged by MEXC (history) beats the configured one.
@@ -457,7 +834,7 @@ export class TransferEngine {
       const received = diff > (expected * 102n) / 100n ? expected : diff;
       this.d.db.updateTransfer(row.id!, { status: 'selling', received: received.toString() });
       log.info(`transfer #${row.id} ${row.base}: ${toFloat(received, row.decimals)} arrived in wallet`);
-      return this.sellStep(this.reload(row), gas, ethUsd);
+      return this.sellStep(this.reload(row), gas, nativeUsd);
     }
     if (rec && WITHDRAW_FAILED.has(rec.status) && diff <= 0n) {
       // Funds go back to the MEXC account; sell there once they are visible.
@@ -501,7 +878,7 @@ export class TransferEngine {
    * have moved during the approval window (round-3 review, M3).
    */
   private async holdIfBelowFloor(row: TransferRow, minBuyAmount: bigint, qty: number): Promise<boolean> {
-    const worstOut = toFloat(minBuyAmount, USDC_DECIMALS) * this.stableRate; // in USDT, like the cost
+    const worstOut = toFloat(minBuyAmount, this.stableDec()) * this.stableRate; // in USDT, like the cost
     const floor = row.cost_usd * (1 - this.cfg.transferMaxLossPct / 100);
     if (worstOut >= floor && row.hold_alerted) this.d.db.updateTransfer(row.id!, { hold_alerted: 0 }); // recovered: alert again if it falls
     if (worstOut < floor && !row.force_sell) {
@@ -519,7 +896,7 @@ export class TransferEngine {
     return false;
   }
 
-  private async sellStep(row: TransferRow, gas: GasInfo, ethUsd: number) {
+  private async sellStep(row: TransferRow, gas: GasInfo, nativeUsd: number) {
     if (row.next_try > this.now()) return;
     if (Number(gas.effective) / 1e9 > this.cfg.maxGasGwei) return this.note(`sell-${row.id}`, `transfer #${row.id}: gas too high, sale waits`);
 
@@ -539,7 +916,7 @@ export class TransferEngine {
     if (amount * 100n < BigInt(row.received!)) {
       this.d.db.updateTransfer(row.id!, { status: 'stuck', note: 'tokens no longer in the wallet' });
       await this.d.tg.send(
-        `🚨 TRANSFER #${row.id} ${row.base}: the tokens are no longer in the wallet (sold before a restart, or moved). Check etherscan, then /clear ${row.id}.`,
+        `🚨 TRANSFER #${row.id} ${row.base}: the tokens are no longer in the wallet (sold before a restart, or moved). Check ${this.cfg.chain.explorer}, then /clear ${row.id}.`,
       );
       return;
     }
@@ -553,7 +930,7 @@ export class TransferEngine {
 
       const ap = await this.d.chain.approveExact(row.address, this.spenderOf(first), amount, gas);
       gasWei += ap.gasCostWei;
-      if (ap.unknown) return this.unknownOutcome(row, `approval ${ap.hash}`, gasWei, ethUsd);
+      if (ap.unknown) return this.unknownOutcome(row, `approval ${ap.hash}`, gasWei, nativeUsd);
       if (!ap.ok) throw new Error(`approval failed: ${ap.reason}`);
       const firm = await this.d.agg.quote(req); // fresh after the approval
       if (!firm.tx) throw new Error('quote without transaction');
@@ -561,7 +938,7 @@ export class TransferEngine {
       // on the FIRM quote before sending, or the loss floor does not protect the actual sale (round-3, M3).
       if (await this.holdIfBelowFloor(row, firm.minBuyAmount, qty)) {
         // The approval gas was really spent; book it so the row's gas stays honest.
-        this.d.db.updateTransfer(row.id!, { gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * ethUsd });
+        this.d.db.updateTransfer(row.id!, { gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * nativeUsd });
         return;
       }
       const est = await this.d.chain.simulate(firm.tx);
@@ -572,13 +949,13 @@ export class TransferEngine {
       if (r.refused) return; // an earlier tx is unresolved: not an attempt, try again later
       gasWei += r.gasCostWei;
       txHash = r.hash;
-      if (r.unknown) return this.unknownOutcome(row, `swap ${r.hash}`, gasWei, ethUsd);
+      if (r.unknown) return this.unknownOutcome(row, `swap ${r.hash}`, gasWei, nativeUsd);
       if (!r.ok) throw new Error(`swap ${r.reason}`);
-      const usdcOut = toFloat((await this.d.chain.tokenBalance(this.cfg.usdc)) - usdcBefore, USDC_DECIMALS) * this.stableRate; // USDT
-      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * ethUsd;
+      const usdcOut = toFloat((await this.d.chain.tokenBalance(this.cfg.usdc)) - usdcBefore, this.stableDec()) * this.stableRate; // USDT
+      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * nativeUsd;
       const pnl = usdcOut - row.cost_usd - gasTotal;
       this.d.db.updateTransfer(row.id!, { status: 'done', usdc_out: usdcOut, gas_usd: gasTotal, pnl });
-      this.recordTrade(row, 'ok', pnl, gasTotal, txHash, `sold ${qty} for ${usd(usdcOut)}`, usdcOut / qty);
+      this.recordTrade(row, 'ok', pnl, gasTotal, txHash, `sold ${qty} for ${usd(usdcOut)}`, usdcOut / qty, firm.source ?? this.d.agg.name);
       await this.d.tg.send(
         [
           `${pnl >= 0 ? '✅' : '🔻'} TRANSFER #${row.id} ${row.base} done`,
@@ -586,23 +963,46 @@ export class TransferEngine {
           `Sell DEX: ${qty} for ${usd(usdcOut)} (@ ${(usdcOut / qty).toPrecision(6)})`,
           `Withdraw fee ${row.withdraw_fee} ${row.base} | Gas ${usd(gasTotal)}`,
           `Expected ${usd(row.expected_net)} | Net PnL ${usd(pnl)}`,
-          `https://etherscan.io/tx/${txHash}`,
+          explorerTxUrl(this.cfg.chain, txHash!),
         ].join('\n'),
       );
       this.afterRisk('ok');
     } catch (e) {
       const attempts = row.sell_attempts + 1;
-      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * ethUsd;
+      const gasTotal = row.gas_usd + (Number(gasWei) / 1e18) * nativeUsd;
       const stuck = attempts >= MAX_SELL_ATTEMPTS;
-      const wait = SELL_BACKOFF_MS[Math.min(attempts - 1, SELL_BACKOFF_MS.length - 1)];
+      let wait = SELL_BACKOFF_MS[Math.min(attempts - 1, SELL_BACKOFF_MS.length - 1)];
+      let fastRetry = false;
+      let held = false;
+      // Phase 7: before the long backoff, take a fresh quote (same BestOf path as the sell
+      // quote). Still profitable -> retry FAST, first retry only. At/below the loss floor
+      // -> the existing hold path (holdIfBelowFloor sets next_try +5 min and alerts; the
+      // update below must not overwrite it). Fresh quote itself failing -> existing
+      // backoff, never a fast-retry spin on quote errors.
+      if (!stuck && attempts === 1) {
+        try {
+          const fresh = await this.d.agg.quote(req);
+          if (await this.holdIfBelowFloor(row, fresh.minBuyAmount, qty)) {
+            held = true;
+          } else {
+            wait = SELL_FAST_RETRY_MS;
+            fastRetry = true;
+          }
+        } catch (qe) {
+          log.warn(`transfer #${row.id} ${row.base}: fresh quote after the failed sell also failed (${errMsg(qe)}); keeping the ${wait / 60_000}-min backoff`);
+        }
+      }
       this.d.db.updateTransfer(row.id!, {
         sell_attempts: attempts,
         gas_usd: gasTotal,
         status: stuck ? 'stuck' : 'selling',
-        next_try: this.now() + wait,
+        ...(held ? {} : { next_try: this.now() + wait }),
         note: errMsg(e),
       });
-      log.warn(`transfer #${row.id} ${row.base} sell attempt ${attempts} failed: ${errMsg(e)}${stuck ? '' : `; retry in ${wait / 60_000} min`}`);
+      log.warn(
+        `transfer #${row.id} ${row.base} sell attempt ${attempts} failed: ${errMsg(e)}` +
+          (stuck ? '' : held ? '; below the loss floor, holding (re-check in 5 min)' : fastRetry ? `; quote still profitable, fast retry in ${SELL_FAST_RETRY_MS / 1000} s` : `; retry in ${wait / 60_000} min`),
+      );
       if (stuck) {
         await this.d.tg.send(
           `🚨 TRANSFER #${row.id} ${row.base}: DEX sale failed ${attempts} times (${errMsg(e)}). Automatic retries STOPPED.\n` +
@@ -614,16 +1014,16 @@ export class TransferEngine {
   }
 
   /** On-chain outcome unknown: do not retry (could double-sell). Pause and hand over to a human. */
-  private async unknownOutcome(row: TransferRow, what: string, gasWei: bigint, ethUsd: number) {
+  private async unknownOutcome(row: TransferRow, what: string, gasWei: bigint, nativeUsd: number) {
     this.d.db.updateTransfer(row.id!, {
       status: 'stuck',
-      gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * ethUsd,
+      gas_usd: row.gas_usd + (Number(gasWei) / 1e18) * nativeUsd,
       note: `${what} outcome unknown`,
     });
     this.d.risk.pause(`transfer #${row.id}: ${what} outcome unknown`, true);
     await this.d.tg.send(
       `🚨 TRANSFER #${row.id} ${row.base}: ${what} was not mined and its cancel was not confirmed. Outcome UNKNOWN.\n` +
-        `Trading PAUSED. Check the wallet on etherscan. Then /sell ${row.id} (if the tokens are still there) or /clear ${row.id}, and /start.`,
+        `Trading PAUSED. Check the wallet on ${this.cfg.chain.explorer}. Then /sell ${row.id} (if the tokens are still there) or /clear ${row.id}, and /start.`,
     );
   }
 
@@ -689,6 +1089,16 @@ export class TransferEngine {
     this.afterRisk('one_sided');
   }
 
+  /** Telegram /recycle <id>: resume a held Phase 8 recycle on the next scan. */
+  retryRecycle(id: number): string {
+    return this.recycle.retryTransfer(id);
+  }
+
+  /** Telegram /recycle catchup: resume a held catch-up sweep on the next scan. */
+  retryCatchUp(): string {
+    return this.recycle.retryCatchUp();
+  }
+
   /** Telegram /sell <id>: retry a stuck or held sale now (even below the loss floor). */
   forceSell(id: number): string {
     const t = this.d.db.getTransfer(id);
@@ -710,7 +1120,7 @@ export class TransferEngine {
     return `Transfer #${id} closed manually. Gas spent (${usd(t.gas_usd)}) is booked; the token result is not, check balances yourself.`;
   }
 
-  private recordTrade(row: TransferRow, status: 'ok' | 'one_sided', pnl: number, gas: number, tx: string | undefined, note: string, sellPrice = 0) {
+  private recordTrade(row: TransferRow, status: 'ok' | 'one_sided', pnl: number, gas: number, tx: string | undefined, note: string, sellPrice = 0, aggregator: string | null = null) {
     const now = this.now();
     const buyPrice = row.cost_usd / (row.buy_qty || 1);
     this.d.db.insertTrade({
@@ -719,6 +1129,10 @@ export class TransferEngine {
       // informational only: PnL is measured from real balances and already includes every fee
       cex_fee_usd: row.cost_usd * this.fee(row.base) + row.withdraw_fee * buyPrice,
       gas_usd: gas, pnl_usd: pnl, status, dex_tx: tx ?? null, cex_order_id: row.buy_order_id, note,
+      // Live transfer rows carry no pool TVL (the transfer row never stored
+      // it): pool_tvl_usd / safe_size_usd stay NULL, the size column is
+      // still the depth-derived size used (see the dashboard label).
+      aggregator,
     });
   }
 

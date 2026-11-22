@@ -1,10 +1,12 @@
 // pm2 start ecosystem.live.cjs
-// Live twin: trades only tokens proven profitable in paper (see provenTokens).
-// Reads paper history from the paper bot's DB (PAPER_DB_PATH, readonly); keeps its
-// own DB for live trades + risk state. Same MEXC key + hot wallet as the paper bot
-// (paper mode never touches real funds, so no double-commit).
+// Live twin (transfer mode since 2026-11-21): CEX buy -> withdraw -> DEX sell
+// only, never DEX->CEX. Reads paper history from the paper bot's DB
+// (PAPER_DB_PATH, readonly); keeps its own DB for live trades + risk state.
+// Same MEXC key + hot wallet as the paper bot (paper mode never touches real
+// funds, so no double-commit).
 // Requires: PRIVATE_KEY in .env, a funded hot wallet, and a MEXC key with Spot
-// Trading enabled (withdraw stays OFF). Do NOT start until those are ready.
+// Trading + Withdraw enabled (withdrawal-address whitelist = hot wallet only).
+// Do NOT start until those are ready.
 module.exports = {
   apps: [
     {
@@ -19,7 +21,15 @@ module.exports = {
         DB_PATH: 'data/ethereum-live.sqlite',
         PAPER_DB_PATH: 'data/ethereum.sqlite',
         MAX_TRADE_USD: '300',
+        MIN_TRADE_USD: '100', // random size $100–300 per trade (owner decision 2026-11-22)
+        TRANSFER_DRIFT_BPS: '100', // drift reserve 1.5% -> 1.0% (owner decision 2026-11-22)
         UNLIMITED_APPROVAL: 'yes', // owner decision 2026-11-21: approve MaxUint256 once per token, skip the approve tx on later sales (~12s saved per sale). Risk accepted: a compromised spender could drain the token balance.
+        // Live watchlist (owner decision 2026-11-22): 100 tokens by volume — MEXC 24h vol >= $10k
+        // and DEX 24h vol >= $10k. Paper bot keeps the shared .env values (MEXC vol $50k, no DEX filter, no cap).
+        MIN_MEXC_VOLUME_USD: '10000',
+        MIN_DEX_VOLUME_USD: '10000',
+        TRANSFER_UNIVERSE_MAX: '100',
+        SCAN_MIN_GAP_PCT: '2', // owner decision 2026-11-22: rough gap 3% -> 2% (more candidates; exact-quote profit gate still applies)
       },
       autorestart: true,
       max_restarts: 1000,

@@ -1,25 +1,71 @@
-// Entry point. Wires everything together, runs one scan per Ethereum block.
+// Entry point. Wires everything together, runs one scan per block.
 import fs from 'node:fs';
+import { dirname } from 'node:path';
 import { loadConfig, secretsOf, validateConfig } from './config.js';
 import { log, errMsg, registerSecrets } from './log.js';
-import { Db } from './db.js';
+import { Db, publishPublicConfig } from './db.js';
 import { Risk } from './risk.js';
-import { Telegram } from './telegram.js';
+import { Telegram, makeModeTag } from './telegram.js';
 import { MexcRest, RateLimitError } from './mexc/rest.js';
 import { MexcBookStream } from './mexc/ws.js';
 import { Chain } from './dex/chain.js';
-import { BestOf, Kyber, Limited, OneInch, TokenBucket, ZeroEx, type Aggregator } from './dex/aggregator.js';
+import { BestOf, Kyber, Limited, OneInch, OpenOcean, TokenBucket, Velora, ZeroEx, type Aggregator } from './dex/aggregator.js';
 import { buildWatchlist, provenTokens, refreshStatus } from './watchlist.js';
 import { paperBalances, snapshot } from './inventory.js';
 import { Engine } from './engine.js';
 import { TransferEngine } from './transfer.js';
+import { dexPrices } from './scanner.js';
 import { formatReport } from './summary.js';
 import { recoverExecuting } from './recovery.js';
 import { makeUnresolvedCheck, resolveTrade, startHandler, unresolvedLines } from './commands.js';
-import { dhakaDay, dhakaHourMinute, usd } from './util.js';
+import { startupAlertDue, recordStartupAlert } from './startup-alert.js';
+import { dhakaDay, dhakaHourMinute, usd, walletLine } from './util.js';
+import { getOrCreatePairingCode, rotatePairingCode, startPairingPush, type RemoteSnapshotCtx } from './remote.js';
 
 const cfg = validateConfig(loadConfig());
 registerSecrets(secretsOf(cfg));
+
+/** Bot version for the pairing snapshot (package.json, best effort). */
+let BOT_VERSION = 'unknown';
+try {
+  BOT_VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version ?? 'unknown';
+} catch { /* ignore */ }
+
+/**
+ * Pairing-code dashboard (Phase B): this bot instance owns one code (one per
+ * chain), stored in its own DB state table — never in .env, never in git.
+ * Generated once; announced in the log + Telegram only on first creation.
+ * The pairing object also carries the snapshot pusher, so /pairing-new can
+ * push with the new code at once.
+ */
+function makePairing(db: Db, tg: Telegram) {
+  const first = getOrCreatePairingCode(db);
+  let code = first.code;
+  let pusher: (() => Promise<boolean>) | null = null;
+  if (first.isNew) {
+    log.info(`pairing code (${cfg.chain.name}): ${code} — this chain's dashboard code, keep it private like a password`);
+    void tg.send(`🔗 Pairing code (${cfg.chain.name}): ${code}\narb.alphahelper.online-এ এই code বসালে এই bot-এর live dashboard দেখাবে। Code-টা password-এর মতো — কাউকে দিও না।`).catch(() => {});
+  }
+  const api = {
+    get code() {
+      return code;
+    },
+    setPusher(fn: () => Promise<boolean>) {
+      pusher = fn;
+    },
+    async pushNow(): Promise<boolean> {
+      return pusher ? pusher() : false;
+    },
+    async rotate(): Promise<string> {
+      const r = await rotatePairingCode(db, cfg.ingestUrl);
+      code = r.newCode;
+      await api.pushNow();
+      return r.newCode;
+    },
+  };
+  return api;
+}
+export type Pairing = ReturnType<typeof makePairing>;
 
 /** Backoff after HTTP 429/418 from any API: skip scans for 1, 2, 4 ... up to 15 minutes. */
 const rateLimit = { until: 0, level: 0 };
@@ -89,6 +135,21 @@ async function main() {
   if (cfg.mode === 'live') checkEnvPermissions(cfg.envPath);
 
   const db = new Db(cfg.dbPath);
+  // Phase 6 (option b): publish the bot's PUBLIC config into the DB so the
+  // read-only status dashboard can show aggregators / DEX-ARB / depth floor
+  // without reading .env. Public values only, never secrets; a restart with
+  // new env rewrites them. A failed write must never kill startup.
+  try {
+    publishPublicConfig(db, {
+      aggregators: cfg.aggregators,
+      dexArbEnabled: cfg.dexArbEnabled,
+      minPoolLiquidityUsd: cfg.minPoolLiquidityUsd,
+      depthMaxImpactBps: cfg.depthMaxImpactBps,
+      strategy: cfg.strategy,
+    });
+  } catch (e) {
+    log.warn(`public config publish: ${errMsg(e)}`);
+  }
   // Twin setup: the live bot reads paper history from the paper bot's DB (readonly);
   // its own DB holds live trades + risk state. Empty PAPER_DB_PATH = own DB (paper bot itself).
   let paperDb: Db = db;
@@ -100,19 +161,20 @@ async function main() {
     }
   }
   const risk = new Risk(db, cfg.mode, cfg);
-  // Every Telegram message carries the mode on its first line, so paper and live
-  // can never be confused in the same chat: 📝 PAPER vs 🔴 LIVE — আসল টাকা.
-  const modeTag = cfg.mode === 'live' ? '🔴 LIVE — আসল টাকা' : '📝 PAPER';
+  // Every Telegram message carries the mode + chain on its first line, so
+  // paper/live and ethereum/arbitrum can never be confused in the same chat.
+  const tag = makeModeTag(cfg.mode, cfg.chain.name);
   const tg = new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, {
     get: () => db.getState('telegram_offset'),
     set: (v) => db.setState('telegram_offset', v),
-  }, modeTag);
+  }, tag);
   if (!tg.enabled) log.warn('Telegram not configured: alerts only go to the log and there is no /stop');
+  const pairing = makePairing(db, tg);
   const mexc = new MexcRest(cfg.mexcApiKey, cfg.mexcApiSecret);
   const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei, {
     get: () => db.getState('unresolved_tx') || undefined,
     set: (v) => db.setState('unresolved_tx', v ?? ''),
-  }, cfg.chain.chainId, cfg.unlimitedApproval);
+  }, cfg.chain.chainId, cfg.unlimitedApproval, cfg.builderTipGwei);
   // Every aggregator gets its own quote budget (token bucket, honours 429 / Retry-After).
   const limited = cfg.aggregators.map((name) => {
     const inner =
@@ -120,7 +182,11 @@ async function main() {
         ? new ZeroEx(cfg.zeroExApiKey, fetch, cfg.chain.chainId)
         : name === '1inch'
           ? new OneInch(cfg.oneInchApiKey, fetch, cfg.chain.chainId)
-          : new Kyber(cfg.chain.kyberName, cfg.kyberClientId);
+          : name === 'velora'
+            ? new Velora(cfg.chain.chainId)
+            : name === 'openocean'
+              ? new OpenOcean(cfg.chain.chainId)
+              : new Kyber(cfg.chain.kyberName, cfg.kyberClientId);
     return new Limited(inner, new TokenBucket(cfg.quoteRps[name]));
   });
   const agg: Aggregator = limited.length === 1 ? limited[0] : new BestOf(limited);
@@ -153,10 +219,11 @@ async function main() {
     if (!cfg.telegramAdminId) throw new Error('Live mode needs TELEGRAM_ADMIN_ID (only this user may send /stop /start)');
     const acc = await mexc.account();
     if (!acc.canTrade) throw new Error('MEXC API key cannot trade');
-    const eth = Number(await chain.ethBalance()) / 1e18;
-    if (eth < cfg.minEthForGas) throw new Error(`Hot wallet has ${eth} ETH, need at least MIN_ETH_FOR_GAS=${cfg.minEthForGas}`);
+    const nativeSymbol = cfg.chain.nativeMexcSymbol.replace('USDT', ''); // ETH on Ethereum/Arbitrum, BNB on BSC
+    const native = Number(await chain.ethBalance()) / 1e18;
+    if (native < cfg.minEthForGas) throw new Error(`Hot wallet has ${native} ${nativeSymbol}, need at least MIN_ETH_FOR_GAS=${cfg.minEthForGas}`);
     const usdt = Number(acc.balances.find((b) => b.asset === 'USDT')?.free ?? 0);
-    log.info(`wallet ${chain.address}: ${eth.toFixed(4)} ETH | MEXC USDT ${usdt.toFixed(2)}`);
+    log.info(`wallet ${chain.address}: ${native.toFixed(4)} ${nativeSymbol} | MEXC USDT ${usdt.toFixed(2)}`);
     if (usdt < cfg.minTradeUsd) log.warn(`MEXC USDT ${usdt} < MIN_TRADE_USD: MEXC buys are blocked until you deposit`);
     if (cfg.strategy === 'transfer') {
       await tg.send(
@@ -174,7 +241,7 @@ async function main() {
   // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
   setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
 
-  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg, paperDb);
+  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg, stableDecimals, pairing);
 
   const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
     chain: cfg.chain,
@@ -239,10 +306,16 @@ async function main() {
       risk.pause('Telegram /stop');
       return '🛑 Trading STOPPED. Send /start to resume.';
     },
-    '/start': startHandler(risk, statusText, makeUnresolvedCheck(db, chain)),
+    '/start': startHandler(risk, statusText, makeUnresolvedCheck(db, chain), cfg.chain.explorer),
     '/status': statusText,
     '/tokens': () =>
       `Tokens (${tokens.length}): ${tokens.map((t) => `${t.base} (vol $${Math.round(t.mexcVolumeUsd / 1000)}k, TVL $${Math.round(t.dexTvlUsd / 1000)}k)`).join(', ')}`,
+    '/pairing': () =>
+      `🔗 Pairing code (${cfg.chain.name}): ${pairing.code}\narb.alphahelper.online-এ code বসিয়ে এই bot-এর dashboard দেখো। Push: ${cfg.ingestUrl ? `চালু (প্রতি ${cfg.ingestIntervalSec}s)` : 'বন্ধ (INGEST_URL নেই)'}`,
+    '/pairing-new': async () => {
+      const newCode = await pairing.rotate();
+      return `🔗 নতুন pairing code (${cfg.chain.name}): ${newCode}\nপুরনো code সাথে সাথে বাতিল হয়েছে — নতুন code দিয়ে আবার connect করো।`;
+    },
     '/cancelnonce': () => chain.cancelNonce(),
     '/resolve': ([id, pnl]) => resolveTrade(db, id, pnl),
   });
@@ -355,7 +428,32 @@ async function main() {
     }
   }, 30_000);
 
-  installProcessHandlers(tg, () => stream.stop());
+  // Pairing-code dashboard (Phase B): push a public-safe snapshot to the
+  // central receiver every INGEST_INTERVAL_SEC (first one immediately).
+  const pairingPush = startPairingPush({
+    db,
+    getCode: () => pairing.code,
+    ingestUrl: cfg.ingestUrl,
+    intervalSec: cfg.ingestIntervalSec,
+    buildCtx: async (): Promise<RemoteSnapshotCtx> => {
+      let bal = { mexcUsdt: null as number | null, walletNative: null as number | null, walletUsdc: null as number | null };
+      try {
+        const b = await balances();
+        bal = { mexcUsdt: b.mexc.USDT ?? null, walletNative: b.walletEth, walletUsdc: b.walletUsdc };
+      } catch { /* push with nulls */ }
+      return {
+        chain: cfg.chain.name, mode: cfg.mode, strategy: cfg.strategy, maxTradeUsd: cfg.maxTradeUsd,
+        aggregators: cfg.aggregators, dexArbEnabled: cfg.dexArbEnabled,
+        minPoolLiquidityUsd: cfg.minPoolLiquidityUsd, depthMaxImpactBps: cfg.depthMaxImpactBps,
+        version: BOT_VERSION, uptimeSec: process.uptime(), lastScanTs: lastTick,
+        ...bal, nativeSymbol: cfg.chain.nativeMexcSymbol.replace('USDT', ''),
+      };
+    },
+    onError: (m) => log.warn(m),
+  });
+  pairing.setPusher(() => pairingPush.pushNow());
+
+  installProcessHandlers(tg, () => { stream.stop(); pairingPush.stop(); });
 
   await tg.send(
     `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} via ${agg.name}\nTokens: ${tokens.map((t) => t.base).join(', ')}\n` +
@@ -364,36 +462,33 @@ async function main() {
 }
 
 /** TRANSFER strategy: scan MEXC ERC20 tokens, buy on MEXC, withdraw, sell on DEX. CEX->DEX only. */
-async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator, paperDb: Db) {
-  const engine = new TransferEngine({ cfg, mexc, chain, agg, db, risk, tg,
-    // Live mode trades only tokens proven profitable in paper (same rule as the
-    // inventory live watchlist). Paper mode is the scout: it scans everything.
-    provenFilter: cfg.mode === 'live'
-      ? (tokens) => provenTokens(tokens, paperDb.paperTokenStats(), cfg.liveMinPaperTrades, cfg.liveMinPaperPnlUsd, cfg.liveWatchlistMax)
-      : undefined,
-  });
+async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator, stableDecimals: number, pairing: Pairing) {
+  // Live watchlist (owner decision 2026-11-22): 100 tokens by volume — MEXC 24h vol >= $20k
+  // and DEX 24h vol >= $20k (MIN_MEXC_VOLUME_USD / MIN_DEX_VOLUME_USD / TRANSFER_UNIVERSE_MAX
+  // in ecosystem.live.config.cjs). The old proven-only rule (live trades only paper-proven
+  // tokens) is REMOVED for transfer mode: live now trades unproven tokens too.
+  const engine = new TransferEngine({ cfg, mexc, chain, agg, db, risk, tg, dexPricesFn: (addrs) => dexPrices(addrs, fetch, cfg.chain.dexScreenerId), stableDecimals });
   await engine.refreshUniverse(true);
-  if (engine.universe.length === 0) {
-    if (engine.provenFilteredEmpty) {
-      const msg = '⚠️ Live transfer: কোনো টোকেন এখনো paper-এ প্রমাণিত হয়নি — live trade হবে না। Paper-এ লাভ করা টোকেন আসলেই scan শুরু হবে।';
-      log.warn(msg);
-      await tg.send(msg).catch(() => {});
-    } else {
-      throw new Error('No MEXC ERC20 token passed the filters');
-    }
-  }
+  if (engine.universe.length === 0) throw new Error('No MEXC ERC20 token passed the filters');
 
   void tg.startPolling({
     '/stop': () => {
       risk.pause('Telegram /stop');
       return '🛑 New trades STOPPED. An open transfer still finishes (selling the tokens already bought is the safe exit). /start to resume.';
     },
-    '/start': async (args: string[]) => startHandler(risk, transferStatus, makeUnresolvedCheck(db, chain))(args),
+    '/start': async (args: string[]) => startHandler(risk, transferStatus, makeUnresolvedCheck(db, chain), cfg.chain.explorer)(args),
     '/status': async () => transferStatus(),
     '/cancelnonce': () => chain.cancelNonce(),
     '/resolve': ([id, pnl]: string[]) => resolveTrade(db, id, pnl),
     '/sell': ([id]: string[]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
     '/clear': ([id]: string[]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
+    '/pairing': () =>
+      `🔗 Pairing code (${cfg.chain.name}): ${pairing.code}\narb.alphahelper.online-এ code বসিয়ে এই bot-এর dashboard দেখো। Push: ${cfg.ingestUrl ? `চালু (প্রতি ${cfg.ingestIntervalSec}s)` : 'বন্ধ (INGEST_URL নেই)'}`,
+    '/pairing-new': async () => {
+      const newCode = await pairing.rotate();
+      return `🔗 নতুন pairing code (${cfg.chain.name}): ${newCode}\nপুরনো code সাথে সাথে বাতিল হয়েছে — নতুন code দিয়ে আবার connect করো।`;
+    },
+    '/recycle': ([id]: string[]) => (!id ? 'Usage: /recycle <transfer id> | /recycle catchup' : id === 'catchup' ? engine.retryCatchUp() : engine.retryRecycle(Number(id))),
   });
 
   async function transferStatus() {
@@ -415,7 +510,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
         const b = await mexc.balances();
         const eth = await chain.ethBalance();
         const usdc = await chain.tokenBalance(cfg.usdc);
-        lines.push(`MEXC ${usd(b.USDT ?? 0)} USDT | wallet ${(Number(eth) / 1e18).toFixed(4)} ETH, ${usd(Number(usdc) / 1e6)} USDC`);
+        lines.push(walletLine(b.USDT ?? 0, eth, usdc, cfg.chain, stableDecimals, usd));
       } catch (e) {
         lines.push(`Balance error: ${errMsg(e)}`);
       }
@@ -426,20 +521,23 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
   let busy = false;
   let errors = 0;
   let lastLow = 0;
+  let lastScanTs = 0;
   const loop = async () => {
     if (busy || rateLimited() || lifecycle.stopping) return;
     busy = lifecycle.busy = true;
+    lastScanTs = Date.now();
     try {
       await engine.tick();
       errors = 0;
       rateLimitOk();
-      // MEXC USDT is spent by buys and comes back only when you move USDC from the wallet to MEXC.
+      // MEXC USDT is spent by buys and comes back via the Phase 8 recycle loop (USDC proceeds -> MEXC -> USDCUSDT).
+      // If it is low anyway, the recycle is probably HELD — the alert says why.
       if (cfg.mode === 'live' && Date.now() - lastLow > 6 * 3600_000) {
         const usdt = (await mexc.balances()).USDT ?? 0;
-        const eth = Number(await chain.ethBalance()) / 1e18;
-        if (usdt < cfg.minTradeUsd || eth < cfg.minEthForGas) {
+        const native = Number(await chain.ethBalance()) / 1e18;
+        if (usdt < cfg.minTradeUsd || native < cfg.minEthForGas) {
           lastLow = Date.now();
-          await tg.send(`📦 Rebalance needed: MEXC USDT ${usd(usdt)}, wallet ETH ${eth.toFixed(4)}. Move USDC profits from the wallet back to MEXC.`);
+          await tg.send(`📦 Rebalance needed: MEXC USDT ${usd(usdt)}, wallet ${cfg.chain.nativeMexcSymbol.replace('USDT', '')} ${native.toFixed(4)}. The recycle loop normally restores USDT automatically — check for a ♻️ HELD alert if it did not.`);
         }
       }
     } catch (e) {
@@ -454,6 +552,31 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
   setInterval(loop, cfg.scanIntervalSec * 1000);
   void loop();
 
+  // Pairing-code dashboard (Phase B): push a public-safe snapshot to the
+  // central receiver every INGEST_INTERVAL_SEC (first one immediately).
+  const pairingPush = startPairingPush({
+    db,
+    getCode: () => pairing.code,
+    ingestUrl: cfg.ingestUrl,
+    intervalSec: cfg.ingestIntervalSec,
+    buildCtx: async (): Promise<RemoteSnapshotCtx> => {
+      let balances = { mexcUsdt: null as number | null, walletNative: null as number | null, walletUsdc: null as number | null };
+      try {
+        const [mexcB, eth, usdc] = await Promise.all([mexc.balances(), chain.ethBalance(), chain.tokenBalance(cfg.usdc)]);
+        balances = { mexcUsdt: mexcB.USDT ?? null, walletNative: Number(eth) / 1e18, walletUsdc: Number(usdc) / 10 ** stableDecimals };
+      } catch { /* push with nulls */ }
+      return {
+        chain: cfg.chain.name, mode: cfg.mode, strategy: cfg.strategy, maxTradeUsd: cfg.maxTradeUsd,
+        aggregators: cfg.aggregators, dexArbEnabled: cfg.dexArbEnabled,
+        minPoolLiquidityUsd: cfg.minPoolLiquidityUsd, depthMaxImpactBps: cfg.depthMaxImpactBps,
+        version: BOT_VERSION, uptimeSec: process.uptime(), lastScanTs,
+        ...balances, nativeSymbol: cfg.chain.nativeMexcSymbol.replace('USDT', ''),
+      };
+    },
+    onError: (m) => log.warn(m),
+  });
+  pairing.setPusher(() => pairingPush.pushNow());
+
   setInterval(async () => {
     const today = dhakaDay();
     if (dhakaHourMinute().hour === 23 && db.getState('last_summary_day') !== today) {
@@ -462,7 +585,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
     }
   }, 30_000);
 
-  installProcessHandlers(tg, () => {});
+  installProcessHandlers(tg, () => pairingPush.stop());
 
   const open = db.openTransfers();
   await tg.send(
@@ -475,7 +598,15 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
 
 main().catch(async (e) => {
   log.error(`startup failed: ${errMsg(e)}`);
-  const modeTag = cfg.mode === 'live' ? '🔴 LIVE — আসল টাকা' : '📝 PAPER';
-  await new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, undefined, modeTag).send(`❗ Bot failed to start: ${errMsg(e)}`);
+  // Throttle: pm2 restarts a failing start up to 1000x, and every attempt
+  // would otherwise send a Telegram alert (observed: 2 Arbitrum alerts 12s
+  // apart). One alert per 15 min per chain; the stamp survives restarts
+  // because the process exits on failure.
+  const stamp = `${dirname(cfg.dbPath)}/.startup-alert-${cfg.chain.name}`;
+  if (await startupAlertDue(stamp)) {
+    await recordStartupAlert(stamp);
+    const tag = makeModeTag(cfg.mode, cfg.chain.name);
+    await new Telegram(cfg.telegramToken, cfg.telegramChatId, fetch, cfg.telegramAdminId, undefined, tag).send(`❗ Bot failed to start: ${errMsg(e)}`);
+  }
   process.exit(1);
 });

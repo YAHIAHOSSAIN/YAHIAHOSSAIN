@@ -6,7 +6,7 @@ import { MexcRest } from '../src/mexc/rest.js';
 import { ZeroEx, ZEROX_ALLOWANCE_HOLDER } from '../src/dex/aggregator.js';
 import { AmbiguousRequestError } from '../src/mexc/rest.js';
 import { placeSafely } from '../src/engine.js';
-import { loadConfig, secretsOf, validateConfig } from '../src/config.js';
+import { hurdleBps, loadConfig, secretsOf, validateConfig } from '../src/config.js';
 import { Telegram } from '../src/telegram.js';
 import { redact, registerSecrets } from '../src/log.js';
 import { Db } from '../src/db.js';
@@ -167,11 +167,54 @@ test('placeSafely: a timed-out order that WAS placed is found by client id; one 
 test('config validation rejects dangerous values', () => {
   process.env.RPC_URL = 'http://x';
   process.env.MODE = 'paper';
+  // A VPS .env could set the depth knobs out of range and break this test.
+  delete process.env.MIN_POOL_LIQUIDITY_USD;
+  delete process.env.DEPTH_MAX_IMPACT_BPS;
+  delete process.env.DEPTH_MAX_SIZE_PCT;
+  delete process.env.QUOTE_RPS_VELORA;
+  delete process.env.QUOTE_RPS_OPENOCEAN;
+  delete process.env.REBALANCE_LOW_X;
+  delete process.env.DEX_ARB_ENABLED;
+  delete process.env.MIN_PROFIT_BPS_ETH;
+  delete process.env.BUILDER_TIP_GWEI;
   const ok = loadConfig();
   assert.doesNotThrow(() => validateConfig(ok));
   assert.throws(() => validateConfig({ ...ok, minProfitBps: -1 }), /MIN_PROFIT_BPS/);
   assert.throws(() => validateConfig({ ...ok, dexSlippageBps: 20_000 }), /DEX_SLIPPAGE_BPS/);
   assert.throws(() => validateConfig({ ...ok, minTradeUsd: 500, maxTradeUsd: 200 }), /MIN_TRADE_USD/);
+});
+
+test('Phase 5: dynamic hurdle + builder tip — defaults off, ranges enforced, ETH-only', () => {
+  const saved = { ...process.env };
+  try {
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    delete process.env.MIN_PROFIT_BPS_ETH;
+    delete process.env.BUILDER_TIP_GWEI;
+    delete process.env.MIN_PROFIT_BPS;
+    delete process.env.CHAIN;
+    let c = loadConfig();
+    assert.equal(c.minProfitBpsEth, 0); // off by default: current behaviour everywhere
+    assert.equal(c.builderTipGwei, 0);
+    assert.equal(hurdleBps(c), 20); // falls back to MIN_PROFIT_BPS
+    assert.throws(() => validateConfig({ ...c, minProfitBpsEth: -1 }), /MIN_PROFIT_BPS_ETH/);
+    assert.throws(() => validateConfig({ ...c, minProfitBpsEth: 10_001 }), /MIN_PROFIT_BPS_ETH/);
+    assert.throws(() => validateConfig({ ...c, builderTipGwei: -1 }), /BUILDER_TIP_GWEI/);
+    assert.throws(() => validateConfig({ ...c, builderTipGwei: 101 }), /BUILDER_TIP_GWEI/);
+    // Ethereum uses the override when set; L2s ignore it.
+    process.env.MIN_PROFIT_BPS_ETH = '50';
+    c = loadConfig();
+    assert.equal(c.chain.name, 'ethereum');
+    assert.equal(hurdleBps(c), 50);
+    process.env.CHAIN = 'arbitrum';
+    c = loadConfig();
+    assert.equal(hurdleBps(c), 20);
+    process.env.CHAIN = 'bsc';
+    c = loadConfig();
+    assert.equal(hurdleBps(c), 20);
+  } finally {
+    process.env = saved;
+  }
 });
 
 test('Telegram only obeys the admin user in a private chat', async () => {
@@ -273,7 +316,7 @@ test('ethNetwork finds the Ethereum entry in MEXC coin config', () => {
 test('transfer strategy refuses to start without ALLOW_WITHDRAWALS=yes; safe defaults', () => {
   const saved = { ...process.env };
   try {
-    for (const k of ['MODE', 'STRATEGY', 'ALLOW_WITHDRAWALS', 'MAX_TRADE_USD']) delete process.env[k];
+    for (const k of ['MODE', 'STRATEGY', 'ALLOW_WITHDRAWALS', 'MAX_TRADE_USD', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED', 'MIN_PROFIT_BPS_ETH', 'BUILDER_TIP_GWEI']) delete process.env[k];
     process.env.RPC_URL = 'http://x';
     const d = loadConfig();
     assert.equal(d.mode, 'paper');
@@ -304,6 +347,96 @@ test('UNLIMITED_APPROVAL defaults to off (exact approvals); yes turns it on', ()
   }
 });
 
+test('transfer universe volume knobs default to off (no DEX filter, no cap)', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MIN_DEX_VOLUME_USD', 'TRANSFER_UNIVERSE_MAX', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED', 'MIN_PROFIT_BPS_ETH', 'BUILDER_TIP_GWEI']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = loadConfig();
+    assert.equal(c.minDexVolumeUsd, 0);
+    assert.equal(c.transferUniverseMax, 0);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('depth filter knobs default to a $150k pool floor, 70 bps impact, 1% size cap', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = validateConfig(loadConfig());
+    assert.equal(c.minPoolLiquidityUsd, 150_000);
+    assert.equal(c.depthMaxImpactBps, 70);
+    assert.equal(c.depthMaxSizePct, 1);
+    assert.throws(() => validateConfig({ ...c, minPoolLiquidityUsd: -1 }), /MIN_POOL_LIQUIDITY_USD/);
+    assert.throws(() => validateConfig({ ...c, depthMaxImpactBps: 5001 }), /DEPTH_MAX_IMPACT_BPS/);
+    assert.throws(() => validateConfig({ ...c, depthMaxSizePct: 101 }), /DEPTH_MAX_SIZE_PCT/);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Phase 4: REBALANCE_LOW_X defaults to 1 (range 0.1..10); DEX_ARB_ENABLED defaults to no (detection only)', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['REBALANCE_LOW_X', 'DEX_ARB_ENABLED', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = validateConfig(loadConfig());
+    assert.equal(c.rebalanceLowX, 1);
+    assert.equal(c.dexArbEnabled, false);
+    assert.throws(() => validateConfig({ ...c, rebalanceLowX: 0.05 }), /REBALANCE_LOW_X/);
+    assert.throws(() => validateConfig({ ...c, rebalanceLowX: 10.1 }), /REBALANCE_LOW_X/);
+    process.env.REBALANCE_LOW_X = '1.5';
+    assert.equal(loadConfig().rebalanceLowX, 1.5);
+    process.env.DEX_ARB_ENABLED = 'yes';
+    assert.equal(loadConfig().dexArbEnabled, true);
+    process.env.DEX_ARB_ENABLED = 'no';
+    assert.equal(loadConfig().dexArbEnabled, false);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Phase 3: velora + openocean are accepted aggregator names; unknown names rejected', () => {
+  const saved = { ...process.env };
+  try {
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    process.env.DEX_AGGREGATOR = 'velora,openocean';
+    assert.deepEqual(loadConfig().aggregators, ['velora', 'openocean']);
+    process.env.DEX_AGGREGATOR = '0x,kyber,1inch,velora,openocean';
+    assert.deepEqual(loadConfig().aggregators, ['0x', 'kyber', '1inch', 'velora', 'openocean']);
+    process.env.DEX_AGGREGATOR = 'velora,paraswap';
+    assert.throws(() => loadConfig(), /DEX_AGGREGATOR: unknown "paraswap"/);
+    delete process.env.DEX_AGGREGATOR;
+    assert.deepEqual(loadConfig().aggregators, ['0x']); // default unchanged
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Phase 3: QUOTE_RPS_VELORA defaults to 1 (free-tier limit), QUOTE_RPS_OPENOCEAN to 2; ranges enforced', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.QUOTE_RPS_VELORA;
+    delete process.env.QUOTE_RPS_OPENOCEAN;
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = validateConfig(loadConfig());
+    assert.equal(c.quoteRps.velora, 1);
+    assert.equal(c.quoteRps.openocean, 2);
+    assert.equal(c.quoteRps['0x'], 4); // existing defaults unchanged
+    assert.throws(() => validateConfig({ ...c, quoteRps: { ...c.quoteRps, velora: -1 } }), /QUOTE_RPS_VELORA/);
+    assert.throws(() => validateConfig({ ...c, quoteRps: { ...c.quoteRps, openocean: 101 } }), /QUOTE_RPS_OPENOCEAN/);
+  } finally {
+    process.env = saved;
+  }
+});
+
 test('RPC URLs (they contain provider keys) are redacted', () => {
   process.env.RPC_URL = 'https://eth-mainnet.g.alchemy.com/v2/SECRETKEY123';
   process.env.MODE = 'paper';
@@ -316,7 +449,7 @@ test('RPC URLs (they contain provider keys) are redacted', () => {
 test('default economics: profit floor is small vs trade size; $15 on $50 is rejected', () => {
   const saved = { ...process.env };
   try {
-    for (const k of ['MIN_PROFIT_USD', 'MAX_TRADE_USD', 'MODE', 'STRATEGY']) delete process.env[k];
+    for (const k of ['MIN_PROFIT_USD', 'MAX_TRADE_USD', 'MIN_TRADE_USD', 'TRANSFER_DRIFT_BPS', 'MODE', 'STRATEGY', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED']) delete process.env[k];
     process.env.RPC_URL = 'http://x';
     const d = validateConfig(loadConfig());
     assert.ok(d.minProfitUsd <= d.maxTradeUsd * 0.1, `${d.minProfitUsd} vs ${d.maxTradeUsd}`);
@@ -377,6 +510,25 @@ test('L1_FEE_USD defaults to 0 (round-3 M1)', () => {
     delete process.env.L1_FEE_USD;
     process.env.RPC_URL = 'http://x';
     assert.equal(loadConfig().l1FeeUsd, 0);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('transfer strategy runs on ethereum/arbitrum/bsc, not on base', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MODE', 'STRATEGY', 'ALLOW_WITHDRAWALS', 'MAX_TRADE_USD', 'CHAIN', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.STRATEGY = 'transfer';
+    process.env.ALLOW_WITHDRAWALS = 'yes';
+    for (const chain of ['ethereum', 'arbitrum', 'bsc']) {
+      process.env.CHAIN = chain;
+      assert.equal(loadConfig().chain.name, chain);
+      assert.equal(loadConfig().strategy, 'transfer');
+    }
+    process.env.CHAIN = 'base';
+    assert.throws(() => loadConfig(), /only supported on CHAIN=ethereum\/arbitrum\/bsc/);
   } finally {
     process.env = saved;
   }

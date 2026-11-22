@@ -9,6 +9,12 @@ type Update = {
   message?: { chat?: { id: number | string; type?: string }; from?: { id: number | string }; text?: string; date?: number };
 };
 
+/** First line of every Telegram message: mode + chain, so the bots sharing
+ *  one chat (paper/live, ethereum/arbitrum) can never be confused. */
+export function makeModeTag(mode: string, chain: string): string {
+  return `${mode === 'live' ? '🔴 LIVE — আসল টাকা' : '📝 PAPER'} · ${chain}`;
+}
+
 export class Telegram {
   private offset = 0;
   private running = false;
