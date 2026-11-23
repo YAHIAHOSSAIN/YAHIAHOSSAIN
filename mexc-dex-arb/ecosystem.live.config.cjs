@@ -28,6 +28,7 @@ module.exports = {
         // and DEX 24h vol >= $10k. Paper bot keeps the shared .env values (MEXC vol $50k, no DEX filter, no cap).
         MIN_MEXC_VOLUME_USD: '10000',
         MIN_DEX_VOLUME_USD: '10000',
+        MIN_POOL_LIQUIDITY_USD: '50000', // owner decision 2026-11-23: pool floor $150k -> $50k (impact <=0.7% and size <=1% of pool caps still apply)
         TRANSFER_UNIVERSE_MAX: '100',
         SCAN_MIN_GAP_PCT: '2', // owner decision 2026-11-22: rough gap 3% -> 2% (more candidates; exact-quote profit gate still applies)
         DEX_ARB_ENABLED: 'yes', // owner decision 2026-11-23: DEX-DEX detection on (detection only — no trade/execution)

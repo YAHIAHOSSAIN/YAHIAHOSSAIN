@@ -38,6 +38,7 @@ module.exports = {
         UNLIMITED_APPROVAL: 'yes', // owner decision 2026-11-21: approve MaxUint256 once per token, skip the approve tx on later sales (~12s saved per sale). Risk accepted: a compromised spender could drain the token balance.
         MIN_MEXC_VOLUME_USD: '10000',
         MIN_DEX_VOLUME_USD: '10000',
+        MIN_POOL_LIQUIDITY_USD: '50000', // owner decision 2026-11-23: pool floor $150k -> $50k (impact <=0.7% and size <=1% of pool caps still apply)
         TRANSFER_UNIVERSE_MAX: '100',
         SCAN_MIN_GAP_PCT: '2',
         DEX_ARB_ENABLED: 'yes', // owner decision 2026-11-23: DEX-DEX detection on (detection only — no trade/execution)

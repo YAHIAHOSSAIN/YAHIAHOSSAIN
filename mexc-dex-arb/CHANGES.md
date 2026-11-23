@@ -1,3 +1,8 @@
+# Pool floor $150k -> $50k on all live chains (owner decision 2026-11-23, Yahia: "50k koro")
+
+- `MIN_POOL_LIQUIDITY_USD: '50000'` added to the env block of all three live ecosystem configs (was unset — the `src/config.ts` default of 150,000 applied). Impact ≤0.7% and size ≤1% of pool caps still apply, so a $500 trade on a $50k pool still sizes down (~$175 at the impact cap); the floor change only widens the universe to $50k–$150k pools.
+- Deployed to VPS, bots restarted (pm2 delete + start), live API confirms `minPoolLiquidityUsd: 50000` on all three chains. Local tests 342/342 pass (config-only change, no code touched).
+
 # DEX-ARB detection wiring into the transfer tick + audit round 1 fixes (Muse, 2026-11-23 ~05:20, Yahia's order "হ্যাঁ, transfer-এ wiring করো" + voice-call full-loop order: fix → scan → fix → scan until clean → only then push + deploy)
 
 **The gap:** `scanDexArbTick` existed ONLY in the inventory `Engine` (`src/engine.ts:419`); `TransferEngine` had zero DEX-ARB code, and live bots run `STRATEGY=transfer` — so `DEX_ARB_ENABLED=yes` in all three live envs produced 0 `DEX_ARB` rows. Wiring (detection only, never trades):
