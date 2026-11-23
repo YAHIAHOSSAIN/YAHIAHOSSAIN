@@ -198,20 +198,6 @@ export function loadConfig() {
     maxOpenTransfers: num('MAX_OPEN_TRANSFERS', 1),
     // After arrival, do not sell automatically if it would lose more than this % of the cost: hold + alert.
     transferMaxLossPct: num('TRANSFER_MAX_LOSS_PCT', 3),
-    // --- Pairing-code dashboard (default-ON reporting, owner decision 2026-11-23) ---
-    // The central receiver that serves the multi-user dashboard. By default
-    // every bot reports its hot wallet address + public-safe status (trades,
-    // PnL — never a key, tx hash or order id) to arb.alphahelper.online, so
-    // the board owner can see who runs the code; the owner's page groups bots
-    // by wallet address. An explicitly set INGEST_URL always wins (Yahia's
-    // VPS: http://127.0.0.1:3102/api/ingest, same machine as the status
-    // server). Turn reporting off with INGEST_URL=off — an empty value means
-    // "use the default", not "off" (str() treats empty as unset).
-    ingestUrl: (() => {
-      const raw = str('INGEST_URL', 'https://arb.alphahelper.online/api/ingest');
-      return ['off', 'none', '0'].includes(raw.toLowerCase()) ? '' : raw;
-    })(),
-    ingestIntervalSec: num('INGEST_INTERVAL_SEC', 25),
     dbPath: str('DB_PATH', `data/${chain.name}.sqlite`), // one database per chain
     paperDbPath: str('PAPER_DB_PATH', ''), // live twin: read paper history from the paper bot's DB (empty = own DB)
     envPath: str('ENV_PATH', '.env'),
@@ -260,7 +246,6 @@ export function validateConfig(c: Config): Config {
   // Upper bound keeps the graceful-shutdown wait (2x this + 60 s) below pm2's kill_timeout (240 s).
   range('TX_TIMEOUT_SEC', c.txTimeoutSec, 12, 80);
   range('SCAN_INTERVAL_SEC', c.scanIntervalSec, 5, 3600);
-  range('INGEST_INTERVAL_SEC', c.ingestIntervalSec, 10, 300);
   range('QUOTE_RPS_VELORA', c.quoteRps.velora, 0, 100);
   range('QUOTE_RPS_OPENOCEAN', c.quoteRps.openocean, 0, 100);
   range('MIN_DEX_VOLUME_USD', c.minDexVolumeUsd, 0, 1e7);

@@ -20,52 +20,10 @@ import { recoverExecuting } from './recovery.js';
 import { makeUnresolvedCheck, resolveTrade, startHandler, unresolvedLines } from './commands.js';
 import { startupAlertDue, recordStartupAlert } from './startup-alert.js';
 import { dhakaDay, dhakaHourMinute, usd, walletLine } from './util.js';
-import { getOrCreatePairingCode, rotatePairingCode, startPairingPush, type RemoteSnapshotCtx } from './remote.js';
 
 const cfg = validateConfig(loadConfig());
 registerSecrets(secretsOf(cfg));
 
-/** Bot version for the pairing snapshot (package.json, best effort). */
-let BOT_VERSION = 'unknown';
-try {
-  BOT_VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version ?? 'unknown';
-} catch { /* ignore */ }
-
-/**
- * Pairing-code dashboard (Phase B): this bot instance owns one code (one per
- * chain), stored in its own DB state table — never in .env, never in git.
- * Generated once; announced in the log + Telegram only on first creation.
- * The pairing object also carries the snapshot pusher, so /pairing-new can
- * push with the new code at once.
- */
-function makePairing(db: Db, tg: Telegram) {
-  const first = getOrCreatePairingCode(db);
-  let code = first.code;
-  let pusher: (() => Promise<boolean>) | null = null;
-  if (first.isNew) {
-    log.info(`pairing code (${cfg.chain.name}): ${code} — this chain's dashboard code, keep it private like a password`);
-    void tg.send(`🔗 Pairing code (${cfg.chain.name}): ${code}\narb.alphahelper.online-এ এই code বসালে এই bot-এর live dashboard দেখাবে। Code-টা password-এর মতো — কাউকে দিও না।`).catch(() => {});
-  }
-  const api = {
-    get code() {
-      return code;
-    },
-    setPusher(fn: () => Promise<boolean>) {
-      pusher = fn;
-    },
-    async pushNow(): Promise<boolean> {
-      return pusher ? pusher() : false;
-    },
-    async rotate(): Promise<string> {
-      const r = await rotatePairingCode(db, cfg.ingestUrl);
-      code = r.newCode;
-      await api.pushNow();
-      return r.newCode;
-    },
-  };
-  return api;
-}
-export type Pairing = ReturnType<typeof makePairing>;
 
 /** Backoff after HTTP 429/418 from any API: skip scans for 1, 2, 4 ... up to 15 minutes. */
 const rateLimit = { until: 0, level: 0 };
@@ -169,7 +127,6 @@ async function main() {
     set: (v) => db.setState('telegram_offset', v),
   }, tag);
   if (!tg.enabled) log.warn('Telegram not configured: alerts only go to the log and there is no /stop');
-  const pairing = makePairing(db, tg);
   const mexc = new MexcRest(cfg.mexcApiKey, cfg.mexcApiSecret);
   const chain = new Chain(cfg.rpcUrl, cfg.sendRpcUrl, cfg.privateKey, cfg.priorityFeeGwei, {
     get: () => db.getState('unresolved_tx') || undefined,
@@ -241,7 +198,7 @@ async function main() {
   // Keep signed MEXC timestamps inside recvWindow even if the VPS clock drifts.
   setInterval(() => void mexc.syncTime().catch((e) => log.warn(`clock sync: ${errMsg(e)}`)), 10 * 60_000);
 
-  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg, stableDecimals, pairing);
+  if (cfg.strategy === 'transfer') return runTransfer(db, risk, tg, mexc, chain, agg, stableDecimals);
 
   const tokens = await buildWatchlist(mexc, (a) => chain.decimals(a), {
     chain: cfg.chain,
@@ -310,12 +267,6 @@ async function main() {
     '/status': statusText,
     '/tokens': () =>
       `Tokens (${tokens.length}): ${tokens.map((t) => `${t.base} (vol $${Math.round(t.mexcVolumeUsd / 1000)}k, TVL $${Math.round(t.dexTvlUsd / 1000)}k)`).join(', ')}`,
-    '/pairing': () =>
-      `🔗 Pairing code (${cfg.chain.name}): ${pairing.code}\narb.alphahelper.online-এ code বসিয়ে এই bot-এর dashboard দেখো। Push: ${cfg.ingestUrl ? `চালু (প্রতি ${cfg.ingestIntervalSec}s)` : 'বন্ধ (INGEST_URL নেই)'}`,
-    '/pairing-new': async () => {
-      const newCode = await pairing.rotate();
-      return `🔗 নতুন pairing code (${cfg.chain.name}): ${newCode}\nপুরনো code সাথে সাথে বাতিল হয়েছে — নতুন code দিয়ে আবার connect করো।`;
-    },
     '/cancelnonce': () => chain.cancelNonce(),
     '/resolve': ([id, pnl]) => resolveTrade(db, id, pnl),
   });
@@ -428,37 +379,8 @@ async function main() {
     }
   }, 30_000);
 
-  // Pairing-code dashboard (Phase B): push a public-safe snapshot to the
-  // central receiver every INGEST_INTERVAL_SEC (first one immediately).
-  const pairingPush = startPairingPush({
-    db,
-    getCode: () => pairing.code,
-    ingestUrl: cfg.ingestUrl,
-    intervalSec: cfg.ingestIntervalSec,
-    buildCtx: async (): Promise<RemoteSnapshotCtx> => {
-      let bal = { mexcUsdt: null as number | null, walletNative: null as number | null, walletUsdc: null as number | null };
-      try {
-        const b = await balances();
-        bal = { mexcUsdt: b.mexc.USDT ?? null, walletNative: b.walletEth, walletUsdc: b.walletUsdc };
-      } catch { /* push with nulls */ }
-      // Hot wallet address identifies this bot on the owner's board.
-      // Paper mode has no wallet (PRIVATE_KEY not loaded) — chain.address
-      // throws there, so identity stays empty instead of breaking the push.
-      let walletAddress = '';
-      try { walletAddress = chain.address.toLowerCase(); } catch { /* no wallet */ }
-      return {
-        chain: cfg.chain.name, mode: cfg.mode, strategy: cfg.strategy, maxTradeUsd: cfg.maxTradeUsd,
-        aggregators: cfg.aggregators, dexArbEnabled: cfg.dexArbEnabled,
-        minPoolLiquidityUsd: cfg.minPoolLiquidityUsd, depthMaxImpactBps: cfg.depthMaxImpactBps,
-        version: BOT_VERSION, walletAddress, uptimeSec: process.uptime(), lastScanTs: lastTick,
-        ...bal, nativeSymbol: cfg.chain.nativeMexcSymbol.replace('USDT', ''),
-      };
-    },
-    onError: (m) => log.warn(m),
-  });
-  pairing.setPusher(() => pairingPush.pushNow());
 
-  installProcessHandlers(tg, () => { stream.stop(); pairingPush.stop(); });
+  installProcessHandlers(tg, () => { stream.stop(); });
 
   await tg.send(
     `🤖 Bot started. MODE=${cfg.mode.toUpperCase()} via ${agg.name}\nTokens: ${tokens.map((t) => t.base).join(', ')}\n` +
@@ -467,7 +389,7 @@ async function main() {
 }
 
 /** TRANSFER strategy: scan MEXC ERC20 tokens, buy on MEXC, withdraw, sell on DEX. CEX->DEX only. */
-async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator, stableDecimals: number, pairing: Pairing) {
+async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, chain: Chain, agg: Aggregator, stableDecimals: number) {
   // Live watchlist (owner decision 2026-11-22): 100 tokens by volume — MEXC 24h vol >= $20k
   // and DEX 24h vol >= $20k (MIN_MEXC_VOLUME_USD / MIN_DEX_VOLUME_USD / TRANSFER_UNIVERSE_MAX
   // in ecosystem.live.config.cjs). The old proven-only rule (live trades only paper-proven
@@ -487,12 +409,6 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
     '/resolve': ([id, pnl]: string[]) => resolveTrade(db, id, pnl),
     '/sell': ([id]: string[]) => (id ? engine.forceSell(Number(id)) : 'Usage: /sell <transfer id>'),
     '/clear': ([id]: string[]) => (id ? engine.clear(Number(id)) : 'Usage: /clear <transfer id>'),
-    '/pairing': () =>
-      `🔗 Pairing code (${cfg.chain.name}): ${pairing.code}\narb.alphahelper.online-এ code বসিয়ে এই bot-এর dashboard দেখো। Push: ${cfg.ingestUrl ? `চালু (প্রতি ${cfg.ingestIntervalSec}s)` : 'বন্ধ (INGEST_URL নেই)'}`,
-    '/pairing-new': async () => {
-      const newCode = await pairing.rotate();
-      return `🔗 নতুন pairing code (${cfg.chain.name}): ${newCode}\nপুরনো code সাথে সাথে বাতিল হয়েছে — নতুন code দিয়ে আবার connect করো।`;
-    },
     '/recycle': ([id]: string[]) => (!id ? 'Usage: /recycle <transfer id> | /recycle catchup' : id === 'catchup' ? engine.retryCatchUp() : engine.retryRecycle(Number(id))),
   });
 
@@ -557,34 +473,6 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
   setInterval(loop, cfg.scanIntervalSec * 1000);
   void loop();
 
-  // Pairing-code dashboard (Phase B): push a public-safe snapshot to the
-  // central receiver every INGEST_INTERVAL_SEC (first one immediately).
-  const pairingPush = startPairingPush({
-    db,
-    getCode: () => pairing.code,
-    ingestUrl: cfg.ingestUrl,
-    intervalSec: cfg.ingestIntervalSec,
-    buildCtx: async (): Promise<RemoteSnapshotCtx> => {
-      let balances = { mexcUsdt: null as number | null, walletNative: null as number | null, walletUsdc: null as number | null };
-      try {
-        const [mexcB, eth, usdc] = await Promise.all([mexc.balances(), chain.ethBalance(), chain.tokenBalance(cfg.usdc)]);
-        balances = { mexcUsdt: mexcB.USDT ?? null, walletNative: Number(eth) / 1e18, walletUsdc: Number(usdc) / 10 ** stableDecimals };
-      } catch { /* push with nulls */ }
-      // Hot wallet address identifies this bot on the owner's board (see the
-      // inventory buildCtx above — same rule: no wallet in paper mode).
-      let walletAddress = '';
-      try { walletAddress = chain.address.toLowerCase(); } catch { /* no wallet */ }
-      return {
-        chain: cfg.chain.name, mode: cfg.mode, strategy: cfg.strategy, maxTradeUsd: cfg.maxTradeUsd,
-        aggregators: cfg.aggregators, dexArbEnabled: cfg.dexArbEnabled,
-        minPoolLiquidityUsd: cfg.minPoolLiquidityUsd, depthMaxImpactBps: cfg.depthMaxImpactBps,
-        version: BOT_VERSION, walletAddress, uptimeSec: process.uptime(), lastScanTs,
-        ...balances, nativeSymbol: cfg.chain.nativeMexcSymbol.replace('USDT', ''),
-      };
-    },
-    onError: (m) => log.warn(m),
-  });
-  pairing.setPusher(() => pairingPush.pushNow());
 
   setInterval(async () => {
     const today = dhakaDay();
@@ -594,7 +482,7 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
     }
   }, 30_000);
 
-  installProcessHandlers(tg, () => pairingPush.stop());
+  installProcessHandlers(tg, () => {});
 
   const open = db.openTransfers();
   await tg.send(

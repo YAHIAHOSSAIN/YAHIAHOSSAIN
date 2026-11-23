@@ -56,25 +56,6 @@ Yahia terminal ছাড়া VPS-এর বটটা দেখতে চেয
 - শুধু `127.0.0.1`-এ শোনে; বাইরে থেকে আসে শুধু Cloudflare Tunnel দিয়ে
 - পেজে যা দেখায় তা শুধু paper হিসাব — কোনো wallet/key/ঠিকানা নেই
 
-## Owner board — /bots (key দিয়ে বন্ধ, 2026-11-23)
-
-- যে বটগুলো এই code চালায়, তাদের hot wallet address দিয়ে group করে একটা
-  summary page: মোট user, active user (শেষ ৫ মিনিটে snapshot পাঠিয়েছে),
-  মোট volume/profit, প্রত্যেক user-এর chains/trades/profit/শেষ trade।
-- **OWNER_KEY setup (শুধু VPS-এ, repo-তে কখনো নয়):** ২৪ অক্ষরের random key
-  বানান (pairing code-এর মতো alphabet), VPS-এর `status-ecosystem.config.cjs`
-  ফাইলে status server-এর env-এ `OWNER_KEY` হিসাবে বসান। key না থাকলে
-  `/api/owner` সবসময় 404 দেয় (fail-closed) — board বন্ধই থাকে।
-  pm2-এ env বদলাতে `pm2 restart` যথেষ্ট নয় — `pm2 delete` + `pm2 start`
-  করতে হয়।
-- Key-টা URL-এ যায় (`/bots?key=…` → `/api/owner?key=…`) — link share করা
-  যায় বলেই এভাবে; পেজে কোনো external link নেই, তাই অন্য সাইটে leak হয় না।
-- **জানা সীমা (accepted, 2-user private scope):** address grouping বটের
-  পাঠানো address-এর উপর ভরসা করে — কোনো valid pairing code ধরা বট অন্যের
-  address দাবি করলে তার totals-এ ঢুকে যাবে। যাচাই করতে হলে snapshot-এ
-  signature লাগবে (এখনো বানানো হয়নি); private 2-user board-এ এটা মেনে
-  নেওয়া হয়েছে।
-
 ## Deploy (Yahia-র OK পেলে, VPS-এ)
 
 1. ফাইল দুটো VPS-এর `~/mexc-dex-arb-repo/mexc-dex-arb/`-এ নাও:

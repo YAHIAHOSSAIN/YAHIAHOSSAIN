@@ -28,7 +28,7 @@ export function computeKpis(db: Db, sinceTs: number, mode: string): Kpis {
   // as "tokens seen" but never as tradeable gaps, so every opportunity query
   // below excludes them (direction IS NOT 'DEX_ARB' is NULL-safe, so legacy
   // rows without a direction still count). Their own stats live in
-  // readDexArbStats (status server / remote snapshot).
+  // readDexArbStats (status server).
   const opportunitiesPerToken = q<{ token: string; n: number; best_gross_bps: number | null }>(
     `SELECT token, COUNT(*) n, MAX(gross_bps) best_gross_bps FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND gross_bps IS NOT NULL GROUP BY token ORDER BY n DESC`,
     sinceTs,

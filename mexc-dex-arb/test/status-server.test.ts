@@ -133,7 +133,7 @@ process.env.CHAIN = 'ethereum';
 process.env.MODE = 'paper';
 
 const server = await import('../status-server.mjs');
-const { readPublicConfig, readDepthRejects, readDexArbStats, readTradeStats, readLive, sanitizeSnapshot, chainJson, PAGE, CHAINS, dashboardPage, paperPage } = server;
+const { readPublicConfig, readDepthRejects, readDexArbStats, readTradeStats, readLive, chainJson, PAGE, CHAINS, dashboardPage, paperPage } = server;
 
 test('Phase 6: readPublicConfig returns the published config; defaults to DEX-ARB OFF', () => {
   const db = new Database(paperDbPath, { readonly: true });
@@ -296,19 +296,6 @@ test('Board audit L1: live Booked falls back to pnl (transfer mode never re-quot
   const xyzPaper = out.recent.find((r: any) => r.symbol === 'XYZ');
   assert.ok(xyzPaper, 'paper XYZ trade missing');
   assert.equal(xyzPaper.booked, null); // paper without a re-quote still shows —
-});
-
-test('Board audit L1 (remote): sanitizeSnapshot books live pnl when booked is null; paper unchanged', () => {
-  const live: any = sanitizeSnapshot({
-    chain: 'ethereum', mode: 'live',
-    recent: [{ ts: Date.now(), symbol: 'ACN', direction: 'TRANSFER', size: 300, expected: 10, booked: null, pnl: 15.79, status: 'ok' }],
-  });
-  assert.equal(live.recent[0].booked, 15.79);
-  const paper: any = sanitizeSnapshot({
-    chain: 'ethereum', mode: 'paper',
-    recent: [{ ts: Date.now(), symbol: 'BGB', direction: 'TRANSFER', size: 300, expected: 20, booked: null, pnl: 2.5, status: 'paper' }],
-  });
-  assert.equal(paper.recent[0].booked, null);
 });
 
 test('Board audit L4: live tokens seen in the last hour are reported (paper parity)', async () => {
