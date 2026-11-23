@@ -19,11 +19,12 @@
 //   LIVE_MAX_TRADE_USD default 50 (display only, live)
 //   WATCHLIST_MAX default 50 (display only)
 //
-// Per-chain pages (2026-11-22): / is the chain index, /ethereum, /arbitrum
-// and /bsc are the per-chain dashboards (same premium layout). Arbitrum and
-// BSC have no paper twin, so their paper section shows "paper bot নেই" and
-// only the live section has data. A missing live DB never crashes the page:
-// that chain's sections show "no data yet" instead.
+// Per-chain pages (2026-11-22; ETH split 2026-11-23): / is the chain index,
+// /ethereum, /arbitrum and /bsc are the per-chain LIVE dashboards (same
+// premium layout). Ethereum paper lives on its own page, /ethereum-paper —
+// the two were one long page with paper first, so the live numbers sat below
+// frozen paper numbers. Arbitrum and BSC have no paper twin. A missing live
+// DB never crashes the page: that chain's sections show "no data yet" instead.
 //
 // Details dashboard (premium look, approved 2026-11-22): hero stat cards,
 // per-trade detail (first-quote net vs booked net), gap distribution +
@@ -54,7 +55,7 @@ const WATCHLIST_MAX = Number(process.env.WATCHLIST_MAX || 50);
 // "no data yet" instead of breaking the page.
 export const CHAINS = {
   ethereum: {
-    name: 'ethereum', label: 'Ethereum', sub: 'MEXC ↔ Ethereum DEX · Paper + Live — দুটো হিসাবই আছে',
+    name: 'ethereum', label: 'Ethereum', sub: 'MEXC ↔ Ethereum DEX · Live — আসল টাকা দিয়ে ট্রেড',
     paperDb: process.env.STATUS_DB || process.env.DB_PATH || 'data/ethereum.sqlite',
     liveDb: process.env.STATUS_LIVE_DB || process.env.LIVE_DB_PATH || 'data/ethereum-live.sqlite',
     paperApp: 'mexc-dex-arb-ethereum', liveApp: 'mexc-dex-arb-ethereum-live',
@@ -832,6 +833,7 @@ button{background:#d4af37;color:#000;border:0;border-radius:8px;padding:8px 14px
 </style></head><body>
 <h1>🤖 MEV Bot — Paper</h1>
 <div class="sub">MEXC ↔ Ethereum DEX · আসল টাকা নয়, শুধু paper হিসাব</div>
+<div id="paper-block">
 <div class="card" id="status">লোড হচ্ছে…</div>
 <div class="card" id="config"></div>
 <div class="hero" id="hero"></div>
@@ -846,6 +848,8 @@ button{background:#d4af37;color:#000;border:0;border-radius:8px;padding:8px 14px
 <div class="card" id="tokens"></div>
 <h2>📅 দিন অনুযায়ী — Paper</h2>
 <div class="dgrid" id="daily"></div>
+</div>
+<div id="live-block">
 <h2 class="live">🔴 Live — আসল টাকা</h2>
 <div class="sub" style="color:#999;font-size:13px;margin-bottom:12px">এই অংশের লাভ/লস সত্যিকারের — আসল wallet আর MEXC দিয়ে ট্রেড হয়</div>
 <div class="card live" id="live-status">লোড হচ্ছে…</div>
@@ -862,6 +866,7 @@ button{background:#d4af37;color:#000;border:0;border-radius:8px;padding:8px 14px
 <div class="card live" id="live-gap"></div>
 <h2 class="live">🛡️ Depth Filter — Live · গত ২৪ ঘণ্টা</h2>
 <div class="card live" id="live-depth"></div>
+</div>
 <div class="foot" id="foot"></div>
 <p><button onclick="load()">↻ এখনই দেখো</button></p>
 <script>
@@ -1059,17 +1064,33 @@ load(); setInterval(load, 30000);
 
 function navHtml(active) {
   const links = Object.values(CHAINS).map((c) => `<a href="/${c.name}" class="${c.name === active ? 'active' : ''}">${c.label}</a>`).join('');
-  return `<div class="nav"><a href="/" class="${active === 'index' ? 'active' : ''}">🏠 সব chain</a>${links}</div>`;
+  const paper = `<a href="/ethereum-paper" class="${active === 'ethereum-paper' ? 'active' : ''}">📝 ETH Paper</a>`;
+  return `<div class="nav"><a href="/" class="${active === 'index' ? 'active' : ''}">🏠 সব chain</a>${links}${paper}</div>`;
 }
 
 // Per-chain dashboard: the same premium PAGE, with the chain name in the
 // title/heading, a nav bar, and the JS fetching this chain's JSON.
+// Per-chain dashboard: LIVE only. Ethereum paper lives on its own page
+// (/ethereum-paper) — the two were one long page with paper first, so the
+// live numbers sat below frozen paper numbers.
 export function dashboardPage(c) {
   return PAGE
-    .replace('<title>MEV Bot — Paper + Live</title>', `<title>MEV Bot — ${c.label}</title>`)
-    .replace('<h1>🤖 MEV Bot — Paper</h1>', `<h1>🤖 MEV Bot — ${c.label}</h1>`)
+    .replace('<title>MEV Bot — Paper + Live</title>', `<title>MEV Bot — ${c.label} Live</title>`)
+    .replace('<h1>🤖 MEV Bot — Paper</h1>', `<h1>🤖 MEV Bot — ${c.label} Live</h1>`)
     .replace('MEXC ↔ Ethereum DEX · আসল টাকা নয়, শুধু paper হিসাব', c.sub)
-    .replace('<body>', `<body>\n${navHtml(c.name)}`)
+    .replace('<body>', `<body>\n${navHtml(c.name)}<style>#paper-block{display:none}</style>`)
+    .replace("fetch('/api/status')", `fetch('/api/status?chain=${c.name}')`)
+    .replace('async function load(){', `const HAS_PAPER = ${c.paperDb ? 'true' : 'false'};\nasync function load(){`);
+}
+
+// Ethereum paper on its own page: the frozen paper bot (stopped 2026-11-23)
+// keeps its numbers, but no longer sits above the live numbers.
+export function paperPage(c) {
+  return PAGE
+    .replace('<title>MEV Bot — Paper + Live</title>', `<title>MEV Bot — ${c.label} Paper</title>`)
+    .replace('<h1>🤖 MEV Bot — Paper</h1>', `<h1>🤖 MEV Bot — ${c.label} Paper</h1>`)
+    .replace('MEXC ↔ Ethereum DEX · আসল টাকা নয়, শুধু paper হিসাব', 'MEXC ↔ Ethereum DEX · আসল টাকা নয়, শুধু paper হিসাব — bot বন্ধ, frozen ডেটা')
+    .replace('<body>', `<body>\n${navHtml('ethereum-paper')}<style>#live-block{display:none}</style>`)
     .replace("fetch('/api/status')", `fetch('/api/status?chain=${c.name}')`)
     .replace('async function load(){', `const HAS_PAPER = ${c.paperDb ? 'true' : 'false'};\nasync function load(){`);
 }
@@ -1148,8 +1169,9 @@ function cardHtml(c){
       ? '<div class="row"><span>📝 Paper ট্রেড</span><span>'+c.paper.trades+' টা · '+pnlHtml(c.paper.pnl)+'</span></div>'
       : '<div class="muted">Paper তথ্য পাওয়া যায়নি</div>');
   var state = live && live.pm2 === 'online' ? '<span class="badge">● live চলছে</span>' : (live && live.pm2 === 'not-found' ? '<span class="badge off">● live bot নেই</span>' : '<span class="badge off">● live বন্ধ</span>');
+  var paperBtn = c.paper === null ? '' : ' <a href="/'+c.chain+'-paper" style="display:inline-block;background:#222;color:#d4af37;border:1px solid #4a3d16;border-radius:8px;padding:9px 16px;font-weight:700;text-decoration:none">📝 Paper দেখো →</a>';
   return '<div class="card"><h2>'+c.label+'</h2>' + state + liveLine + paperLine +
-    '<p style="margin:12px 0 0"><a href="/'+c.chain+'" style="display:inline-block;background:#d4af37;color:#000;border-radius:8px;padding:9px 16px;font-weight:700;text-decoration:none">দেখো →</a></p></div>';
+    '<p style="margin:12px 0 0"><a href="/'+c.chain+'" style="display:inline-block;background:#d4af37;color:#000;border-radius:8px;padding:9px 16px;font-weight:700;text-decoration:none">দেখো →</a>'+paperBtn+'</p></div>';
 }
 var savedCodes = [];
 try { savedCodes = JSON.parse(localStorage.getItem('arb_codes') || '[]'); if(!Array.isArray(savedCodes)) savedCodes = []; } catch(e){ savedCodes = []; }
@@ -1381,6 +1403,11 @@ const server = http.createServer(async (req, res) => {
     if (path === '/' || path === '/index.html') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(INDEX_PAGE);
+      return;
+    }
+    if (path === '/ethereum-paper') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(paperPage(CHAINS.ethereum));
       return;
     }
     const chainPage = path === '/ethereum' ? CHAINS.ethereum : path === '/arbitrum' ? CHAINS.arbitrum : path === '/bsc' ? CHAINS.bsc : null;

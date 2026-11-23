@@ -133,7 +133,7 @@ process.env.CHAIN = 'ethereum';
 process.env.MODE = 'paper';
 
 const server = await import('../status-server.mjs');
-const { readPublicConfig, readDepthRejects, readDexArbStats, readTradeStats, readLive, sanitizeSnapshot, chainJson, PAGE, CHAINS, dashboardPage } = server;
+const { readPublicConfig, readDepthRejects, readDexArbStats, readTradeStats, readLive, sanitizeSnapshot, chainJson, PAGE, CHAINS, dashboardPage, paperPage } = server;
 
 test('Phase 6: readPublicConfig returns the published config; defaults to DEX-ARB OFF', () => {
   const db = new Database(paperDbPath, { readonly: true });
@@ -456,4 +456,26 @@ test('Board audit L6: /ethereum subtitle is no longer paper-only; the stale demo
   assert.ok(page.includes(CHAINS.ethereum.sub));
   assert.ok(!page.includes('আসল টাকা নয়, শুধু paper হিসাব'));
   assert.ok(!fs.existsSync(new URL('../dashboard-demo.html', import.meta.url)), 'dashboard-demo.html is still in the repo root');
+});
+
+// ---------------- ETH paper split from live (owner decision 2026-11-23) ----------------
+test('ETH split: /ethereum is live-only, /ethereum-paper is paper-only', () => {
+  const live = dashboardPage(CHAINS.ethereum);
+  assert.ok(live.includes('<h1>🤖 MEV Bot — Ethereum Live</h1>'), 'live page h1 must say Live');
+  assert.ok(live.includes('#paper-block{display:none}'), 'live page must hide the paper block');
+  assert.ok(live.includes(CHAINS.ethereum.sub));
+  assert.ok(!live.includes('আসল টাকা নয়, শুধু paper হিসাব'), 'live page must not carry the paper-only sub');
+  assert.ok(live.includes('href="/ethereum-paper"'), 'live page nav must link to the paper page');
+  const paper = paperPage(CHAINS.ethereum);
+  assert.ok(paper.includes('<h1>🤖 MEV Bot — Ethereum Paper</h1>'), 'paper page h1 must say Paper');
+  assert.ok(paper.includes('#live-block{display:none}'), 'paper page must hide the live block');
+  assert.ok(paper.includes('আসল টাকা নয়, শুধু paper হিসাব'), 'paper page sub must say paper-only');
+  assert.ok(paper.includes('bot বন্ধ'), 'paper page must say the paper bot is stopped');
+  assert.ok(paper.includes("fetch('/api/status?chain=ethereum')"), 'paper page reads the same chain JSON');
+  assert.ok(paper.includes('href="/ethereum"'), 'paper page nav must link back to live');
+  // The other chains are live-only too (their paper block hides the "paper
+  // bot নেই" note instead of showing it).
+  const arb = dashboardPage(CHAINS.arbitrum);
+  assert.ok(arb.includes('<h1>🤖 MEV Bot — Arbitrum Live</h1>'));
+  assert.ok(arb.includes('#paper-block{display:none}'));
 });

@@ -1,3 +1,10 @@
+# ETH paper split from live on the website (owner decision 2026-11-23, Yahia: "live site a eth paper o alada koro live theke")
+
+- `/ethereum` is now LIVE only (h1 "Ethereum Live", paper block hidden); Ethereum paper moved to its own page `/ethereum-paper` (h1 "Ethereum Paper", live block hidden, sub says the paper bot is stopped / frozen data). Both pages read the same `/api/status?chain=ethereum` JSON — only the visible sections changed, no API change.
+- Nav (all pages) gained a "📝 ETH Paper" link; the index ETH card gained a "📝 Paper দেখো →" button next to "দেখো →". `/arbitrum` and `/bsc` are live-only too (their paper block now hides the "paper bot নেই" note instead of showing it).
+- `status-server.mjs`: paper sections wrapped in `#paper-block`, live sections in `#live-block`; `dashboardPage` hides the paper block, new exported `paperPage` hides the live block; route `/ethereum-paper` added; `CHAINS.ethereum.sub` is now the live sub.
+- Deployed to VPS (status server restarted only — bots untouched), verified live: `/ethereum`, `/ethereum-paper`, `/arbitrum`, `/bsc`, `/` all 200 with the right headings/hide rules; API unchanged (paper 26 trades, live 3 trades). Local tests 343/343 pass (+1 split test), `node --check` + `tsc --noEmit` clean.
+
 # Pool floor $10k on Arbitrum + BSC only (owner decision 2026-11-23, Yahia: "bnb pool arb pool 10k koro")
 
 - `MIN_POOL_LIQUIDITY_USD: '10000'` in the Arbitrum and BSC live configs only; Ethereum stays at `'50000'`. Note: the $100 MIN_TRADE_USD + 0.7% impact cap still gate trades — safe size is 0.35% of pool, so a pool needs ~$29k before a $100 trade can pass the impact cap; $10k–$29k pools enter the universe but cannot trade.
