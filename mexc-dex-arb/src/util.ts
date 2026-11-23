@@ -1,4 +1,15 @@
+import type { ChainProfile } from './chains.js';
+
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Run fn over items in parallel batches of `size` (network-bound work). Results keep input order. */
+export async function mapBatches<T, R>(items: readonly T[], size: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(...(await Promise.all(items.slice(i, i + size).map(fn))));
+  }
+  return out;
+}
 
 const DHAKA_OFFSET_MS = 6 * 3600 * 1000; // Bangladesh: UTC+6, no DST
 
@@ -51,4 +62,21 @@ function plainDecimal(x: number): string {
   if (point <= 0) return `0.${'0'.repeat(-point)}${digits}`;
   if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
   return `${digits.slice(0, point)}.${digits.slice(point)}`;
+}
+
+/** The /status wallet line, chain-aware: the native token is ETH on
+ * Ethereum/Arbitrum and BNB on BSC, and the DEX stable is USDC (6 decimals)
+ * on Ethereum/Arbitrum but USDT (18 decimals) on BSC. The old line hardcoded
+ * `ETH` and `/1e6`, so on BSC it showed the USDT balance ~1e12x too big.
+ * (audit 2026-11-22, M6) */
+export function walletLine(
+  mexcUsdt: number,
+  nativeWei: bigint,
+  stableRaw: bigint,
+  chain: ChainProfile,
+  stableDecimals: number,
+  fmt: (x: number) => string,
+): string {
+  const nativeSym = chain.nativeMexcSymbol.replace('USDT', '');
+  return `MEXC ${fmt(mexcUsdt)} USDT | wallet ${toFloat(nativeWei, 18).toFixed(4)} ${nativeSym}, ${fmt(toFloat(stableRaw, stableDecimals))} ${chain.stable.symbol}`;
 }

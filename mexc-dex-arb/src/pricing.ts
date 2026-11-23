@@ -240,6 +240,8 @@ export function evaluateTransfer(p: {
     driftUsd,
     gasUsd: p.gasUsd,
     costUsd: plan.costUsd,
+    /** Sell value minus buy value, before gas, fees, drift and safety (same meaning as Opportunity.grossUsd). */
+    grossUsd: outUsdt - plan.costUsd,
     net,
   };
 }

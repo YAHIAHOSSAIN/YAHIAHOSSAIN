@@ -1,7 +1,7 @@
 // End-to-end tests of the trading engine with fake MEXC, chain and aggregator.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadConfig } from '../src/config.js';
+import { hurdleBps, loadConfig } from '../src/config.js';
 import { Db } from '../src/db.js';
 import { Risk } from '../src/risk.js';
 import { Engine } from '../src/engine.js';
@@ -34,13 +34,36 @@ function setup(opts: {
   unresolved?: boolean;
   notReady?: boolean;
   usdcUsdt?: number;
+  minPoolLiquidityUsd?: number; // MIN_POOL_LIQUIDITY_USD knob for this engine (default 150000)
+  dexTvlUsd?: number; // best-pool TVL for LINK (default 1e6, deep)
+  dexArbEnabled?: boolean; // DEX_ARB_ENABLED knob for this engine (default false = detection off)
+  lowX?: number; // REBALANCE_LOW_X knob for this engine (default 1)
+  dexSellBoost?: number; // multiply the fake DEX sell-leg output (default 1): makes a DEX-DEX spread appear
+  chain?: string; // CHAIN for this engine (default 'ethereum')
+  minProfitBpsEth?: number; // MIN_PROFIT_BPS_ETH knob (default 0 = off, falls back to MIN_PROFIT_BPS)
+  builderTipGwei?: number; // BUILDER_TIP_GWEI knob (default 0 = off)
 }) {
+  process.env.CHAIN = opts.chain ?? 'ethereum';
   process.env.MODE = opts.mode ?? 'live';
   process.env.RPC_URL = 'http://localhost';
   process.env.MAX_TRADE_USD = '200'; // tests use $200 trades (default is 50)
+  process.env.MIN_TRADE_USD = '25'; // default: the multi-size test quotes 0.5x of the $100 base = $50
+  process.env.TRANSFER_DRIFT_BPS = '150'; // default: pin so a VPS .env value cannot leak in
+  process.env.QUOTE_RPS_VELORA = '1'; // pin the code defaults (a VPS .env value cannot leak in)
+  process.env.QUOTE_RPS_OPENOCEAN = '2';
+  // Pin the Phase-4 knobs to their code defaults (a VPS .env value cannot leak in).
+  process.env.REBALANCE_LOW_X = String(opts.lowX ?? 1);
+  process.env.DEX_ARB_ENABLED = opts.dexArbEnabled ? 'yes' : 'no';
   process.env.MIN_PROFIT_USD = '15';
+  // Pin the depth-filter knobs to their code defaults (a VPS .env value
+  // would otherwise leak in and change which fake pools pass).
+  process.env.MIN_POOL_LIQUIDITY_USD = String(opts.minPoolLiquidityUsd ?? 150000);
+  process.env.DEPTH_MAX_IMPACT_BPS = '70';
+  process.env.DEPTH_MAX_SIZE_PCT = '1';
   // These older tests keep the pre-upgrade cost settings, so their numbers stay meaningful.
   process.env.MIN_PROFIT_BPS = '50';
+  process.env.MIN_PROFIT_BPS_ETH = String(opts.minProfitBpsEth ?? 0); // pin the Phase-5 hurdle (0 = off)
+  process.env.BUILDER_TIP_GWEI = String(opts.builderTipGwei ?? 0); // pin the Phase-5 builder tip (0 = off)
   process.env.SAFETY_MARGIN_USD = '2';
   process.env.SAFETY_MARGIN_BPS = '0';
   process.env.CEX_SLIPPAGE_BPS = '20';
@@ -65,10 +88,12 @@ function setup(opts: {
     LINKUSDT: { bids: [[bid, 1000]], asks: [[bid + 0.01, 1000]], ts: Date.now() },
   };
 
-  // DEX price = 10 USDC per LINK, 0.1% minOut buffer.
+  // DEX price = 10 USDC per LINK, 0.1% minOut buffer. With dexSellBoost, the
+  // token->USDC leg pays more (a cross-pool spread for the DEX-DEX scan only).
+  const boost = BigInt(Math.round((opts.dexSellBoost ?? 1) * 100));
   const dexQuote = (r: QuoteRequest, firm: boolean): Quote => {
-    const buyingToken = r.sellToken === USDC;
-    const out = buyingToken ? (r.sellAmount * 10n ** 12n) / 10n : (r.sellAmount * 10n) / 10n ** 12n;
+    const buyingToken = r.sellToken === cfg.usdc; // chain's DEX stable (Ethereum USDC here; Arbitrum's own USDC on that chain)
+    const out = buyingToken ? (r.sellAmount * 10n ** 12n) / 10n : ((r.sellAmount * 10n) / 10n ** 12n) * boost / 100n;
     return {
       buyAmount: out,
       minBuyAmount: (out * 999n) / 1000n,
@@ -93,7 +118,7 @@ function setup(opts: {
     }
   };
 
-  const token = { ...LINK, rules: { ...LINK.rules, minNotional: opts.minNotional ?? 1 } };
+  const token = { ...LINK, dexTvlUsd: opts.dexTvlUsd ?? 1e6, rules: { ...LINK.rules, minNotional: opts.minNotional ?? 1 } };
   const engine = new Engine({
     cfg,
     db,
@@ -134,7 +159,7 @@ function setup(opts: {
         if (opts.dexUnknown) return { ok: false, unknown: true, hash: '0xtx', gasCostWei: 0n, reason: 'unknown' };
         if (opts.dexOk === false) return { ok: false, hash: '0xtx', gasCostWei: gasWei, reason: 'reverted' };
         const r = lastFirm!;
-        if (r.sellToken === USDC) {
+        if (r.sellToken === cfg.usdc) {
           bal.walletUsdc -= Number(r.sellAmount) / 1e6;
           bal.walletToken.LINK += (Number(r.sellAmount) / 1e6) / 10;
         } else {
@@ -386,7 +411,7 @@ test('stale or unreasonable USDC/USDT rate: no trading', async () => {
 });
 
 // ---------------- Phase-1 upgrade: items 2, 4e, 5 ----------------
-const opps = (db: Db) => db.all<{ token: string; direction: string; size_usd: number | null; decision: string; net_usd: number | null; gross_bps: number | null }>('SELECT * FROM opportunities');
+const opps = (db: Db) => db.all<{ token: string; direction: string; size_usd: number | null; decision: string; reason: string | null; net_usd: number | null; gross_bps: number | null }>('SELECT * FROM opportunities');
 
 test('every evaluated candidate is logged to opportunities, with its decision', async () => {
   const { engine, db } = setup({ bid: 10.9 }); // below the hurdle
@@ -407,13 +432,18 @@ test('a traded candidate is logged as trade; paused ticks are logged as paused',
   assert.ok(opps(s2.db).every((r) => r.decision === 'paused'));
 });
 
-test('multi-size: near the hurdle, 0.5x and 2x of the base size are quoted and the best net is used', async () => {
-  const { engine, priced, calls } = setup({});
+test('multi-size: near the hurdle, the depth ladder (100/75/50% of safe size) is quoted and the best net is used', async () => {
+  // Grok v2 review: the inventory ladder is the transfer ladder. $50k pool
+  // (floor lowered to 0, or the pool-floor reject would fire first): safe
+  // size is 0.7% of the $25k half = $175, ladder $175 / $131 / $87. At a
+  // 10% gap the $175 gross (~$17.40) is below the $15 need but close
+  // (0.7 * need = $10.50), so the smaller steps are quoted too; the $87
+  // gross (~$8.65) is no longer close, so the ladder stops there. No size
+  // passes, so no trade is booked — the largest net ($175) is the best.
+  const { engine, priced, db } = setup({ dexTvlUsd: 50_000, minPoolLiquidityUsd: 0, bid: 11 });
   await engine.tick();
-  // DEX_BUY quotes in USDC base units: base = MAX_TRADE_USD/2 = 100, then 50 and 200
-  const usdc = priced.filter((x) => x % 1_000_000n === 0n && x <= 1_000_000_000n).map((x) => Number(x / 1_000_000n));
-  assert.ok(usdc.includes(100) && usdc.includes(50) && usdc.includes(200), String(usdc));
-  assert.ok(calls.includes('limit SELL 19.98 @ 11.177')); // the $200 size won (largest net)
+  assert.deepEqual(usdcSizes(priced), [175, 131, 87]);
+  assert.equal(trades(db).total.trades, 0);
 });
 
 test('legs: a live trade writes one dex and one mexc leg with latency', async () => {
@@ -493,4 +523,214 @@ test('L1_FEE_USD reserve lowers the estimated net (round-3 M1)', async () => {
   } finally {
     process.env = saved;
   }
+});
+
+// ---------------- Phase 1 depth filter ----------------
+test('depth reject: a thin pool writes a rule row and spends no DEX quote', async () => {
+  const { engine, db, priced } = setup({ dexTvlUsd: 42_000 });
+  await engine.tick();
+  assert.equal(priced.length, 0); // evalAt returned before agg.price()
+  assert.equal(trades(db).total.trades, 0);
+  const rows = opps(db);
+  assert.ok(rows.length >= 2, `both directions should be evaluated, got ${rows.length}`); // DEX_BUY + CEX_BUY
+  assert.ok(
+    rows.every((r) => r.decision === 'rule' && (r.reason ?? '').startsWith('depth reject pool $42k < $150k')),
+    JSON.stringify(rows),
+  );
+  assert.ok(rows.every((r) => r.net_usd === null)); // no quote was taken, so no net
+});
+
+test('depth-unknown pool (tvl 0) is fail-open: it still quotes', async () => {
+  const { engine, priced } = setup({ dexTvlUsd: 0 });
+  await engine.tick();
+  assert.ok(priced.length > 0); // the exact quote still gates the trade
+});
+
+// ---------------- Phase 2 dynamic sizing ----------------
+// DEX_BUY quotes are in USDC base units (size * 1e6); CEX_BUY quotes are in
+// token units (>> 1e9), so this filter isolates the DEX_BUY sizes.
+const usdcSizes = (priced: bigint[]) =>
+  priced.filter((x) => x % 1_000_000n === 0n && x <= 1_000_000_000n).map((x) => Number(x / 1_000_000n));
+
+test('depth-derived base: a shallow pool shrinks the base to the safe size', async () => {
+  // $20k pool (floor lowered to 0 for this test, or the pool-floor reject
+  // would fire first): safe size is 0.7% of the $10k half = $70 < the $100
+  // default base, so DEX_BUY quotes $70 — and its gross ($8.32) is below
+  // 0.7 * need, so no multi-size follows.
+  const { engine, priced } = setup({ dexTvlUsd: 20_000, minPoolLiquidityUsd: 0 });
+  await engine.tick();
+  assert.deepEqual(usdcSizes(priced), [70]);
+});
+
+test('depth-derived base: multi-size is seeded from the depth-derived base', async () => {
+  // Same $20k pool, but a 20% gap (MEXC bid 12 vs DEX 10): the $70 gross
+  // ($13.92) reaches 0.7 * need, so the ladder's next step ($52) is tried —
+  // its gross (~$10.34) is no longer close, so the $35 step is never
+  // quoted. (The old 0.5x/2x trigger is gone: the 2x step would have been
+  // depth-rejected at 1.4% impact anyway.)
+  const { engine, priced } = setup({ dexTvlUsd: 20_000, minPoolLiquidityUsd: 0, bid: 12 });
+  await engine.tick();
+  assert.deepEqual(usdcSizes(priced), [70, 52]); // 35 never quoted
+});
+
+test('depth-derived base: unknown TVL keeps the old $100 base (and its multi-size)', async () => {
+  const { engine, priced } = setup({ dexTvlUsd: 0 });
+  await engine.tick();
+  const usdc = usdcSizes(priced);
+  assert.ok(usdc.includes(100) && usdc.includes(50) && usdc.includes(200), String(usdc));
+});
+
+// ---------------- Phase 4: REBALANCE_LOW_X + DEX-DEX detection ----------------
+const dexArbRows = (db: Db) =>
+  db.all<{ token: string; direction: string; size_usd: number | null; decision: string; reason: string | null; net_usd: number | null }>(
+    "SELECT * FROM opportunities WHERE direction = 'DEX_ARB'",
+  );
+
+test('REBALANCE_LOW_X: a side at ~1.36x the trade size tickets at LOW_X=1.5 but not at 1', async () => {
+  // Trade size is MAX_TRADE_USD/2 = $100; MEXC LINK 12.5 tokens ≈ $136 at the
+  // $10.90 bid (bid 10.9 keeps the gap below the hurdle, so no trade moves balances).
+  const run = async (lowX: number) => {
+    process.env.REBALANCE_AFTER_MIN = '0';
+    try {
+      const { engine, db, alerts, bal } = setup({ lowX, bid: 10.9 });
+      bal.mexc.LINK = 12.5;
+      await engine.tick();
+      await engine.tick();
+      return { open: db.openTickets().filter((k) => k.token === 'LINK' && k.side === 'mexc'), alerts };
+    } finally {
+      delete process.env.REBALANCE_AFTER_MIN;
+    }
+  };
+  const at1 = await run(1);
+  assert.equal(at1.open.length, 0); // ~$136 >= 1x $100: not low, no ticket
+  const at15 = await run(1.5);
+  assert.equal(at15.open.length, 1); // ~$136 < 1.5x $100: low, one ticket
+  assert.equal(at15.alerts.filter((a) => a.startsWith('🎫 Rebalance ticket') && a.includes('LINK')).length, 1);
+});
+
+test('shortfall warning: sent once (throttled) via alertThrottled, never as a ticket', async () => {
+  process.env.REBALANCE_AFTER_MIN = '0';
+  try {
+    // Bid 10.9: no trade, balances stay put. Wallet USDC $10, MEXC USDT $50,
+    // target $300: the wallet STABLE side needs $290 more, the other side has $50.
+    const { engine, db, alerts, bal } = setup({ bid: 10.9 });
+    bal.walletUsdc = 10;
+    bal.mexc.USDT = 50;
+    await engine.tick();
+    await engine.tick();
+    const warns = alerts.filter((a) => a.includes('STABLE wallet needs $290.00 more'));
+    assert.equal(warns.length, 1); // throttled: sent once, not once per tick
+    assert.match(warns[0], /needs \$290\.00 more, but the other side only has \$50\.00/);
+    assert.match(warns[0], /deposit fresh funds/);
+    assert.ok(!warns.some((a) => a.startsWith('🎫'))); // the warning itself is not a ticket
+    // The low STABLE wallet side still gets its (separate) rebalance ticket.
+    assert.equal(db.openTickets().filter((k) => k.token === 'STABLE' && k.side === 'wallet').length, 1);
+  } finally {
+    delete process.env.REBALANCE_AFTER_MIN;
+  }
+});
+
+test('DEX-ARB disabled: the scan never runs (counting agg)', async () => {
+  // A thin pool ($42k) is depth-rejected before any DEX quote, so the normal
+  // evaluation spends zero quotes. With detection off (the pinned default),
+  // the tick must stay at zero quotes and record no DEX_ARB rows.
+  const { engine, db, priced } = setup({ dexTvlUsd: 42_000 });
+  await engine.tick();
+  assert.equal(priced.length, 0);
+  assert.equal(dexArbRows(db).length, 0);
+});
+
+test('DEX-ARB enabled: the scan runs (2 more quotes) and records a below_hurdle row', async () => {
+  // Same thin pool, detection on: the scan still prices both legs (its only
+  // skips are unknown TVL / safe size < MIN_TRADE_USD — $42k gives $147).
+  // The fake DEX is symmetric ($10 both ways), so the spread is just -gas.
+  const { engine, db, priced } = setup({ dexTvlUsd: 42_000, dexArbEnabled: true });
+  await engine.tick();
+  assert.equal(priced.length, 2); // buy leg + sell leg, nothing else
+  const rows = dexArbRows(db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].decision, 'below_hurdle');
+  assert.match(rows[0].reason ?? '', /dex-arb detection only — no execution/);
+  assert.ok((rows[0].net_usd ?? 0) < 0);
+  assert.equal(rows[0].size_usd, 147); // depth-safe size of a $42k pool
+});
+
+test('DEX-ARB enabled with a real spread: recorded as trade (detection only — nothing executed)', async () => {
+  // dexSellBoost 1.2: the token->USDC leg pays $12 per LINK instead of $10.
+  // Scan: buy $200 -> 20 LINK, sell 20 LINK -> $240, gas $3/leg, net $34 > need $15.
+  const { engine, db, alerts } = setup({ mode: 'paper', dexArbEnabled: true, dexSellBoost: 1.2 });
+  await engine.tick();
+  const rows = dexArbRows(db);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].decision, 'trade');
+  assert.equal(rows[0].reason, 'dex-arb detection only — no execution');
+  assert.ok(Math.abs((rows[0].net_usd ?? 0) - 34) < 1e-9, String(rows[0].net_usd));
+  // Detection only: the normal paper trade is the only trade recorded, and no
+  // extra live trade was executed for the DEX-ARB spread.
+  assert.equal(db.statsSince(0, 'paper').total.trades, 1);
+  assert.ok(!alerts.some((a) => a.includes('DEX-ARB')));
+});
+
+// ---------------- Phase 5: parallel directions + dynamic hurdle + rejection counts ----------------
+test('Phase 5: candidates() evaluates both directions (parallel refactor drops neither)', async () => {
+  const { engine, bal } = setup({});
+  const book = { bids: [[11.2, 1000]], asks: [[11.21, 1000]], ts: Date.now() };
+  const gas = { baseFee: 9n * GWEI, tip: GWEI, effective: 10n * GWEI, maxFee: 19n * GWEI };
+  const out = await engine.candidates({ ...LINK, dexTvlUsd: 1e6 }, book, bal, gas, 2000);
+  assert.deepEqual(out.map((c) => c.opp.direction).sort(), ['CEX_BUY', 'DEX_BUY']);
+});
+
+test('Phase 5: thin-pool depth rejects are counted (lastDepthRejects)', async () => {
+  const { engine, bal, db } = setup({});
+  const book = { bids: [[11.2, 1000]], asks: [[11.21, 1000]], ts: Date.now() };
+  const gas = { baseFee: 9n * GWEI, tip: GWEI, effective: 10n * GWEI, maxFee: 19n * GWEI };
+  // $42k pool < $150k floor: both directions reject before any exact quote.
+  const out = await engine.candidates({ ...LINK, dexTvlUsd: 42_000 }, book, bal, gas, 2000);
+  assert.deepEqual(out, []);
+  assert.equal(engine.lastDepthRejects, 2);
+  // Phase 6: flushing writes exactly ONE summary row for the tick (total 2,
+  // one detail entry per rejected direction), not one row per candidate.
+  engine.flushDepthRejects();
+  const rows = db.all<Record<string, unknown>>('SELECT * FROM depth_rejects');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].total, 2);
+  assert.equal(rows[0].chain, 'ethereum');
+  const detail = JSON.parse(String(rows[0].detail)) as { token: string; liq_usd: number; reason: string }[];
+  assert.equal(detail.length, 2);
+  assert.ok(detail.every((d) => d.token === 'LINK' && d.liq_usd === 42_000));
+  assert.ok(detail.every((d) => /pool \$42k < \$150k/.test(d.reason)));
+  // flushDepthRejects writes one row per call; the tick calls it exactly
+  // once (a second manual call would write a second row — the test only
+  // proves the first call wrote exactly one).
+  assert.equal(db.all('SELECT * FROM depth_rejects').length, 1);
+});
+
+test('Phase 6: zero-reject flush writes nothing; paper trade records aggregator + depth sizing', async () => {
+  const { engine, db } = setup({ mode: 'paper' });
+  engine.flushDepthRejects();
+  assert.equal(db.all('SELECT * FROM depth_rejects').length, 0);
+  await engine.tick();
+  const rows = db.all<Record<string, unknown>>('SELECT * FROM trades');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].aggregator, '0x');
+  assert.equal(rows[0].pool_tvl_usd, 1_000_000);
+  assert.ok(Math.abs(Number(rows[0].safe_size_usd) - 3500) < 1e-6, String(rows[0].safe_size_usd));
+});
+
+test('Phase 5: dynamic hurdle — MIN_PROFIT_BPS_ETH blocks the trade on Ethereum', async () => {
+  // The profitable setup nets ~$20 at $200: need is max($15, 50 bps) = $15
+  // by default, but 2000 bps makes it $40, which the same gap cannot clear.
+  const { engine, db, calls, cfg } = setup({ minProfitBpsEth: 2000 });
+  assert.equal(hurdleBps(cfg), 2000);
+  await engine.tick();
+  assert.deepEqual(calls, []);
+  assert.equal(trades(db).total.trades, 0);
+});
+
+test('Phase 5: dynamic hurdle — the same MIN_PROFIT_BPS_ETH is ignored on Arbitrum (L2 keeps the old hurdle)', async () => {
+  const { engine, db, calls, cfg } = setup({ chain: 'arbitrum', minProfitBpsEth: 2000 });
+  assert.equal(hurdleBps(cfg), 50); // falls back to MIN_PROFIT_BPS on L2
+  await engine.tick();
+  assert.ok(calls.includes('send'));
+  assert.equal(trades(db).total.trades, 1);
 });

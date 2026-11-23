@@ -9,6 +9,12 @@ type Update = {
   message?: { chat?: { id: number | string; type?: string }; from?: { id: number | string }; text?: string; date?: number };
 };
 
+/** First line of every Telegram message: mode + chain, so the bots sharing
+ *  one chat (paper/live, ethereum/arbitrum) can never be confused. */
+export function makeModeTag(mode: string, chain: string): string {
+  return `${mode === 'live' ? '🔴 LIVE — আসল টাকা' : '📝 PAPER'} · ${chain}`;
+}
+
 export class Telegram {
   private offset = 0;
   private running = false;
@@ -23,6 +29,8 @@ export class Telegram {
     private adminId = '',
     /** Persists the update offset across restarts. */
     private offsetStore?: { get(): string | undefined; set(v: string): void },
+    /** First line prepended to every message (e.g. the bot's mode tag). Empty = no tag. */
+    private tag = '',
   ) {}
 
   get enabled(): boolean {
@@ -43,7 +51,10 @@ export class Telegram {
 
   /** Never throws: alerts must not crash the bot. */
   async send(text: string): Promise<void> {
-    const msg = redact(text);
+    // One unmistakable first line on every message, so paper and live are never
+    // confused in the same chat. A text that already starts with the tag is not doubled.
+    const tagged = this.tag && !text.startsWith(this.tag) ? `${this.tag}\n${text}` : text;
+    const msg = redact(tagged);
     log.info(`[telegram] ${msg.replace(/\n/g, ' | ')}`);
     if (!this.enabled) return;
     try {

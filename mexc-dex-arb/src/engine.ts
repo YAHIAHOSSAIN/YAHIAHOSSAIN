@@ -1,5 +1,6 @@
 // The trading loop: find the best opportunity each block, confirm it, trade both legs, clean up, account.
 import type { Config } from './config.js';
+import { hurdleBps } from './config.js';
 import { explorerTxUrl } from './chains.js';
 import { BestOf, QuoteBudgetError, type Aggregator, type Quote, type QuoteRequest } from './dex/aggregator.js';
 import type { GasInfo, TxResult } from './dex/chain.js';
@@ -97,7 +98,10 @@ export async function placeSafely(
     throw new Error(`UNKNOWN_ORDER_STATE client id ${cid}: ${errMsg(e)}`);
   }
 }
-import { decimalsOfStep, dhakaDay, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+import { decimalsOfStep, dhakaDay, mapBatches, sleep as realSleep, toFloat, toUnits, usd } from './util.js';
+import { dexPrices } from './watchlist.js';
+import { depthRejectReason, depthSafeSize, estimatedImpact, topDepthRejects, type DepthRejectDetail } from './dex/depth.js';
+import { scanDexArb } from './dex/dexarb.js';
 
 export const USDC_DECIMALS = 6;
 export { ZEROX_ALLOWANCE_HOLDER } from './dex/aggregator.js';
@@ -177,6 +181,36 @@ export class Engine {
   private lastAlert = new Map<string, number>();
   private sleep: (ms: number) => Promise<void>;
   lastGasGwei = 0;
+  /** Phase 5: depth rejects this tick (thin pools dropped before any exact quote).
+   * Reset at the start of every tick; the status server (Phase 6) can read it. */
+  lastDepthRejects = 0;
+  /** Phase 6: per-candidate reject detail for this tick, flushed as ONE
+   * summary row at the end of the tick (see flushDepthRejects). */
+  private depthRejectDetails: DepthRejectDetail[] = [];
+
+  /** Record one depth rejection for this tick's summary row. */
+  private noteDepthReject(token: string, size: number, liq: number, reason: string): void {
+    this.depthRejectDetails.push({ token, liq_usd: liq, impact_pct: estimatedImpact(size, liq), reason });
+  }
+
+  /**
+   * Phase 6: persist this tick's depth rejects as ONE summary row.
+   * Zero-reject ticks write nothing. Never throws — a failed write is
+   * logged and the tick goes on.
+   */
+  flushDepthRejects(now = Date.now()): void {
+    if (this.lastDepthRejects === 0 || !this.depthRejectDetails.length) return;
+    try {
+      this.d.db.insertDepthRejects({
+        ts: now,
+        chain: this.cfg.chain.name,
+        total: this.lastDepthRejects,
+        detail: JSON.stringify(topDepthRejects(this.depthRejectDetails)),
+      });
+    } catch (e) {
+      log.warn(`depth rejects record: ${errMsg(e)}`);
+    }
+  }
 
   constructor(private d: EngineDeps) {
     this.sleep = d.sleep ?? realSleep;
@@ -210,7 +244,7 @@ export class Engine {
     };
   }
   private need(sizeUsd: number) {
-    return threshold(sizeUsd, this.cfg.minProfitUsd, this.cfg.minProfitBps);
+    return threshold(sizeUsd, this.cfg.minProfitUsd, hurdleBps(this.cfg));
   }
 
   /**
@@ -289,7 +323,8 @@ export class Engine {
     const bal = await this.d.balances();
     const books = new Map<string, Book>();
     const prices: Record<string, number> = {};
-    for (const t of this.d.tokens) {
+    // MEXC books are independent: fetch in parallel batches (sequential = ~0.3 s/token).
+    await mapBatches(this.d.tokens, 8, async (t) => {
       try {
         const b = await this.d.book(t.symbol);
         if (b.bids.length && b.asks.length) {
@@ -299,7 +334,7 @@ export class Engine {
       } catch (e) {
         log.warn(`${t.symbol} book: ${errMsg(e)}`);
       }
-    }
+    });
 
     if (this.live) {
       for (const w of inventoryWarnings(bal, this.d.tokens, prices, this.cfg.minTradeUsd, this.cfg.minEthForGas)) {
@@ -313,33 +348,125 @@ export class Engine {
 
     const rows: OpportunityRow[] = [];
     let best: Candidate | null = null;
-    for (const t of this.d.tokens) {
-      const b = books.get(t.symbol);
-      if (!b) continue;
-      if (!t.depositOk || !t.withdrawOk) {
-        this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
-        continue;
-      }
-      this.note(`susp-${t.base}`, `${t.base}: active`);
+    this.lastDepthRejects = 0; // per-tick count, read by the status server (Phase 6)
+    this.depthRejectDetails = [];
+    // Quote-saving pre-filter: only spend a (rate-limited) DEX quote when the rough
+    // MEXC-vs-DexScreener gap is big enough to ever trade. On any fetch failure,
+    // quote everything (same as before).
+    let toQuote = this.d.tokens;
+    if (this.cfg.prefilterBps > 0) {
       try {
-        for (const c of await this.candidates(t, b, bal, gas, ethUsd, rows)) {
-          const need = c.need ?? this.need(c.opp.sizeUsd);
-          log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(need)})`);
-          const passes = c.opp.net > need;
-          if (c.row) {
-            c.row.decision = passes ? 'trade' : 'below_hurdle';
-            c.row.reason = passes ? null : `net ${c.opp.net.toFixed(4)} <= need ${need.toFixed(4)}`;
-          }
-          if (passes && (!best || c.opp.net > best.opp.net)) best = c;
+        const dex = await dexPrices(this.d.tokens.filter((t) => books.has(t.symbol)).map((t) => t.address));
+        const kept: Token[] = [];
+        for (const t of this.d.tokens) {
+          const b = books.get(t.symbol);
+          const px = dex.get(t.address.toLowerCase());
+          if (!b || px === undefined) { kept.push(t); continue; }
+          const gapBps = (Math.abs(px - prices[t.base]) / prices[t.base]) * 10_000;
+          if (gapBps >= this.cfg.prefilterBps) kept.push(t);
+          else rows.push(this.blankRow(t, 'rule', `prefilter: rough gap ${gapBps.toFixed(0)} bps < ${this.cfg.prefilterBps} bps`));
         }
+        log.info(`prefilter: quoting ${kept.length}/${this.d.tokens.length} tokens`);
+        toQuote = kept;
       } catch (e) {
-        if (e instanceof QuoteBudgetError) rows.push(this.blankRow(t, 'rate_limited', errMsg(e)));
-        else log.warn(`${t.base} quote: ${errMsg(e)}`);
+        log.warn(`prefilter: ${errMsg(e)} (quoting all)`);
+      }
+    }
+    const batchSize = 3;
+    const batchGapMs = 2000; // 3 tokens x 2 quotes per 2 s = Kyber 3 quotes/s
+    const perToken: Candidate[][] = [];
+    for (let i = 0; i < toQuote.length; i += batchSize) {
+      const started = Date.now();
+      const results = await Promise.all(toQuote.slice(i, i + batchSize).map(async (t) => {
+        const b = books.get(t.symbol);
+        if (!b) return [] as Candidate[];
+        if (!t.depositOk || !t.withdrawOk) {
+          this.note(`susp-${t.base}`, `${t.base}: MEXC deposit/withdraw suspended, skipping`);
+          return [] as Candidate[];
+        }
+        this.note(`susp-${t.base}`, `${t.base}: active`);
+        try {
+          return await this.candidates(t, b, bal, gas, ethUsd, rows);
+        } catch (e) {
+          if (e instanceof QuoteBudgetError) rows.push(this.blankRow(t, 'rate_limited', errMsg(e)));
+          else log.warn(`${t.base} quote: ${errMsg(e)}`);
+          return [] as Candidate[];
+        }
+      }));
+      perToken.push(...results);
+      const elapsed = Date.now() - started;
+      if (i + batchSize < toQuote.length && elapsed < batchGapMs) await this.sleep(batchGapMs - elapsed);
+    }
+    for (const [i, list] of perToken.entries()) {
+      const t = toQuote[i];
+      for (const c of list) {
+        const need = c.need ?? this.need(c.opp.sizeUsd);
+        log.info(`${t.base} ${c.opp.direction} size ${usd(c.opp.sizeUsd)} net ${usd(c.opp.net)} (need ${usd(need)})`);
+        const passes = c.opp.net > need;
+        if (c.row) {
+          c.row.decision = passes ? 'trade' : 'below_hurdle';
+          c.row.reason = passes ? null : `net ${c.opp.net.toFixed(4)} <= need ${need.toFixed(4)}`;
+        }
+        if (passes && (!best || c.opp.net > best.opp.net)) best = c;
       }
     }
     for (const r of rows) if (r.decision === 'trade' && best?.row !== r) r.reason = 'passed, but another candidate was better this tick';
+    if (this.lastDepthRejects > 0) log.info(`depth rejects this tick: ${this.lastDepthRejects} (thin pools, no exact quote spent)`);
+    this.flushDepthRejects();
     this.flushRows(rows);
+    // Phase 4: DEX-DEX detection only (flag-gated, never trades). Runs after
+    // the normal candidate evaluation, over the same tokens.
+    if (this.cfg.dexArbEnabled) await this.scanDexArbTick(gas, ethUsd);
     if (best) await this.execute(best, gas, ethUsd);
+  }
+
+  /**
+   * DEX-DEX detection only: price both DEX legs per token and log + record
+   * any cross-pool spread. No trade, no send, no approval — the 'trade'
+   * decision on a row means "net beat the hurdle", not "a trade was made"
+   * (see the row reason). Never called when DEX_ARB_ENABLED is off.
+   */
+  private async scanDexArbTick(gas: GasInfo, ethUsd: number) {
+    const opps = await scanDexArb(this.d.tokens, this.d.agg, gas, ethUsd, {
+      stableAddress: this.cfg.usdc,
+      stableDecimals: this.stableDec,
+      taker: this.taker,
+      slippageBps: this.cfg.dexSlippageBps,
+      minTradeUsd: this.cfg.minTradeUsd,
+      maxTradeUsd: this.cfg.maxTradeUsd,
+      hurdleUsd: (size) => this.need(size), // reuses MIN_PROFIT_USD/BPS, no second knob
+      stableInUsdt: this.stableRate,
+      l1FeeUsd: this.cfg.l1FeeUsd,
+      maxImpactPct: this.cfg.depthMaxImpactBps / 100,
+      maxSizePct: this.cfg.depthMaxSizePct,
+    });
+    if (!opps.length) return;
+    const rows: OpportunityRow[] = [];
+    for (const o of opps) {
+      log.info(`DEX-ARB ${o.token}: buy ${usd(o.buyInUsd)} -> sell ${usd(o.sellOutUsd)}, net ${usd(o.netUsd)}`);
+      const t = this.d.tokens.find((x) => x.base === o.token);
+      if (!t) continue;
+      const passes = o.netUsd > o.hurdleUsd;
+      const row = this.blankRow(
+        t,
+        passes ? 'trade' : 'below_hurdle',
+        passes
+          ? 'dex-arb detection only — no execution'
+          : `net ${o.netUsd.toFixed(4)} <= hurdle ${o.hurdleUsd.toFixed(4)} (dex-arb detection only — no execution)`,
+        'DEX_ARB',
+      );
+      Object.assign(row, {
+        size_usd: o.sizeUsd,
+        aggregator: o.buySource ?? this.d.agg.name,
+        dex_out: o.tokensBought,
+        gross_bps: ((o.sellOutUsd - o.buyInUsd) / o.sizeUsd) * 10_000,
+        gas_usd: o.gasUsd,
+        net_usd: o.netUsd,
+        hurdle_usd: o.hurdleUsd,
+      });
+      rows.push(row);
+    }
+    this.flushRows(rows);
   }
 
   // ---------- opportunity logging ----------
@@ -418,7 +545,7 @@ export class Engine {
       ? `${u.executedHash} was mined (${u.ok ? 'SUCCESS' : 'REVERTED'})${u.executedHash === p.hashes[0] ? ': the ORIGINAL tx executed' : ': the cancel won, the original did NOT execute'}`
       : u.dropped
         ? 'no RPC knows the tx any more: it was dropped and never executed'
-        : 'the nonce was used, but no receipt was found for our hashes: check etherscan';
+        : 'the nonce was used, but no receipt was found for our hashes: check ' + this.cfg.chain.explorer;
     await this.d.tg.send(`ℹ️ Nonce ${p.nonce} resolved: ${what}. You may now fix any position by hand, then /start confirm.`);
     const row = this.d.db.tradeByDexTx(p.hashes[0]);
     if (row) this.d.db.updateTrade(row.id, { note: `${row.note ?? ''}; dex resolved: ${what}` });
@@ -431,21 +558,56 @@ export class Engine {
    * added to `rows` (the opportunities log).
    */
   async candidates(t: Token, b: Book, bal: Balances, gas: GasInfo, ethUsd: number, rows: OpportunityRow[] = []): Promise<Candidate[]> {
-    const out: Candidate[] = [];
     const bestBid = b.bids[0][0];
     const tokenUsd = mid(b);
     const cexTok = bal.mexc[t.base] ?? 0;
     const walTok = bal.walletToken[t.base] ?? 0;
-    const base = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
+    const base0 = this.cfg.baseTradeUsd > 0 ? this.cfg.baseTradeUsd : this.cfg.maxTradeUsd / 2;
+    // Phase 2: the base size is depth-derived — never larger than the pool can take at the
+    // impact cap. Unknown TVL (0) keeps the old base (fail-open; the depth filter in
+    // evalAt still gates the quote). Floored to whole dollars (0.7% of a $20k pool
+    // computes as 69.999..., not 70 — the same 1e-9 slack as the transfer ladder).
+    const base = t.dexTvlUsd > 0
+      ? Math.min(base0, Math.floor(depthSafeSize(t.dexTvlUsd, { maxImpactPct: this.cfg.depthMaxImpactBps / 100, maxSizePct: this.cfg.depthMaxSizePct }) + 1e-9))
+      : base0;
 
     const capA = Math.min(this.cfg.maxTradeUsd, bal.walletUsdc * 0.99, cexTok * bestBid * 0.99);
     const capB = Math.min(this.cfg.maxTradeUsd, (bal.mexc.USDT ?? 0) * 0.99, walTok * bestBid * 0.99);
 
-    for (const [dir, cap] of [['DEX_BUY', capA], ['CEX_BUY', capB]] as const) {
+    // Phase 5: the two directions quote independently (different sell tokens,
+    // different MEXC legs), so they run in parallel. The multi-size ladder
+    // inside one direction stays sequential: each extra size is only quoted
+    // when the previous size's gross is close to the hurdle.
+    const evalDir = async (dir: 'DEX_BUY' | 'CEX_BUY', cap: number): Promise<Candidate | null> => {
       if (cap < this.cfg.minTradeUsd) {
         rows.push(this.blankRow(t, 'inventory', `max size ${usd(cap)} < MIN_TRADE_USD (not enough ${dir === 'DEX_BUY' ? 'wallet stable / MEXC token' : 'MEXC USDT / wallet token'})`, dir));
-        continue;
+        return null;
       }
+      if (t.dexTvlUsd > 0) {
+        // Grok v2 review: the inventory ladder is the transfer ladder —
+        // 100% / 75% / 50% of the depth-safe size, largest first (same shape
+        // as transfer depthSizes, whole dollars, capped by the direction
+        // cap, at least MIN_TRADE_USD). Largest passing size wins; a smaller
+        // size is only tried when the larger one is below the hurdle but
+        // close (the multi-size trigger). A pool whose safe size is below
+        // MIN falls through to one MIN_TRADE_USD quote so evalAt records
+        // the depth reject instead of silently skipping.
+        const safe = depthSafeSize(t.dexTvlUsd, { maxImpactPct: this.cfg.depthMaxImpactBps / 100, maxSizePct: this.cfg.depthMaxSizePct });
+        let sizes = [...new Set([1, 0.75, 0.5].map((f) => Math.floor(safe * f + 1e-9)).map((s) => Math.min(s, cap)).filter((s) => s >= this.cfg.minTradeUsd))];
+        if (!sizes.length) sizes = [this.cfg.minTradeUsd];
+        let best: Candidate | null = null;
+        for (const size of sizes) {
+          const c = await this.evalAt(t, b, bal, gas, ethUsd, dir, size, rows);
+          if (!c) break; // MEXC book too thin / depth reject: smaller sizes are out of scope here
+          if (!best || c.opp.net > best.opp.net) best = c;
+          const need = c.need ?? this.need(c.opp.sizeUsd);
+          if (c.opp.net > need) break; // passes: take the largest passing size, stop
+          if (c.opp.grossUsd < this.cfg.multiSizeTrigger * need) break; // not close: smaller sizes only shrink the gross
+        }
+        return best;
+      }
+      // Unknown TVL: the old behaviour — one base size, then 0.5x/2x when
+      // close (fail-open; the depth filter in evalAt still gates the quote).
       const sizes = [Math.max(this.cfg.minTradeUsd, Math.min(base, cap))];
       const results: Candidate[] = [];
       const first = await this.evalAt(t, b, bal, gas, ethUsd, dir, sizes[0], rows);
@@ -460,9 +622,10 @@ export class Engine {
           if (c) results.push(c);
         }
       }
-      if (results.length) out.push(results.reduce((x, y) => (y.opp.net > x.opp.net ? y : x)));
-    }
-    return out;
+      return results.length ? results.reduce((x, y) => (y.opp.net > x.opp.net ? y : x)) : null;
+    };
+    const [a, c] = await Promise.all([evalDir('DEX_BUY', capA), evalDir('CEX_BUY', capB)]);
+    return [a, c].filter((x): x is Candidate => x !== null);
   }
 
   /** One direction at one size: DEX quote + MEXC book walk -> Candidate (or null), plus its opportunities row. */
@@ -481,6 +644,28 @@ export class Engine {
     const row = this.blankRow(t, 'below_hurdle', null, dir);
     Object.assign(row, { size_usd: size, mexc_bid: b.bids[0][0], mexc_ask: b.asks[0][0], book_age_ms: Date.now() - b.ts });
     rows.push(row);
+
+    // Depth filter (Phase 1, same rule as the transfer path): never spend a
+    // DEX quote on a known-thin pool. tvl 0/unknown is fail-open — the exact
+    // quote still gates the trade.
+    const liq = t.dexTvlUsd;
+    if (liq > 0) {
+      const reason = depthRejectReason(size, liq, {
+        maxImpactPct: this.cfg.depthMaxImpactBps / 100,
+        minLiqUsd: this.cfg.minPoolLiquidityUsd,
+        maxSizePct: this.cfg.depthMaxSizePct,
+      });
+      if (reason) {
+        row.decision = 'rule';
+        row.reason = `depth reject ${reason}`;
+        this.lastDepthRejects++;
+        this.noteDepthReject(t.base, size, liq, reason);
+        log.info(`${t.base}: depth reject — ${reason} (size ${usd(size)}, pool ${usd(liq)})`);
+        return null;
+      }
+    } else {
+      log.info(`${t.base}: depth-unknown (no pool TVL), allowing — the exact quote still gates the trade`);
+    }
 
     let c: Candidate | null = null;
     if (dir === 'DEX_BUY') {
@@ -584,12 +769,15 @@ export class Engine {
       stableInUsdt: this.stableRate,
       stableSymbol: this.cfg.chain.stable.symbol,
       walletAddress: this.d.chain.address,
+      lowX: this.cfg.rebalanceLowX,
     })) {
       if (w.kind === 'warning') {
+        // Token-share and shortfall warnings: throttled like the other
+        // inventory warnings, never a rebalance ticket.
         void this.alertThrottled(`invplan-${w.key}`, `📦 Inventory: ${w.text}`);
         continue;
       }
-      // A side below 1x the trade size for REBALANCE_AFTER_MIN -> ONE ticket (the bot never moves funds).
+      // A side below REBALANCE_LOW_X x the trade size for REBALANCE_AFTER_MIN -> ONE ticket (the bot never moves funds).
       const key = `${w.token}:${w.side}`;
       if (!w.low) {
         this.lowSince.delete(key);
@@ -1009,6 +1197,7 @@ export class Engine {
     r: { pnl: number; gas: number; dexTx?: string; orderId?: string | null; note?: string | null },
   ): number {
     const now = Date.now();
+    const tvl = c.token.dexTvlUsd > 0 ? c.token.dexTvlUsd : null;
     return this.d.db.insertTrade({
       ts: now,
       day: dhakaDay(now),
@@ -1027,6 +1216,12 @@ export class Engine {
       dex_tx: r.dexTx ?? null,
       cex_order_id: r.orderId ?? null,
       note: r.note ?? null,
+      // Winning aggregator for the scan quote that produced this candidate
+      // (row.aggregator is set in evalAt from q.source ?? agg name), plus
+      // the depth context the size was derived from.
+      aggregator: c.row?.aggregator ?? null,
+      pool_tvl_usd: tvl,
+      safe_size_usd: tvl === null ? null : depthSafeSize(tvl, { maxImpactPct: this.cfg.depthMaxImpactBps / 100, maxSizePct: this.cfg.depthMaxSizePct }),
     });
   }
 

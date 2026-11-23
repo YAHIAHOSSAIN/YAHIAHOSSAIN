@@ -76,7 +76,7 @@ export const CHAINS: Record<ChainName, ChainProfile> = {
     nativeMexcSymbol: 'ETHUSDT',
     kyberName: 'arbitrum',
     dexScreenerId: 'arbitrum',
-    mexcNetwork: /^ARB$|Arbitrum One|^ARBITRUM$/i,
+    mexcNetwork: /^ARB$|Arbitrum One|^ARBITRUM$|ARBEVM/i, // ARBEVM = Gate's Arbitrum One code (verified via Gate /wallet/currency_chains)
     explorer: 'arbiscan.io',
     tickMs: 1000,
   },

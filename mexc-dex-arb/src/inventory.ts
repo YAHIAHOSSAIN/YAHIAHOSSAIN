@@ -84,7 +84,9 @@ export type PlanItem =
 /**
  * Inventory sizing (phase 1, item 5):
  *  - target per token per side = INVENTORY_PER_SIDE_X x the trade size;
- *  - a side below 1x the trade size is "low" (the engine turns a long-lasting low side into ONE ticket);
+ *  - a side below LOW_X x the trade size is "low" (the engine turns a long-lasting low side into ONE ticket);
+ *  - when a low side's deficit to target is bigger than what the other side holds, a shortfall
+ *    warning is added: moving funds alone cannot cover it, fresh funds must be deposited;
  *  - token holdings above MAX_TOKEN_SHARE_PCT of the portfolio -> warning.
  * The bot never moves funds: tickets tell a human what to deposit or withdraw.
  */
@@ -92,10 +94,24 @@ export function inventoryPlan(
   b: Balances,
   tokens: Token[],
   prices: Record<string, number>,
-  o: { tradeUsd: number; perSideX: number; maxTokenSharePct: number; stableInUsdt?: number; walletAddress?: string; stableSymbol?: string },
+  o: { tradeUsd: number; perSideX: number; maxTokenSharePct: number; stableInUsdt?: number; walletAddress?: string; stableSymbol?: string; lowX?: number },
 ): PlanItem[] {
   const out: PlanItem[] = [];
   const target = o.tradeUsd * o.perSideX;
+  const lowX = o.lowX ?? 1;
+  const lowAt = o.tradeUsd * lowX;
+  // A low side whose deficit to target the other side cannot cover: warn that
+  // moving funds alone will not fix it (a rebalance ticket would promise too much).
+  const shortfall = (token: string, side: 'wallet' | 'mexc', have: number, other: number) => {
+    const need = target - have;
+    if (have < lowAt && need > other) {
+      out.push({
+        kind: 'warning',
+        key: `shortfall-${token}-${side}`,
+        text: `${token} ${side} needs $${need.toFixed(2)} more, but the other side only has $${other.toFixed(2)} — deposit fresh funds, moving alone will not cover it`,
+      });
+    }
+  };
   const toWallet = `withdraw MEXC→wallet${o.walletAddress ? ` ${o.walletAddress}` : ''} (in the MEXC app)`;
   const toMexc = 'deposit wallet→MEXC';
   // The DEX-side stable (USDC on Ethereum/Base/Arbitrum, USDT on BSC). The wallet side needs
@@ -111,14 +127,18 @@ export function inventoryPlan(
     const w = (b.walletToken[t.base] ?? 0) * px;
     const m = (b.mexc[t.base] ?? 0) * px;
     tokenUsd += w + m;
-    out.push({ kind: 'side', token: t.base, side: 'wallet', low: w < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - w, m)) / px, direction: toWallet });
-    out.push({ kind: 'side', token: t.base, side: 'mexc', low: m < o.tradeUsd, asset: t.base, amount: Math.max(0, Math.min(target - m, w)) / px, direction: toMexc });
+    out.push({ kind: 'side', token: t.base, side: 'wallet', low: w < lowAt, asset: t.base, amount: Math.max(0, Math.min(target - w, m)) / px, direction: toWallet });
+    out.push({ kind: 'side', token: t.base, side: 'mexc', low: m < lowAt, asset: t.base, amount: Math.max(0, Math.min(target - m, w)) / px, direction: toMexc });
+    shortfall(t.base, 'wallet', w, m);
+    shortfall(t.base, 'mexc', m, w);
   }
   const walletStable = b.walletUsdc * (o.stableInUsdt ?? 1);
   const mexcStable = b.mexc.USDT ?? 0;
   // Wallet-side amount is in stable units (USDT amount / the USDC-USDT rate); MEXC side is USDT.
-  out.push({ kind: 'side', token: 'STABLE', side: 'wallet', low: walletStable < o.tradeUsd, asset: stable ?? 'USDC/USDT', amount: Math.max(0, Math.min(target - walletStable, mexcStable)) / (o.stableInUsdt ?? 1), direction: toWalletStable });
-  out.push({ kind: 'side', token: 'STABLE', side: 'mexc', low: mexcStable < o.tradeUsd, asset: 'USDT', amount: Math.max(0, Math.min(target - mexcStable, walletStable)), direction: toMexcStable });
+  out.push({ kind: 'side', token: 'STABLE', side: 'wallet', low: walletStable < lowAt, asset: stable ?? 'USDC/USDT', amount: Math.max(0, Math.min(target - walletStable, mexcStable)) / (o.stableInUsdt ?? 1), direction: toWalletStable });
+  out.push({ kind: 'side', token: 'STABLE', side: 'mexc', low: mexcStable < lowAt, asset: 'USDT', amount: Math.max(0, Math.min(target - mexcStable, walletStable)), direction: toMexcStable });
+  shortfall('STABLE', 'wallet', walletStable, mexcStable);
+  shortfall('STABLE', 'mexc', mexcStable, walletStable);
 
   const total = tokenUsd + walletStable + mexcStable;
   if (total > 0 && (tokenUsd / total) * 100 > o.maxTokenSharePct) {

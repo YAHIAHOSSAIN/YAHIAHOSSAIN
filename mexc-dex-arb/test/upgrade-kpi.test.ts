@@ -70,6 +70,35 @@ test('would-have PnL uses the best row\'s own size (round-3 M4)', () => {
   assert.equal(k.wouldHave.find((w) => w.hurdle_bps === 60)!.trades, 0); // 0.5 < $0.60 on $100
 });
 
+test('KPIs ignore DEX_ARB rows: detection-only spreads never count as tradeable gaps', () => {
+  const db = new Db(':memory:');
+  const t0 = Date.UTC(2026, 10, 21, 3, 0); // 09:00 Dhaka
+  db.insertOpportunities([
+    row({ ts: t0, gross_bps: 40, net_usd: 0.3 }),
+    row({ ts: t0 + 60_000, gross_bps: 60, net_usd: 0.5 }),
+    // DEX-ARB rows with bigger numbers must change NOTHING below.
+    row({ ts: t0, token: 'LINK', direction: 'DEX_ARB', gross_bps: 1500, net_usd: 24, size_usd: 200, decision: 'trade' }),
+    row({ ts: t0 + 60_000, token: 'LINK', direction: 'DEX_ARB', gross_bps: 1200, net_usd: 20, size_usd: 200, decision: 'trade' }),
+  ]);
+  const k = computeKpis(db, 0, 'paper');
+  assert.deepEqual(k.minutesAbove, [
+    { bps: 20, minutes: 2 },
+    { bps: 35, minutes: 2 },
+    { bps: 50, minutes: 1 },
+  ]);
+  const at30 = k.wouldHave.find((w) => w.hurdle_bps === 30)!;
+  assert.equal(at30.trades, 2);
+  assert.ok(Math.abs(at30.pnl - 0.8) < 1e-9); // 0.3 + 0.5, not +24/+20
+  assert.deepEqual(k.byHourDhaka, [{ hour: 9, minutes_above_20: 2 }]);
+  assert.deepEqual(k.decisions, [{ decision: 'below_hurdle', n: 2 }]);
+  assert.deepEqual(k.opportunitiesPerToken, [{ token: 'AERO', n: 2, best_gross_bps: 60 }]);
+  assert.deepEqual(k.histogram, [
+    { token: 'AERO', bucket: '35-50', n: 1 },
+    { token: 'AERO', bucket: '50+', n: 1 },
+  ]);
+  assert.match(opportunitiesCsv(db, 0), /^token,hour_dhaka,quotes,max_gross_bps,minutes_above_20\nAERO,9,2,60,2$/);
+});
+
 test('gasShareOfGross counts gas only on ok/paper trades, like gross (round-3 L1)', () => {
   const db = new Db(':memory:');
   const t0 = Date.UTC(2026, 10, 21, 3, 0);

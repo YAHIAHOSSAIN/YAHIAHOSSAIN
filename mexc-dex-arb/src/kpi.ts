@@ -24,22 +24,27 @@ const bucketSql = `CASE WHEN gross_bps < 0 THEN '<0' WHEN gross_bps < 10 THEN '0
 
 export function computeKpis(db: Db, sinceTs: number, mode: string): Kpis {
   const q = <T>(sql: string, ...a: unknown[]) => db.all<T>(sql, ...a);
+  // DEX_ARB rows are detection-only (no DEX-DEX execution exists): they count
+  // as "tokens seen" but never as tradeable gaps, so every opportunity query
+  // below excludes them (direction IS NOT 'DEX_ARB' is NULL-safe, so legacy
+  // rows without a direction still count). Their own stats live in
+  // readDexArbStats (status server).
   const opportunitiesPerToken = q<{ token: string; n: number; best_gross_bps: number | null }>(
-    `SELECT token, COUNT(*) n, MAX(gross_bps) best_gross_bps FROM opportunities WHERE ts >= ? AND gross_bps IS NOT NULL GROUP BY token ORDER BY n DESC`,
+    `SELECT token, COUNT(*) n, MAX(gross_bps) best_gross_bps FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND gross_bps IS NOT NULL GROUP BY token ORDER BY n DESC`,
     sinceTs,
   );
-  const decisions = q<{ decision: string; n: number }>(`SELECT decision, COUNT(*) n FROM opportunities WHERE ts >= ? GROUP BY decision ORDER BY n DESC`, sinceTs);
+  const decisions = q<{ decision: string; n: number }>(`SELECT decision, COUNT(*) n FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' GROUP BY decision ORDER BY n DESC`, sinceTs);
   const minutesAbove = [20, 35, 50].map((bps) => ({
     bps,
-    minutes: q<{ m: number }>(`SELECT COUNT(DISTINCT ts / 60000) m FROM opportunities WHERE ts >= ? AND gross_bps >= ?`, sinceTs, bps)[0]?.m ?? 0,
+    minutes: q<{ m: number }>(`SELECT COUNT(DISTINCT ts / 60000) m FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND gross_bps >= ?`, sinceTs, bps)[0]?.m ?? 0,
   }));
   const histogram = q<{ token: string; bucket: string; n: number }>(
-    `SELECT token, ${bucketSql} bucket, COUNT(*) n FROM opportunities WHERE ts >= ? AND gross_bps IS NOT NULL GROUP BY token, bucket`,
+    `SELECT token, ${bucketSql} bucket, COUNT(*) n FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND gross_bps IS NOT NULL GROUP BY token, bucket`,
     sinceTs,
   );
   const byHourDhaka = q<{ hour: number; minutes_above_20: number }>(
     `SELECT ((ts / 3600000) + ${DHAKA_H}) % 24 hour, COUNT(DISTINCT ts / 60000) minutes_above_20
-     FROM opportunities WHERE ts >= ? AND gross_bps >= 20 GROUP BY hour ORDER BY hour`,
+     FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND gross_bps >= 20 GROUP BY hour ORDER BY hour`,
     sinceTs,
   );
   // Would-have PnL: at most one trade per token+direction per minute (the best net in that minute),
@@ -53,7 +58,7 @@ export function computeKpis(db: Db, sinceTs: number, mode: string): Kpis {
            SELECT net_usd, size_usd, ROW_NUMBER() OVER (
              PARTITION BY token, direction, ts / 60000 ORDER BY net_usd DESC, size_usd DESC
            ) rn FROM opportunities
-           WHERE ts >= ? AND net_usd IS NOT NULL AND size_usd > 0
+           WHERE ts >= ? AND direction IS NOT 'DEX_ARB' AND net_usd IS NOT NULL AND size_usd > 0
          ) WHERE rn = 1
        ) WHERE best >= size * ? / 10000.0`,
       sinceTs,
@@ -124,7 +129,7 @@ export function opportunitiesCsv(db: Db, sinceTs: number): string {
   const rows = db.all<{ token: string; hour: number; n: number; max_gross_bps: number | null; minutes_above_20: number }>(
     `SELECT token, ((ts / 3600000) + ${DHAKA_H}) % 24 hour, COUNT(*) n, MAX(gross_bps) max_gross_bps,
             COUNT(DISTINCT CASE WHEN gross_bps >= 20 THEN ts / 60000 END) minutes_above_20
-     FROM opportunities WHERE ts >= ? GROUP BY token, hour ORDER BY token, hour`,
+     FROM opportunities WHERE ts >= ? AND direction IS NOT 'DEX_ARB' GROUP BY token, hour ORDER BY token, hour`,
     sinceTs,
   );
   return ['token,hour_dhaka,quotes,max_gross_bps,minutes_above_20', ...rows.map((r) => `${r.token},${r.hour},${r.n},${r.max_gross_bps ?? ''},${r.minutes_above_20}`)].join('\n');

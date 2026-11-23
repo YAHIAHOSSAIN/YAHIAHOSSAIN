@@ -41,6 +41,45 @@ export async function dexTvl(address: string, fetchFn: FetchFn = fetch, dexScree
   return Math.max(0, ...(j.pairs ?? []).filter((p) => p.chainId === dexScreenerChain).map((p) => p.liquidity?.usd ?? 0));
 }
 
+/** Rough USD price per token from DexScreener (highest-liquidity Ethereum pair). Batched, 25 addresses per call. */
+export async function dexPrices(addresses: string[], fetchFn: FetchFn = fetch, dexScreenerChain = 'ethereum'): Promise<Map<string, number>> {
+  const best = new Map<string, { price: number; liq: number }>();
+  for (let i = 0; i < addresses.length; i += 25) {
+    const chunk = addresses.slice(i, i + 25);
+    const res = await fetchFn(`https://api.dexscreener.com/latest/dex/tokens/${chunk.join(',')}`, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) throw new Error(`dexscreener ${res.status}`);
+    const j = (await res.json()) as { pairs?: { chainId: string; baseToken?: { address?: string }; priceUsd?: string; liquidity?: { usd?: number } }[] | null };
+    for (const p of j.pairs ?? []) {
+      if (p.chainId !== dexScreenerChain || !p.baseToken?.address || p.priceUsd === undefined) continue;
+      const price = Number(p.priceUsd);
+      if (!Number.isFinite(price) || price <= 0) continue;
+      const key = p.baseToken.address.toLowerCase();
+      const liq = p.liquidity?.usd ?? 0;
+      const cur = best.get(key);
+      if (!cur || liq > cur.liq) best.set(key, { price, liq });
+    }
+  }
+  return new Map([...best.entries()].map(([k, v]) => [k, v.price]));
+}
+
+export interface PaperTokenStat { symbol: string; trades: number; wins: number; pnl: number }
+
+/**
+ * Live mode: keep only tokens proven profitable in paper trading, best paper P&L first.
+ * `stats` come from Db.paperTokenStats() (trades.symbol is the base symbol, e.g. NPC).
+ * Tokens with no paper history never qualify — paper mode is the scout that earns history.
+ */
+export function provenTokens<T extends { base: string }>(tokens: T[], stats: PaperTokenStat[], minTrades: number, minPnlUsd: number, max: number): T[] {
+  const byBase = new Map(stats.map((s) => [s.symbol, s]));
+  return tokens
+    .filter((t) => {
+      const s = byBase.get(t.base);
+      return !!s && s.trades >= minTrades && s.pnl > minPnlUsd;
+    })
+    .sort((a, b) => (byBase.get(b.base)?.pnl ?? 0) - (byBase.get(a.base)?.pnl ?? 0))
+    .slice(0, max);
+}
+
 export async function buildWatchlist(
   mexc: MexcRest,
   decimalsOf: (address: string) => Promise<number>,

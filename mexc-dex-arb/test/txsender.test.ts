@@ -6,7 +6,7 @@ import { DROP_AFTER_MS, TxSender, classifySendError, type TxBackend, type GasInf
 const gas: GasInfo = { baseFee: 10n, tip: 1n, effective: 11n, maxFee: 21n };
 const tx = { to: '0xrouter', data: '0x01' };
 
-function backend(o: { broadcastError?: unknown; mined?: boolean; confirmed?: number; knows?: boolean; l1Fee?: bigint; rawReceiptThrows?: boolean } = {}) {
+function backend(o: { broadcastError?: unknown; mined?: boolean; confirmed?: number; knows?: boolean; l1Fee?: bigint; gasUsedForL1?: bigint; rawReceiptThrows?: boolean } = {}) {
   const state = { confirmed: o.confirmed ?? 5, signed: [] as { nonce: number; to: string; maxFeePerGas: bigint }[], receipts: new Map<string, number>(), gasReads: 0 };
   const b: TxBackend = {
     address: '0xme',
@@ -14,7 +14,9 @@ function backend(o: { broadcastError?: unknown; mined?: boolean; confirmed?: num
     receipt: async (h) => (state.receipts.has(h) ? { status: state.receipts.get(h)!, gasUsed: 100n, gasPrice: 2n } : null),
     rawReceipt: async () => {
       if (o.rawReceiptThrows) throw new Error('rpc down');
-      return o.l1Fee !== undefined ? { l1Fee: o.l1Fee } : null;
+      if (o.l1Fee !== undefined) return { l1Fee: o.l1Fee };
+      if (o.gasUsedForL1 !== undefined) return { gasUsedForL1: o.gasUsedForL1 };
+      return null;
     },
     knowsTx: async () => o.knows ?? true,
     sign: async (t) => {
@@ -133,5 +135,17 @@ test('raw receipt failure: L1 fee treated as 0, tx still ok (round-3 M1)', async
   const r = await s.send(tx, 100n, gas, 10);
   assert.equal(r.ok, true);
   assert.equal(r.gasCostWei, 200n);
+  assert.equal(r.l1FeeWei, undefined);
+});
+
+test('mined tx on Arbitrum: gasUsedForL1 is recorded, not priced (audit 2026-11-22, M7)', async () => {
+  // Arbitrum receipts carry gasUsedForL1, not l1Fee, and no USD price — the
+  // units are recorded for visibility; the pre-trade gate uses L1_FEE_USD.
+  const { b } = backend({ mined: true, gasUsedForL1: 50000n });
+  const s = new TxSender(b, memStore(), Date.now, async () => {});
+  const r = await s.send(tx, 100n, gas, 10);
+  assert.equal(r.ok, true);
+  assert.equal(r.gasCostWei, 200n); // L2 gas only — the L1 portion is not in the receipt price
+  assert.equal(r.l1GasUsed, 50000n);
   assert.equal(r.l1FeeWei, undefined);
 });

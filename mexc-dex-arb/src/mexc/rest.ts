@@ -55,6 +55,11 @@ export interface Order {
 
 type FetchFn = typeof fetch;
 
+/** First address from a deposit-address response (MEXC returns an array or a single object). */
+function pickDepositAddress(r: { address?: string }[] | { address?: string }): string | null {
+  return Array.isArray(r) ? (r[0]?.address ?? null) : (r.address ?? null);
+}
+
 /** HTTP 429/418 from any API: callers back off instead of hammering, at least `retryAfterSec`. */
 export class RateLimitError extends Error {
   constructor(msg: string, readonly retryAfterSec = 0) {
@@ -85,6 +90,13 @@ export interface WithdrawRecord {
   withdrawOrderId?: string;
 }
 
+/** One MEXC deposit (GET /api/v3/capital/deposit/history). */
+export interface DepositRecord {
+  txId?: string;
+  status: number;
+  amount: string;
+}
+
 export class MexcRest {
   /** serverTime - localTime, so signed timestamps stay inside recvWindow even if the VPS clock drifts. */
   timeOffsetMs = 0;
@@ -107,10 +119,15 @@ export class MexcRest {
       if (!this.apiKey || !this.apiSecret) throw new Error('MEXC API key/secret not configured');
       qs.set('timestamp', String(Date.now() + this.timeOffsetMs));
       qs.set('recvWindow', '5000');
-      qs.set('signature', this.sign(qs.toString()));
+      // MEXC signs the %20 form: URLSearchParams encodes a space as `+`,
+      // which MEXC rejects (400 code 700002 "Signature for this request is
+      // not valid"). Encode spaces as %20 BEFORE signing, and send exactly
+      // that string — the signed query and the sent URL are identical.
+      // (A literal `+` inside a value is already %2B, so this only touches spaces.)
+      qs.set('signature', this.sign(qs.toString().replace(/\+/g, '%20')));
       headers['X-MEXC-APIKEY'] = this.apiKey;
     }
-    const q = qs.toString();
+    const q = qs.toString().replace(/\+/g, '%20');
     let res: Response;
     let text: string;
     try {
@@ -217,6 +234,59 @@ export class MexcRest {
   async findWithdraw(coin: string, sinceTs: number, ref: { id?: string | null; withdrawOrderId?: string }): Promise<WithdrawRecord | null> {
     const h = await this.withdrawHistory(coin, sinceTs);
     return h.find((w) => (ref.id && w.id === ref.id) || (ref.withdrawOrderId && w.withdrawOrderId === ref.withdrawOrderId)) ?? null;
+  }
+
+  /**
+   * MEXC deposit address for a coin on a network (Phase 8 recycle).
+   * GET first; USDC deposit addresses ALREADY EXIST for all networks
+   * (verified live 2026-11-23: GET with no network returns 144 entries),
+   * so POST generates one only when GET comes back empty. GET/POST both
+   * tolerate an array or an object response — MEXC has returned an empty
+   * response either way.
+   * Pass the LONG `network` value from coinConfigs (e.g. "Ethereum(ERC20)",
+   * "Arbitrum One(ARB)", "BNB Smart Chain(BEP20)"): the SHORT `netWork`
+   * ("ETH") is rejected by this endpoint with 400 code 10232 "Coin is not
+   * exist" (live, transfer #3 recycle, 2026-11-23). "ERC20" alone matches
+   * nothing for USDC — the API string for the Ethereum chain is
+   * "Ethereum(ERC20)". Spaced long names are safe: request() signs and
+   * sends the %20 form. The WITHDRAW path is different — it still takes
+   * the short `netWork`; do not change it.
+   *
+   * NOTE on which address GET returns: the GET list is ONE shared list per
+   * coin (same entries whatever `network` is passed), newest first — so the
+   * first entry IS the address the MEXC app currently displays as current /
+   * default (live 2026-11-23: after a POST created 0xb680…8520, GET-first
+   * became 0xb680…8520). POST, by contrast, MINTS A NEW address on every
+   * call (verified live 2026-11-23: three POSTs returned three different
+   * new addresses, each immediately becoming the new GET-first) — so the
+   * recycle path must NOT POST-generate: it would use an address the user
+   * has never seen. The recycle engine resolves GET-first once per chain
+   * and caches it in the DB, so the bot pins that address and never drifts
+   * when the list order later changes.
+   */
+  async depositAddress(coin: string, network: string): Promise<string | null> {
+    const fromGet = pickDepositAddress(await this.request<{ address?: string }[] | { address?: string }>('GET', '/api/v3/capital/deposit/address', { coin, network }, true));
+    if (fromGet) return fromGet;
+    const gen = await this.request<{ address?: string }[] | { address?: string }>('POST', '/api/v3/capital/deposit/address', { coin, network }, true);
+    return pickDepositAddress(gen);
+  }
+
+  /** One deposit record (GET /api/v3/capital/deposit/history). */
+  async depositHistory(coin: string, sinceTs: number): Promise<DepositRecord[]> {
+    const r = await this.request<{ txId?: string; status: number | string; amount: string }[]>(
+      'GET',
+      '/api/v3/capital/deposit/history',
+      { coin, startTime: Math.max(0, Math.floor(sinceTs)), limit: 1000 },
+      true,
+    );
+    return (Array.isArray(r) ? r : []).map((d) => ({ txId: d.txId, status: Number(d.status), amount: d.amount }));
+  }
+
+  /** Find a deposit by chain tx hash (comparison ignores case and a 0x prefix). null = not in history yet. */
+  async findDeposit(coin: string, sinceTs: number, txId: string): Promise<DepositRecord | null> {
+    const norm = (h: string) => h.toLowerCase().replace(/^0x/, '');
+    const h = await this.depositHistory(coin, sinceTs);
+    return h.find((d) => d.txId && norm(d.txId) === norm(txId)) ?? null;
   }
 
   /** `clientOrderId` makes the order findable even if this request times out. */

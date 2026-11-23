@@ -6,12 +6,15 @@ import { MexcRest } from '../src/mexc/rest.js';
 import { ZeroEx, ZEROX_ALLOWANCE_HOLDER } from '../src/dex/aggregator.js';
 import { AmbiguousRequestError } from '../src/mexc/rest.js';
 import { placeSafely } from '../src/engine.js';
-import { loadConfig, secretsOf, validateConfig } from '../src/config.js';
+import { hurdleBps, loadConfig, secretsOf, validateConfig } from '../src/config.js';
 import { Telegram } from '../src/telegram.js';
 import { redact, registerSecrets } from '../src/log.js';
 import { Db } from '../src/db.js';
 import { Risk } from '../src/risk.js';
-import { ethNetwork } from '../src/watchlist.js';
+import { ethNetwork, provenTokens, type Token } from '../src/watchlist.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // --- tiny protobuf encoder for building test messages ---
 const varint = (n: number) => {
@@ -26,6 +29,42 @@ const varint = (n: number) => {
 const field = (num: number, bytes: Uint8Array | number[]) => [...varint(num * 8 + 2), ...varint(bytes.length), ...bytes];
 const s = (x: string) => [...Buffer.from(x)];
 const level = (p: string, q: string) => [...field(1, s(p)), ...field(2, s(q))];
+
+test('provenTokens keeps only paper-profitable tokens, best P&L first', () => {
+  const tok = (base: string): Token => ({
+    base, symbol: `${base}USDT`, address: `0x${base}`, decimals: 18, qtyStep: 0.001, priceDecimals: 4,
+    rules: {} as Token['rules'], dexTvlUsd: 1_000_000, mexcVolumeUsd: 100_000, depositOk: true, withdrawOk: true,
+  });
+  const tokens = ['NPC', 'BGB', 'METAON', 'FET', 'PEPE'].map(tok);
+  const stats = [
+    { symbol: 'NPC', trades: 2, wins: 2, pnl: 19.41 },
+    { symbol: 'BGB', trades: 4, wins: 4, pnl: 7.11 },
+    { symbol: 'METAON', trades: 1, wins: 1, pnl: 1.38 },
+    { symbol: 'FET', trades: 3, wins: 0, pnl: -1.95 },
+  ];
+  assert.deepEqual(provenTokens(tokens, stats, 2, 0, 10).map((t) => t.base), ['NPC', 'BGB']);
+  assert.deepEqual(provenTokens(tokens, stats, 2, 0, 1).map((t) => t.base), ['NPC']);
+  assert.deepEqual(provenTokens(tokens, [], 2, 0, 10), []);
+});
+
+test('twin: live bot reads paper history from the paper bot DB (readonly)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'avh-twin-'));
+  const file = path.join(dir, 'paper.sqlite');
+  const paper = new Db(file);
+  const row = (symbol: string, pnl: number) => paper.insertTrade({ ts: Date.now(), day: '2026-11-21', mode: 'paper', symbol, direction: 'CEX_BUY', size_usd: 300, qty: 1, buy_price: 1, sell_price: 1, expected_net: 1, cex_fee_usd: 0, gas_usd: 0, pnl_usd: pnl, status: 'paper', dex_tx: null, cex_order_id: null, note: null });
+  row('NPC', 10);
+  row('NPC', 9.41);
+  row('BGB', -1);
+  const twin = new Db(file, true);
+  const stats = twin.paperTokenStats().sort((a, b) => a.symbol.localeCompare(b.symbol));
+  assert.deepEqual(stats, [
+    { symbol: 'BGB', trades: 1, wins: 0, pnl: -1 },
+    { symbol: 'NPC', trades: 2, wins: 2, pnl: 19.41 },
+  ]);
+  twin.close();
+  paper.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
 
 test('decodes a MEXC limit-depth protobuf push', () => {
   const depth = [
@@ -128,11 +167,54 @@ test('placeSafely: a timed-out order that WAS placed is found by client id; one 
 test('config validation rejects dangerous values', () => {
   process.env.RPC_URL = 'http://x';
   process.env.MODE = 'paper';
+  // A VPS .env could set the depth knobs out of range and break this test.
+  delete process.env.MIN_POOL_LIQUIDITY_USD;
+  delete process.env.DEPTH_MAX_IMPACT_BPS;
+  delete process.env.DEPTH_MAX_SIZE_PCT;
+  delete process.env.QUOTE_RPS_VELORA;
+  delete process.env.QUOTE_RPS_OPENOCEAN;
+  delete process.env.REBALANCE_LOW_X;
+  delete process.env.DEX_ARB_ENABLED;
+  delete process.env.MIN_PROFIT_BPS_ETH;
+  delete process.env.BUILDER_TIP_GWEI;
   const ok = loadConfig();
   assert.doesNotThrow(() => validateConfig(ok));
   assert.throws(() => validateConfig({ ...ok, minProfitBps: -1 }), /MIN_PROFIT_BPS/);
   assert.throws(() => validateConfig({ ...ok, dexSlippageBps: 20_000 }), /DEX_SLIPPAGE_BPS/);
   assert.throws(() => validateConfig({ ...ok, minTradeUsd: 500, maxTradeUsd: 200 }), /MIN_TRADE_USD/);
+});
+
+test('Phase 5: dynamic hurdle + builder tip — defaults off, ranges enforced, ETH-only', () => {
+  const saved = { ...process.env };
+  try {
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    delete process.env.MIN_PROFIT_BPS_ETH;
+    delete process.env.BUILDER_TIP_GWEI;
+    delete process.env.MIN_PROFIT_BPS;
+    delete process.env.CHAIN;
+    let c = loadConfig();
+    assert.equal(c.minProfitBpsEth, 0); // off by default: current behaviour everywhere
+    assert.equal(c.builderTipGwei, 0);
+    assert.equal(hurdleBps(c), 20); // falls back to MIN_PROFIT_BPS
+    assert.throws(() => validateConfig({ ...c, minProfitBpsEth: -1 }), /MIN_PROFIT_BPS_ETH/);
+    assert.throws(() => validateConfig({ ...c, minProfitBpsEth: 10_001 }), /MIN_PROFIT_BPS_ETH/);
+    assert.throws(() => validateConfig({ ...c, builderTipGwei: -1 }), /BUILDER_TIP_GWEI/);
+    assert.throws(() => validateConfig({ ...c, builderTipGwei: 101 }), /BUILDER_TIP_GWEI/);
+    // Ethereum uses the override when set; L2s ignore it.
+    process.env.MIN_PROFIT_BPS_ETH = '50';
+    c = loadConfig();
+    assert.equal(c.chain.name, 'ethereum');
+    assert.equal(hurdleBps(c), 50);
+    process.env.CHAIN = 'arbitrum';
+    c = loadConfig();
+    assert.equal(hurdleBps(c), 20);
+    process.env.CHAIN = 'bsc';
+    c = loadConfig();
+    assert.equal(hurdleBps(c), 20);
+  } finally {
+    process.env = saved;
+  }
 });
 
 test('Telegram only obeys the admin user in a private chat', async () => {
@@ -234,7 +316,7 @@ test('ethNetwork finds the Ethereum entry in MEXC coin config', () => {
 test('transfer strategy refuses to start without ALLOW_WITHDRAWALS=yes; safe defaults', () => {
   const saved = { ...process.env };
   try {
-    for (const k of ['MODE', 'STRATEGY', 'ALLOW_WITHDRAWALS', 'MAX_TRADE_USD']) delete process.env[k];
+    for (const k of ['MODE', 'STRATEGY', 'ALLOW_WITHDRAWALS', 'MAX_TRADE_USD', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED', 'MIN_PROFIT_BPS_ETH', 'BUILDER_TIP_GWEI']) delete process.env[k];
     process.env.RPC_URL = 'http://x';
     const d = loadConfig();
     assert.equal(d.mode, 'paper');
@@ -244,6 +326,112 @@ test('transfer strategy refuses to start without ALLOW_WITHDRAWALS=yes; safe def
     assert.throws(() => loadConfig(), /ALLOW_WITHDRAWALS=yes/);
     process.env.ALLOW_WITHDRAWALS = 'yes';
     assert.equal(loadConfig().strategy, 'transfer');
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('UNLIMITED_APPROVAL defaults to off (exact approvals); yes turns it on', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.UNLIMITED_APPROVAL;
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    assert.equal(loadConfig().unlimitedApproval, false);
+    process.env.UNLIMITED_APPROVAL = 'yes';
+    assert.equal(loadConfig().unlimitedApproval, true);
+    process.env.UNLIMITED_APPROVAL = 'no';
+    assert.equal(loadConfig().unlimitedApproval, false);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('transfer universe volume knobs default to off (no DEX filter, no cap)', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MIN_DEX_VOLUME_USD', 'TRANSFER_UNIVERSE_MAX', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED', 'MIN_PROFIT_BPS_ETH', 'BUILDER_TIP_GWEI']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = loadConfig();
+    assert.equal(c.minDexVolumeUsd, 0);
+    assert.equal(c.transferUniverseMax, 0);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('depth filter knobs default to a $150k pool floor, 70 bps impact, 1% size cap', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = validateConfig(loadConfig());
+    assert.equal(c.minPoolLiquidityUsd, 150_000);
+    assert.equal(c.depthMaxImpactBps, 70);
+    assert.equal(c.depthMaxSizePct, 1);
+    assert.throws(() => validateConfig({ ...c, minPoolLiquidityUsd: -1 }), /MIN_POOL_LIQUIDITY_USD/);
+    assert.throws(() => validateConfig({ ...c, depthMaxImpactBps: 5001 }), /DEPTH_MAX_IMPACT_BPS/);
+    assert.throws(() => validateConfig({ ...c, depthMaxSizePct: 101 }), /DEPTH_MAX_SIZE_PCT/);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Phase 4: REBALANCE_LOW_X defaults to 1 (range 0.1..10); DEX_ARB_ENABLED defaults to no (detection only)', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['REBALANCE_LOW_X', 'DEX_ARB_ENABLED', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = validateConfig(loadConfig());
+    assert.equal(c.rebalanceLowX, 1);
+    assert.equal(c.dexArbEnabled, false);
+    assert.throws(() => validateConfig({ ...c, rebalanceLowX: 0.05 }), /REBALANCE_LOW_X/);
+    assert.throws(() => validateConfig({ ...c, rebalanceLowX: 10.1 }), /REBALANCE_LOW_X/);
+    process.env.REBALANCE_LOW_X = '1.5';
+    assert.equal(loadConfig().rebalanceLowX, 1.5);
+    process.env.DEX_ARB_ENABLED = 'yes';
+    assert.equal(loadConfig().dexArbEnabled, true);
+    process.env.DEX_ARB_ENABLED = 'no';
+    assert.equal(loadConfig().dexArbEnabled, false);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Phase 3: velora + openocean are accepted aggregator names; unknown names rejected', () => {
+  const saved = { ...process.env };
+  try {
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    process.env.DEX_AGGREGATOR = 'velora,openocean';
+    assert.deepEqual(loadConfig().aggregators, ['velora', 'openocean']);
+    process.env.DEX_AGGREGATOR = '0x,kyber,1inch,velora,openocean';
+    assert.deepEqual(loadConfig().aggregators, ['0x', 'kyber', '1inch', 'velora', 'openocean']);
+    process.env.DEX_AGGREGATOR = 'velora,paraswap';
+    assert.throws(() => loadConfig(), /DEX_AGGREGATOR: unknown "paraswap"/);
+    delete process.env.DEX_AGGREGATOR;
+    assert.deepEqual(loadConfig().aggregators, ['0x']); // default unchanged
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('Phase 3: QUOTE_RPS_VELORA defaults to 1 (free-tier limit), QUOTE_RPS_OPENOCEAN to 2; ranges enforced', () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.QUOTE_RPS_VELORA;
+    delete process.env.QUOTE_RPS_OPENOCEAN;
+    process.env.RPC_URL = 'http://x';
+    process.env.MODE = 'paper';
+    const c = validateConfig(loadConfig());
+    assert.equal(c.quoteRps.velora, 1);
+    assert.equal(c.quoteRps.openocean, 2);
+    assert.equal(c.quoteRps['0x'], 4); // existing defaults unchanged
+    assert.throws(() => validateConfig({ ...c, quoteRps: { ...c.quoteRps, velora: -1 } }), /QUOTE_RPS_VELORA/);
+    assert.throws(() => validateConfig({ ...c, quoteRps: { ...c.quoteRps, openocean: 101 } }), /QUOTE_RPS_OPENOCEAN/);
   } finally {
     process.env = saved;
   }
@@ -261,7 +449,7 @@ test('RPC URLs (they contain provider keys) are redacted', () => {
 test('default economics: profit floor is small vs trade size; $15 on $50 is rejected', () => {
   const saved = { ...process.env };
   try {
-    for (const k of ['MIN_PROFIT_USD', 'MAX_TRADE_USD', 'MODE', 'STRATEGY']) delete process.env[k];
+    for (const k of ['MIN_PROFIT_USD', 'MAX_TRADE_USD', 'MIN_TRADE_USD', 'TRANSFER_DRIFT_BPS', 'MODE', 'STRATEGY', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED']) delete process.env[k];
     process.env.RPC_URL = 'http://x';
     const d = validateConfig(loadConfig());
     assert.ok(d.minProfitUsd <= d.maxTradeUsd * 0.1, `${d.minProfitUsd} vs ${d.maxTradeUsd}`);
@@ -322,6 +510,25 @@ test('L1_FEE_USD defaults to 0 (round-3 M1)', () => {
     delete process.env.L1_FEE_USD;
     process.env.RPC_URL = 'http://x';
     assert.equal(loadConfig().l1FeeUsd, 0);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test('transfer strategy runs on ethereum/arbitrum/bsc, not on base', () => {
+  const saved = { ...process.env };
+  try {
+    for (const k of ['MODE', 'STRATEGY', 'ALLOW_WITHDRAWALS', 'MAX_TRADE_USD', 'CHAIN', 'MIN_POOL_LIQUIDITY_USD', 'DEPTH_MAX_IMPACT_BPS', 'DEPTH_MAX_SIZE_PCT', 'QUOTE_RPS_VELORA', 'QUOTE_RPS_OPENOCEAN', 'REBALANCE_LOW_X', 'DEX_ARB_ENABLED']) delete process.env[k];
+    process.env.RPC_URL = 'http://x';
+    process.env.STRATEGY = 'transfer';
+    process.env.ALLOW_WITHDRAWALS = 'yes';
+    for (const chain of ['ethereum', 'arbitrum', 'bsc']) {
+      process.env.CHAIN = chain;
+      assert.equal(loadConfig().chain.name, chain);
+      assert.equal(loadConfig().strategy, 'transfer');
+    }
+    process.env.CHAIN = 'base';
+    assert.throws(() => loadConfig(), /only supported on CHAIN=ethereum\/arbitrum\/bsc/);
   } finally {
     process.env = saved;
   }

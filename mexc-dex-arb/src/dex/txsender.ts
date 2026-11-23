@@ -37,6 +37,10 @@ export interface TxResult {
   inclusionMs?: number;
   /** OP-stack L1 data fee (wei), when the raw receipt carries one (Base/Optimism). */
   l1FeeWei?: bigint;
+  /** Arbitrum L1 data gas (units), when the raw receipt carries gasUsedForL1
+   * instead of l1Fee. No USD price is in the receipt, so this is recorded
+   * for visibility only; the pre-trade gate uses L1_FEE_USD. */
+  l1GasUsed?: bigint;
 }
 
 export interface Unresolved {
@@ -55,7 +59,7 @@ export interface TxBackend {
   confirmedNonce(): Promise<number>;
   receipt(hash: string): Promise<{ status: number | null; gasUsed: bigint; gasPrice: bigint } | null>;
   /** Optional raw receipt (ethers does not expose the OP-stack L1 fee): only l1Fee is read. */
-  rawReceipt?(hash: string): Promise<{ l1Fee?: bigint } | null>;
+  rawReceipt?(hash: string): Promise<{ l1Fee?: bigint; gasUsedForL1?: bigint } | null>;
   /** true if the public or the private RPC still knows this tx (pending or mined). */
   knowsTx(hash: string): Promise<boolean>;
   sign(tx: { nonce: number; to: string; data: string; value: bigint; gasLimit: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Promise<{ raw: string; hash: string }>;
@@ -271,9 +275,13 @@ export class TxSender {
     // OP-stack chains (Base/Optimism) charge an L1 data fee on top of the L2 gas: it lives in the
     // raw receipt's l1Fee field, which ethers does not expose. Without it the recorded gas
     // understates the true cost (round-3 review, M1). On other chains the field is absent.
-    const l1 = (await this.b.rawReceipt?.(hash).catch(() => null))?.l1Fee ?? 0n;
+    // Arbitrum receipts carry gasUsedForL1 instead (no USD price in the receipt):
+    // record the units for visibility; the pre-trade gate uses L1_FEE_USD.
+    const raw = await this.b.rawReceipt?.(hash).catch(() => null);
+    const l1 = raw?.l1Fee ?? 0n;
+    const l1Gas = raw?.gasUsedForL1 ?? 0n;
     const cost = r.gasUsed * r.gasPrice + l1;
-    const extra = { gasUsed: r.gasUsed, gasPrice: r.gasPrice, inclusionMs: this.now() - this.signedAt, ...(l1 > 0n ? { l1FeeWei: l1 } : {}) };
+    const extra = { gasUsed: r.gasUsed, gasPrice: r.gasPrice, inclusionMs: this.now() - this.signedAt, ...(l1 > 0n ? { l1FeeWei: l1 } : {}), ...(l1Gas > 0n ? { l1GasUsed: l1Gas } : {}) };
     return r.status === 1 ? { ok: true, hash, gasCostWei: cost, ...extra } : { ok: false, hash, gasCostWei: cost, reason: 'reverted', ...extra };
   }
 
