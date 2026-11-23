@@ -1,3 +1,8 @@
+# Pool floor $10k on Arbitrum + BSC only (owner decision 2026-11-23, Yahia: "bnb pool arb pool 10k koro")
+
+- `MIN_POOL_LIQUIDITY_USD: '10000'` in the Arbitrum and BSC live configs only; Ethereum stays at `'50000'`. Note: the $100 MIN_TRADE_USD + 0.7% impact cap still gate trades — safe size is 0.35% of pool, so a pool needs ~$29k before a $100 trade can pass the impact cap; $10k–$29k pools enter the universe but cannot trade.
+- Deployed to VPS, arb + bsc bots restarted (pm2 delete + start; eth untouched), live API confirms `minPoolLiquidityUsd: 10000` on Arbitrum/BSC and `50000` on Ethereum. Local tests 342/342 pass (config-only change, no code touched).
+
 # Pool floor $150k -> $50k on all live chains (owner decision 2026-11-23, Yahia: "50k koro")
 
 - `MIN_POOL_LIQUIDITY_USD: '50000'` added to the env block of all three live ecosystem configs (was unset — the `src/config.ts` default of 150,000 applied). Impact ≤0.7% and size ≤1% of pool caps still apply, so a $500 trade on a $50k pool still sizes down (~$175 at the impact cap); the floor change only widens the universe to $50k–$150k pools.
