@@ -62,7 +62,8 @@ function seedDb(): Db {
 const ctx: RemoteSnapshotCtx = {
   chain: 'ethereum', mode: 'live', strategy: 'transfer', maxTradeUsd: 300,
   aggregators: ['0x'], dexArbEnabled: false, minPoolLiquidityUsd: 150000,
-  depthMaxImpactBps: 70, version: '1.0.0', uptimeSec: 3600, lastScanTs: Date.now(),
+  depthMaxImpactBps: 70, version: '1.0.0', walletAddress: '0x1111111111111111111111111111111111111111',
+  uptimeSec: 3600, lastScanTs: Date.now(),
   mexcUsdt: 1493.97, walletNative: 0.0303, walletUsdc: 0, nativeSymbol: 'ETH',
 };
 
@@ -96,9 +97,13 @@ test('snapshot: numbers match the DB; in-flight trades never count', () => {
   assert.equal(s.chain, 'ethereum');
   assert.equal(s.mode, 'live');
   assert.equal(s.maxTradeUsd, 300);
+  // The hot wallet address identifies this bot on the owner's board.
+  assert.equal(s.walletAddress, '0x1111111111111111111111111111111111111111');
   // 3 finished live trades: +10, -3, -5 = +2 net; the 'executing' row excluded.
   assert.equal(s.hero.trades, 3);
   assert.equal(s.hero.pnl, 2);
+  // All-time traded volume: 3 finished trades x $200 size (executing excluded).
+  assert.equal(s.hero.volumeUsd, 600);
   assert.equal(s.hero.wins, 1);
   assert.equal(s.hero.bestToken, 'XYZ');
   assert.equal(s.hero.bestTokenPnl, 7);
@@ -206,7 +211,7 @@ test('snapshot L1/L4/L5: booked falls back to pnl for live (null for paper); rec
   db.close();
 });
 
-test('snapshot: NO secret ever leaves the bot (tx hashes, order ids, wallet address)', () => {
+test('snapshot: NO secret ever leaves the bot (tx hashes, order ids, keys — the hot wallet address is the designed identity)', () => {
   const db = seedDb();
   const s = buildSnapshot(db, ctx);
   const json = JSON.stringify(s);
@@ -218,6 +223,11 @@ test('snapshot: NO secret ever leaves the bot (tx hashes, order ids, wallet addr
   for (const field of ['dex_tx', 'cex_order_id', 'address', 'private', 'api_key', 'secret']) {
     assert.ok(!json.includes(`"${field}"`), `field ${field} present in snapshot`);
   }
+  // The hot wallet address IS in the snapshot by design (owner decision
+  // 2026-11-23): it identifies the bot on the owner's board. It is the only
+  // address-like value allowed — the transfer's own address (0xWALLETSECRET
+  // above) still never leaves.
+  assert.equal(s.walletAddress, '0x1111111111111111111111111111111111111111');
   db.close();
 });
 

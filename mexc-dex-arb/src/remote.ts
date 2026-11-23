@@ -7,8 +7,11 @@
 // to the central receiver (POST /api/ingest) every INGEST_INTERVAL_SEC.
 //
 // The snapshot is allowlist-by-construction: only the fields below are ever
-// built, and the receiver sanitizes again before storing. No wallet address,
-// no tx hash, no CEX order id, no key, no token ever leaves the bot.
+// built, and the receiver sanitizes again before storing. No tx hash, no CEX
+// order id, no key, no token ever leaves the bot. The hot wallet address IS
+// sent (owner decision 2026-11-23): it identifies the bot on the owner's
+// board — the receiver stores it in its own column, never in the public
+// snapshot blob, and public pages show at most a short fingerprint of it.
 import { randomBytes, createHash } from 'node:crypto';
 import type { Db } from './db.js';
 import { dhakaDay } from './util.js';
@@ -54,6 +57,8 @@ export interface RemoteSnapshotCtx {
   depthMaxImpactBps: number;
   /** Bot version string (package.json), e.g. '1.0.0'. */
   version: string;
+  /** Hot wallet address (lowercase), '' when the bot has no wallet (paper mode). */
+  walletAddress: string;
   /** Seconds since this process started. */
   uptimeSec: number;
   /** ms timestamp of the last scan tick (0 = never). */
@@ -70,11 +75,13 @@ export interface RemoteSnapshot {
   chain: string;
   mode: string;
   version: string;
+  /** Hot wallet address (lowercase) that identifies this bot, null when unknown (paper mode). */
+  walletAddress: string | null;
   uptimeSec: number;
   lastScanTs: number;
   pm2: { state: string };
   maxTradeUsd: number;
-  hero: { trades: number; pnl: number; gas: number; fees: number; wins: number; bestToken: string | null; bestTokenPnl: number };
+  hero: { trades: number; pnl: number; gas: number; fees: number; wins: number; bestToken: string | null; bestTokenPnl: number; volumeUsd: number };
   today: { day: string; trades: number; pnl: number; gas: number; fees: number; wins: number; losses: number };
   week7d: { trades: number; pnl: number };
   perToken: { symbol: string; trades: number; pnl: number; wins: number }[];
@@ -128,12 +135,12 @@ export function buildSnapshot(db: Db, ctx: RemoteSnapshotCtx): RemoteSnapshot {
 
   // Same finished-trade filter as the dashboard's readTradeStats: in-flight
   // ('executing'/'approval') rows never count, their PnL is 0 anyway.
-  const heroRow = db.all<{ c: number; pnl: number; gas: number; fees: number; wins: number }>(
+  const heroRow = db.all<{ c: number; pnl: number; gas: number; fees: number; wins: number; volume: number }>(
     `SELECT COUNT(*) c, COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
-            COALESCE(SUM(cex_fee_usd),0) fees,
+            COALESCE(SUM(cex_fee_usd),0) fees, COALESCE(SUM(size_usd),0) volume,
             SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) wins
      FROM trades WHERE mode = 'live' AND ${FINISHED}`,
-  )[0] ?? { c: 0, pnl: 0, gas: 0, fees: 0, wins: 0 };
+  )[0] ?? { c: 0, pnl: 0, gas: 0, fees: 0, wins: 0, volume: 0 };
   const todayRow = db.all<{ c: number; pnl: number; gas: number; fees: number; wins: number; losses: number }>(
     `SELECT COUNT(*) c, COALESCE(SUM(pnl_usd),0) pnl, COALESCE(SUM(gas_usd),0) gas,
             COALESCE(SUM(cex_fee_usd),0) fees,
@@ -311,13 +318,14 @@ export function buildSnapshot(db: Db, ctx: RemoteSnapshotCtx): RemoteSnapshot {
     chain: ctx.chain,
     mode: ctx.mode,
     version: ctx.version,
+    walletAddress: ctx.walletAddress ? ctx.walletAddress.toLowerCase() : null,
     uptimeSec: Math.round(ctx.uptimeSec),
     lastScanTs: ctx.lastScanTs,
     pm2: { state: 'online' },
     maxTradeUsd: ctx.maxTradeUsd,
     hero: {
       trades: heroRow.c, pnl: heroRow.pnl, gas: heroRow.gas, fees: heroRow.fees,
-      wins: heroRow.wins || 0,
+      wins: heroRow.wins || 0, volumeUsd: heroRow.volume,
       bestToken: best ? best.symbol : null, bestTokenPnl: best ? best.pnl : 0,
     },
     today: { day: today, trades: todayRow.c, pnl: todayRow.pnl, gas: todayRow.gas, fees: todayRow.fees, wins: todayRow.wins || 0, losses: todayRow.losses || 0 },

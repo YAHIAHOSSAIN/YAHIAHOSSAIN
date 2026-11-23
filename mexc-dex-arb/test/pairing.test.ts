@@ -1,7 +1,10 @@
 // Pairing-code dashboard (2026-11-23) — central receiver: ingest sanitizing,
 // per-code storage, revoke, offline detection, retention, rate limiting.
 // Security core: a code is a password, no enumeration, and NO secret field
-// (wallet address, key, token, tx hash, order id) can ever be stored/served.
+// (key, token, tx hash, order id) can ever be stored/served. The hot wallet
+// address is the one exception: it is stored in its own DB column (never in
+// the public snapshot blob) and shown in full only on the key-gated owner
+// page; public pages get at most its fingerprint.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -15,17 +18,25 @@ const Database = require('better-sqlite3');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pairing-'));
 const remoteDbPath = path.join(dir, 'remote-bots.sqlite');
 
-// The receiver module reads REMOTE_DB at import time, so set it before import.
+// The receiver module reads REMOTE_DB + OWNER_KEY at import time, so set
+// them before import. OWNER_KEY here is a TEST key only — the live key lives
+// in the VPS pm2 env and never in the repo.
+const OWNER_KEY = 'AbCdEfGhIjKlMnOpQrStUvWx'; // 24 chars
+process.env.OWNER_KEY = OWNER_KEY;
+const ADDR_Y = '0x1111111111111111111111111111111111111111'; // synthetic operator address (never a real wallet)
+const ADDR_F = '0x000000000000000000000000000000000000beef'; // a second operator
 process.env.REMOTE_DB = remoteDbPath;
 
 const server = await import('../status-server.mjs');
 const {
   sanitizeSnapshot, ingestSnapshot, revokeRemoteCode, readRemote, remoteJson,
-  hashPairingCode, isValidRemoteCode, RateLimiter,
+  hashPairingCode, isValidRemoteCode, RateLimiter, ownerJson, readOwnerSummary,
+  readOwnerAddress, walletFingerprint,
 } = server;
 
 const CODE_A = 'abcdefghijklmnopqrstuvwx'; // 24 chars
 const CODE_B = 'ABCDEFGHIJKLMNOPQRSTUVWX'; // 24 chars
+const CODE_C = '0123456789abcdefghijklmn'; // 24 chars
 const BAD_CODE = 'too-short';
 
 function goodSnapshot(overrides = {}) {
@@ -253,4 +264,184 @@ test('RateLimiter: allows up to the limit, then blocks until the window passes',
   assert.equal(rl.allow('code', 1, 5000, now), true);
   assert.equal(rl.allow('code', 1, 5000, now + 4000), false);
   assert.equal(rl.allow('code', 1, 5000, now + 5000), true);
+});
+
+// ---------------- Owner board (2026-11-23): address identity + summary ----------------
+
+test('ingest: wallet address lands in its own column, never in the stored snapshot', () => {
+  const db = freshDb();
+  const now = Date.now();
+  assert.deepEqual(ingestSnapshot(db, CODE_A, 'ethereum', goodSnapshot({ walletAddress: ADDR_Y }), now), { ok: true });
+  const row = db.prepare('SELECT address, snapshot FROM remote_bots WHERE code_hash = ?').get(hashPairingCode(CODE_A));
+  assert.equal(row.address, ADDR_Y);
+  assert.ok(!row.snapshot.includes(ADDR_Y), 'raw address in stored snapshot blob');
+  assert.ok(!row.snapshot.includes('walletAddress'), 'walletAddress field in stored snapshot blob');
+  // A malformed address stores NULL but the snapshot still lands.
+  assert.deepEqual(ingestSnapshot(db, CODE_B, 'arbitrum', goodSnapshot({ chain: 'arbitrum', walletAddress: 'not-an-address' }), now), { ok: true });
+  const rowB = db.prepare('SELECT address FROM remote_bots WHERE code_hash = ?').get(hashPairingCode(CODE_B));
+  assert.equal(rowB.address, null);
+  // No address at all (old bot version): also NULL, still ok.
+  assert.deepEqual(ingestSnapshot(db, CODE_C, 'bsc', goodSnapshot({ chain: 'bsc' }), now), { ok: true });
+  const rowC = db.prepare('SELECT address FROM remote_bots WHERE code_hash = ?').get(hashPairingCode(CODE_C));
+  assert.equal(rowC.address, null);
+  db.close();
+});
+
+test('owner board: groups by wallet address; totals are all-time hero sums; active = 5 min', () => {
+  const db = freshDb();
+  const now = Date.now();
+  const heroY1 = { trades: 3, pnl: 16, gas: 12, fees: 3, wins: 2, bestToken: 'ACN', bestTokenPnl: 16, volumeUsd: 600 };
+  const heroY2 = { trades: 2, pnl: -5, gas: 2, fees: 1, wins: 0, bestToken: 'METIS', bestTokenPnl: -5, volumeUsd: 400 };
+  const heroF = { trades: 1, pnl: 100, gas: 1, fees: 0, wins: 1, bestToken: 'XYZ', bestTokenPnl: 100, volumeUsd: 1000 };
+  const recentY1 = [{ ts: now, day: '23 Nov', time: '08:00', symbol: 'ACN', direction: 'TRANSFER', size: 248, buy: 1, sell: 1.1, expected: 16, booked: 16, gas: 4, fees: 1, pnl: 16, aggregator: 'kyber', poolTvl: 300000, safeSize: 1050, status: 'ok', note: 'sold' }];
+  const recentY2 = [{ ts: now - 1000, day: '23 Nov', time: '07:59', symbol: 'METIS', direction: 'TRANSFER', size: 200, buy: 1, sell: 1.1, expected: 1, booked: -5, gas: 2, fees: 1, pnl: -5, aggregator: 'kyber', poolTvl: 100000, safeSize: 300, status: 'ok', note: '' }];
+  const recentF = [{ ts: now - 5000, day: '23 Nov', time: '07:55', symbol: 'XYZ', direction: 'TRANSFER', size: 1000, buy: 1, sell: 1.1, expected: 100, booked: 100, gas: 1, fees: 0, pnl: 100, aggregator: 'kyber', poolTvl: 500000, safeSize: 3000, status: 'ok', note: '' }];
+  assert.deepEqual(ingestSnapshot(db, CODE_A, 'ethereum', goodSnapshot({ hero: heroY1, recent: recentY1, walletAddress: ADDR_Y }), now), { ok: true });
+  assert.deepEqual(ingestSnapshot(db, CODE_B, 'arbitrum', goodSnapshot({ chain: 'arbitrum', hero: heroY2, recent: recentY2, walletAddress: ADDR_Y }), now), { ok: true });
+  // Friend's bot pushed 10 minutes ago: present in totals, NOT active.
+  assert.deepEqual(ingestSnapshot(db, CODE_C, 'bsc', goodSnapshot({ chain: 'bsc', hero: heroF, recent: recentF, walletAddress: ADDR_F }), now - 10 * 60 * 1000), { ok: true });
+
+  const sum = readOwnerSummary(db, now);
+  assert.equal(sum.totals.users, 2);
+  assert.equal(sum.totals.activeUsers, 1);
+  assert.equal(sum.totals.totalTrades, 6);
+  assert.equal(sum.totals.totalVolumeUsd, 2000);
+  assert.equal(sum.totals.totalPnlUsd, 111);
+  assert.equal(sum.activeAfterMs, 5 * 60 * 1000);
+  // Sorted by profit desc: friend (+100) first.
+  assert.equal(sum.users[0].address, ADDR_F);
+  assert.equal(sum.users[0].trades, 1);
+  assert.equal(sum.users[0].volumeUsd, 1000);
+  assert.equal(sum.users[0].pnl, 100);
+  assert.equal(sum.users[0].online, false);
+  assert.equal(sum.users[0].lastTrade.symbol, 'XYZ');
+  assert.equal(sum.users[0].lastTrade.pnl, 100);
+  assert.deepEqual(sum.users[0].chains.map((c) => c.chain), ['bsc']);
+  const y = sum.users[1];
+  assert.equal(y.address, ADDR_Y);
+  assert.equal(y.trades, 5);
+  assert.equal(y.volumeUsd, 1000);
+  assert.equal(y.pnl, 11);
+  assert.equal(y.online, true);
+  assert.equal(y.lastTrade.symbol, 'ACN'); // newest across both chains
+  assert.equal(y.lastTrade.pnl, 16);
+  assert.deepEqual(y.chains.map((c) => c.chain), ['arbitrum', 'ethereum']);
+  db.close();
+});
+
+// B1 (audit 2026-11-23): the live DB was created before the address column
+// existed. ensureRemoteTables must migrate it in place — the address index
+// may only be created AFTER the ALTER, or every ingest/remote/owner call
+// throws "no such column: address".
+test('owner board: pre-upgrade DB without the address column migrates on first ingest', () => {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE remote_bots (
+      code_hash TEXT PRIMARY KEY, chain TEXT NOT NULL, snapshot TEXT NOT NULL,
+      received_ts INTEGER NOT NULL, first_seen INTEGER NOT NULL
+    );
+    CREATE INDEX remote_bots_received ON remote_bots(received_ts);
+  `);
+  const colsBefore = db.prepare(`PRAGMA table_info(remote_bots)`).all().map((c) => c.name);
+  assert.ok(!colsBefore.includes('address'));
+  const now = Date.now();
+  assert.deepEqual(ingestSnapshot(db, CODE_A, 'ethereum', goodSnapshot({ walletAddress: ADDR_Y }), now), { ok: true });
+  const colsAfter = db.prepare(`PRAGMA table_info(remote_bots)`).all().map((c) => c.name);
+  assert.ok(colsAfter.includes('address'));
+  const row = db.prepare(`SELECT address FROM remote_bots WHERE code_hash = ?`).get(hashPairingCode(CODE_A));
+  assert.equal(row.address, ADDR_Y);
+  // The owner summary reads the migrated row; /remote still works too.
+  assert.equal(readOwnerSummary(db, now).totals.users, 1);
+  assert.equal(remoteJson(db, CODE_A, now).walletFingerprint, '0x1111…1111');
+  db.close();
+});
+
+// S1 (audit 2026-11-23): a stored blob with wrong-typed hero values must
+// not corrupt the owner totals via string concatenation.
+test('owner board: wrong-typed stored hero values coerce to numbers, never strings', () => {
+  const db = freshDb();
+  const now = Date.now();
+  ingestSnapshot(db, CODE_A, 'ethereum', goodSnapshot({ walletAddress: ADDR_Y }), now);
+  const bad = goodSnapshot({ walletAddress: ADDR_Y });
+  bad.hero = { trades: 'xx', volumeUsd: 'not-a-number', pnl: '5' };
+  db.prepare(`UPDATE remote_bots SET snapshot = ? WHERE code_hash = ?`).run(JSON.stringify(bad), hashPairingCode(CODE_A));
+  const sum = readOwnerSummary(db, now);
+  assert.equal(typeof sum.totals.totalTrades, 'number');
+  assert.equal(typeof sum.totals.totalVolumeUsd, 'number');
+  assert.equal(typeof sum.totals.totalPnlUsd, 'number');
+  assert.equal(sum.totals.totalTrades, 0);
+  assert.equal(sum.totals.totalVolumeUsd, 0);
+  assert.equal(sum.totals.totalPnlUsd, 5); // numeric string '5' still parses
+  assert.equal(sum.users[0].trades, 0);
+  assert.equal(sum.users[0].volumeUsd, 0);
+  assert.equal(sum.users[0].pnl, 5);
+  db.close();
+});
+
+// N3 (audit 2026-11-23): a re-paired bot (new code, same address+chain)
+// must not double-count — only the latest push per (address, chain) counts.
+test('owner board: re-paired bot with a new code does not double-count the chain', () => {
+  const db = freshDb();
+  const now = Date.now();
+  const oldHero = { trades: 3, pnl: 16, gas: 12, fees: 3, wins: 2, bestToken: 'ACN', bestTokenPnl: 16, volumeUsd: 600 };
+  const newHero = { trades: 10, pnl: 50, gas: 20, fees: 5, wins: 7, bestToken: 'ACN', bestTokenPnl: 50, volumeUsd: 2000 };
+  ingestSnapshot(db, CODE_A, 'ethereum', goodSnapshot({ hero: oldHero, walletAddress: ADDR_Y }), now - 60 * 60 * 1000);
+  ingestSnapshot(db, CODE_B, 'ethereum', goodSnapshot({ hero: newHero, walletAddress: ADDR_Y }), now);
+  const sum = readOwnerSummary(db, now);
+  assert.equal(sum.totals.users, 1);
+  assert.equal(sum.totals.totalTrades, 10);
+  assert.equal(sum.totals.totalVolumeUsd, 2000);
+  assert.equal(sum.totals.totalPnlUsd, 50);
+  assert.equal(sum.users[0].chains.length, 1);
+  assert.equal(sum.users[0].chains[0].chain, 'ethereum');
+  assert.equal(readOwnerAddress(db, ADDR_Y).chains.length, 1);
+  db.close();
+});
+
+test('ownerJson: wrong/missing key denies; unknown address 404s; right key lists + details', () => {
+  const db = freshDb();
+  const now = Date.now();
+  ingestSnapshot(db, CODE_A, 'ethereum', goodSnapshot({ walletAddress: ADDR_Y }), now);
+  assert.deepEqual(ownerJson(db, '', ''), { ok: false, error: 'not found' });
+  assert.deepEqual(ownerJson(db, 'zzzzzzzzzzzzzzzzzzzzzzzz', ''), { ok: false, error: 'not found' });
+  assert.deepEqual(ownerJson(db, OWNER_KEY, '0x0000000000000000000000000000000000000000'), { ok: false, error: 'not found' });
+  assert.deepEqual(ownerJson(db, OWNER_KEY, 'not-an-address'), { ok: false, error: 'not found' });
+  const list = ownerJson(db, OWNER_KEY, '');
+  assert.equal(list.ok, true);
+  assert.equal(list.totals.users, 1);
+  assert.equal(list.users[0].address, ADDR_Y);
+  const detail = ownerJson(db, OWNER_KEY, ADDR_Y);
+  assert.equal(detail.ok, true);
+  assert.equal(detail.address, ADDR_Y);
+  assert.equal(detail.chains.length, 1);
+  assert.equal(detail.chains[0].chain, 'ethereum');
+  assert.equal(detail.chains[0].snapshot.hero.pnl, 15.79);
+  // The owner detail never carries the pairing code or its hash.
+  assert.ok(!JSON.stringify(detail).includes(CODE_A));
+  assert.ok(!JSON.stringify(detail).includes(hashPairingCode(CODE_A)));
+  // readOwnerAddress: same shape, null on unknown/invalid.
+  assert.equal(readOwnerAddress(db, '0x0000000000000000000000000000000000000000'), null);
+  assert.equal(readOwnerAddress(db, 'junk'), null);
+  assert.equal(readOwnerAddress(db, ADDR_Y).chains.length, 1);
+  db.close();
+});
+
+test('remoteJson: shows the wallet fingerprint, never the raw address', () => {
+  const db = freshDb();
+  const now = Date.now();
+  assert.equal(walletFingerprint(ADDR_Y), '0x1111…1111');
+  assert.equal(walletFingerprint('junk'), null);
+  assert.equal(walletFingerprint(null), null);
+  ingestSnapshot(db, CODE_A, 'ethereum', goodSnapshot({ walletAddress: ADDR_Y }), now);
+  const out = remoteJson(db, CODE_A, now);
+  assert.ok(out);
+  assert.equal(out.walletFingerprint, '0x1111…1111');
+  assert.ok(out.error.includes('0x1111…1111'));
+  assert.ok(!JSON.stringify(out).includes(ADDR_Y), 'raw address served on the public page');
+  // No address at all (old bot): fingerprint null, page still works.
+  ingestSnapshot(db, CODE_B, 'arbitrum', goodSnapshot({ chain: 'arbitrum' }), now);
+  const outB = remoteJson(db, CODE_B, now);
+  assert.equal(outB.walletFingerprint, null);
+  assert.ok(!JSON.stringify(outB).includes(ADDR_Y));
+  db.close();
 });

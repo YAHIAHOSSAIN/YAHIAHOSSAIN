@@ -441,11 +441,16 @@ async function main() {
         const b = await balances();
         bal = { mexcUsdt: b.mexc.USDT ?? null, walletNative: b.walletEth, walletUsdc: b.walletUsdc };
       } catch { /* push with nulls */ }
+      // Hot wallet address identifies this bot on the owner's board.
+      // Paper mode has no wallet (PRIVATE_KEY not loaded) — chain.address
+      // throws there, so identity stays empty instead of breaking the push.
+      let walletAddress = '';
+      try { walletAddress = chain.address.toLowerCase(); } catch { /* no wallet */ }
       return {
         chain: cfg.chain.name, mode: cfg.mode, strategy: cfg.strategy, maxTradeUsd: cfg.maxTradeUsd,
         aggregators: cfg.aggregators, dexArbEnabled: cfg.dexArbEnabled,
         minPoolLiquidityUsd: cfg.minPoolLiquidityUsd, depthMaxImpactBps: cfg.depthMaxImpactBps,
-        version: BOT_VERSION, uptimeSec: process.uptime(), lastScanTs: lastTick,
+        version: BOT_VERSION, walletAddress, uptimeSec: process.uptime(), lastScanTs: lastTick,
         ...bal, nativeSymbol: cfg.chain.nativeMexcSymbol.replace('USDT', ''),
       };
     },
@@ -565,11 +570,15 @@ async function runTransfer(db: Db, risk: Risk, tg: Telegram, mexc: MexcRest, cha
         const [mexcB, eth, usdc] = await Promise.all([mexc.balances(), chain.ethBalance(), chain.tokenBalance(cfg.usdc)]);
         balances = { mexcUsdt: mexcB.USDT ?? null, walletNative: Number(eth) / 1e18, walletUsdc: Number(usdc) / 10 ** stableDecimals };
       } catch { /* push with nulls */ }
+      // Hot wallet address identifies this bot on the owner's board (see the
+      // inventory buildCtx above — same rule: no wallet in paper mode).
+      let walletAddress = '';
+      try { walletAddress = chain.address.toLowerCase(); } catch { /* no wallet */ }
       return {
         chain: cfg.chain.name, mode: cfg.mode, strategy: cfg.strategy, maxTradeUsd: cfg.maxTradeUsd,
         aggregators: cfg.aggregators, dexArbEnabled: cfg.dexArbEnabled,
         minPoolLiquidityUsd: cfg.minPoolLiquidityUsd, depthMaxImpactBps: cfg.depthMaxImpactBps,
-        version: BOT_VERSION, uptimeSec: process.uptime(), lastScanTs,
+        version: BOT_VERSION, walletAddress, uptimeSec: process.uptime(), lastScanTs,
         ...balances, nativeSymbol: cfg.chain.nativeMexcSymbol.replace('USDT', ''),
       };
     },

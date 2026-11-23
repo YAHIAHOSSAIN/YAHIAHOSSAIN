@@ -139,6 +139,13 @@ npm run report -- 24 live
 ```
 এটা দেখায় কয়টা trade হয়েছে, মোট net PnL, gas খরচ, কয়টা fail করেছে, আর কোন token-এ লাভ বা ক্ষতি হয়েছে। Telegram-এর দৈনিক summary-তেও একই তথ্য আসে।
 
+## Bot board (arb.alphahelper.online)
+
+- বট চালু করলেই (default) প্রতি ২৫ সেকেন্ডে একটা public-safe snapshot পাঠায় `https://arb.alphahelper.online/api/ingest`-এ — hot wallet address + status, trade, PnL। Key, tx hash বা order id কখনো যায় না।
+- Board-এর owner প্রতিটা wallet address-এর আলাদা page আর একটা summary page (মোট user, active user, মোট volume/profit, প্রত্যেকের শেষ trade) দেখতে পায় — owner page-টা key দিয়ে বন্ধ থাকে। Public per-bot page দেখতে bot-এর pairing code লাগে (`/pairing`), আর সেখানে address-এর শুধু ছোট fingerprint দেখায়।
+- Address grouping বটের পাঠানো address-এর উপর ভরসা করে — valid pairing code ধরা বট অন্যের address দাবি করতে পারে (private 2-user board-এ মেনে নেওয়া হয়েছে; যাচাইয়ের জন্য snapshot signature লাগবে, এখনো বানানো হয়নি)।
+- বন্ধ করতে চাইলে `.env`-এ `INGEST_URL=off` লিখুন (খালি রাখলে default চালু থাকে)। নিজের receiver চালাতে চাইলে `INGEST_URL=http://127.0.0.1:3102/api/ingest`।
+
 ## নিরাপত্তা ব্যবস্থা (Muse আর Grok-এর review-এর পর)
 
 - **MEXC order idempotent:** প্রতিটা order-এ নিজের দেওয়া `newClientOrderId` থাকে। timeout বা 5xx হলে আবার পাঠায় না, আগে `origClientOrderId` দিয়ে খুঁজে দেখে।

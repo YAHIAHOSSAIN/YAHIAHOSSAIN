@@ -198,12 +198,19 @@ export function loadConfig() {
     maxOpenTransfers: num('MAX_OPEN_TRANSFERS', 1),
     // After arrival, do not sell automatically if it would lose more than this % of the cost: hold + alert.
     transferMaxLossPct: num('TRANSFER_MAX_LOSS_PCT', 3),
-    // --- Pairing-code dashboard ---
-    // The central receiver that serves the multi-user dashboard. Empty = the
-    // bot never pushes (its code still exists for /pairing, but no snapshot
-    // leaves this VPS). Yahia's VPS: http://127.0.0.1:3102/api/ingest (same
-    // machine as the status server). A friend's VPS: https://arb.alphahelper.online/api/ingest.
-    ingestUrl: str('INGEST_URL', ''),
+    // --- Pairing-code dashboard (default-ON reporting, owner decision 2026-11-23) ---
+    // The central receiver that serves the multi-user dashboard. By default
+    // every bot reports its hot wallet address + public-safe status (trades,
+    // PnL — never a key, tx hash or order id) to arb.alphahelper.online, so
+    // the board owner can see who runs the code; the owner's page groups bots
+    // by wallet address. An explicitly set INGEST_URL always wins (Yahia's
+    // VPS: http://127.0.0.1:3102/api/ingest, same machine as the status
+    // server). Turn reporting off with INGEST_URL=off — an empty value means
+    // "use the default", not "off" (str() treats empty as unset).
+    ingestUrl: (() => {
+      const raw = str('INGEST_URL', 'https://arb.alphahelper.online/api/ingest');
+      return ['off', 'none', '0'].includes(raw.toLowerCase()) ? '' : raw;
+    })(),
     ingestIntervalSec: num('INGEST_INTERVAL_SEC', 25),
     dbPath: str('DB_PATH', `data/${chain.name}.sqlite`), // one database per chain
     paperDbPath: str('PAPER_DB_PATH', ''), // live twin: read paper history from the paper bot's DB (empty = own DB)

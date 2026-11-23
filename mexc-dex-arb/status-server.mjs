@@ -34,7 +34,7 @@
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -87,6 +87,37 @@ function chainCfg(name) {
 const REMOTE_DB = process.env.REMOTE_DB || 'data/remote-bots.sqlite';
 const REMOTE_RETENTION_DAYS = Number(process.env.REMOTE_RETENTION_DAYS || 30);
 const OFFLINE_AFTER_MS = 120_000; // no snapshot for 2 minutes = offline
+// Owner board (/bots): a push every 25 s, so no snapshot for 5 minutes means
+// the bot is not currently running (12 missed pushes — restarts and short
+// network hiccups stay "active").
+const ACTIVE_AFTER_MS = 5 * 60 * 1000;
+// Owner key for /bots + /api/owner. Random 24 chars, set ONLY in the VPS pm2
+// env (status-ecosystem.config.cjs on the VPS) — never in the repo, never in
+// CHANGES.md. Without it the owner endpoints 404 (key unset = board closed).
+const OWNER_KEY = process.env.OWNER_KEY || '';
+// Hot wallet address: the ONE identity field. Validated to lowercase
+// 0x + 40 hex, stored in its own DB column, and shown in full ONLY on the
+// key-gated owner page. Public pages get at most the fingerprint below.
+const WALLET_ADDRESS_RE = /^0x[0-9a-f]{40}$/;
+function cleanWalletAddress(v) {
+  if (typeof v !== 'string') return null;
+  const a = v.toLowerCase();
+  return WALLET_ADDRESS_RE.test(a) ? a : null;
+}
+export function walletFingerprint(addr) {
+  if (typeof addr !== 'string') return null;
+  const a = addr.toLowerCase();
+  if (!WALLET_ADDRESS_RE.test(a)) return null;
+  return a.slice(0, 6) + '…' + a.slice(-4);
+}
+function isOwnerKey(k) {
+  if (!OWNER_KEY || typeof k !== 'string' || k.length !== OWNER_KEY.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(k), Buffer.from(OWNER_KEY));
+  } catch {
+    return false;
+  }
+}
 const MAX_INGEST_BYTES = 64 * 1024;
 const REMOTE_CHAINS = ['ethereum', 'arbitrum', 'bsc'];
 
@@ -102,10 +133,19 @@ function ensureRemoteTables(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS remote_bots (
       code_hash TEXT PRIMARY KEY, chain TEXT NOT NULL, snapshot TEXT NOT NULL,
-      received_ts INTEGER NOT NULL, first_seen INTEGER NOT NULL
+      received_ts INTEGER NOT NULL, first_seen INTEGER NOT NULL, address TEXT
     );
     CREATE INDEX IF NOT EXISTS remote_bots_received ON remote_bots(received_ts);
   `);
+  // DBs created before the address column (2026-11-23): add it in place.
+  // PRAGMA first — SQLite has no ADD COLUMN IF NOT EXISTS.
+  const cols = db.prepare(`PRAGMA table_info(remote_bots)`).all().map((c) => c.name);
+  if (!cols.includes('address')) db.exec(`ALTER TABLE remote_bots ADD COLUMN address TEXT`);
+  // NOTE: the address index MUST be created after the ALTER above. Creating
+  // it before (in the same exec as CREATE TABLE) throws "no such column:
+  // address" on a pre-column DB and bricks every remote/owner endpoint
+  // (audit 2026-11-23, B1) — the live DB is exactly such a pre-column DB.
+  db.exec(`CREATE INDEX IF NOT EXISTS remote_bots_address ON remote_bots(address);`);
 }
 
 let remoteDb = null;
@@ -120,9 +160,13 @@ export function openRemoteDb(dbPath = REMOTE_DB) {
 
 // --- snapshot sanitizer (defense in depth) ---
 // The bot only ever BUILDS allowlisted fields, but the receiver must not
-// trust the network: anything not on this list is DROPPED, so a wallet
-// address, key, token, tx hash or order id can never be stored or served,
-// even if a (compromised or modified) bot sends one.
+// trust the network: anything not on this list is DROPPED, so a key, token,
+// tx hash or order id can never be stored or served, even if a (compromised
+// or modified) bot sends one. The hot wallet address is the ONE exception:
+// it is validated by cleanWalletAddress and stored in its own DB column by
+// ingestSnapshot — it is dropped from the snapshot blob itself, so it can
+// never leak through any public endpoint; only the key-gated owner page may
+// show it in full (public pages get at most the fingerprint).
 const cleanNum = (v, def = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
@@ -138,6 +182,9 @@ function cleanHero(v) {
   return {
     trades: cleanCount(o.trades), pnl: cleanNum(o.pnl), gas: cleanNum(o.gas), fees: cleanNum(o.fees),
     wins: cleanCount(o.wins), bestToken: cleanStr(o.bestToken, 20), bestTokenPnl: cleanNum(o.bestTokenPnl),
+    // All-time traded volume (sum of trade sizes, finished live trades only).
+    // Missing on pre-upgrade snapshots (treated as 0 in the owner totals).
+    volumeUsd: cleanNum(o.volumeUsd),
   };
 }
 function cleanToday(v) {
@@ -278,13 +325,20 @@ export function ingestSnapshot(db, code, chain, rawSnapshot, now = Date.now()) {
   const snap = sanitizeSnapshot(rawSnapshot);
   if (!snap) return { ok: false, error: 'bad snapshot' };
   if (snap.chain !== chain.toLowerCase()) return { ok: false, error: 'chain mismatch' };
+  // The hot wallet address identifies the bot on the owner's board. It is
+  // validated here and stored in its own column — the sanitizer already
+  // dropped it from the snapshot blob, so the stored JSON can never leak it.
+  // A missing/invalid address (old bot version) still stores fine, with a
+  // NULL address: the bot keeps working on /remote, it just has no owner
+  // identity until it upgrades.
+  const address = cleanWalletAddress(rawSnapshot && rawSnapshot.walletAddress);
   ensureRemoteTables(db);
   db.prepare('DELETE FROM remote_bots WHERE received_ts < ?').run(now - REMOTE_RETENTION_DAYS * 86_400_000);
   db.prepare(
-    `INSERT INTO remote_bots (code_hash, chain, snapshot, received_ts, first_seen)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(code_hash) DO UPDATE SET chain = excluded.chain, snapshot = excluded.snapshot, received_ts = excluded.received_ts`,
-  ).run(hashPairingCode(code), chain.toLowerCase(), JSON.stringify(snap), now, now);
+    `INSERT INTO remote_bots (code_hash, chain, snapshot, received_ts, first_seen, address)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(code_hash) DO UPDATE SET chain = excluded.chain, snapshot = excluded.snapshot, received_ts = excluded.received_ts, address = excluded.address`,
+  ).run(hashPairingCode(code), chain.toLowerCase(), JSON.stringify(snap), now, now, address);
   return { ok: true };
 }
 
@@ -301,9 +355,9 @@ export function revokeRemoteCode(db, code) {
 export function readRemote(db, code, now = Date.now()) {
   if (!isValidRemoteCode(code)) return null;
   ensureRemoteTables(db);
-  const row = db.prepare('SELECT chain, snapshot, received_ts FROM remote_bots WHERE code_hash = ?').get(hashPairingCode(code));
+  const row = db.prepare('SELECT chain, snapshot, received_ts, address FROM remote_bots WHERE code_hash = ?').get(hashPairingCode(code));
   if (!row) return null;
-  return { chain: row.chain, snapshot: row.snapshot, receivedTs: row.received_ts, online: now - row.received_ts <= OFFLINE_AFTER_MS };
+  return { chain: row.chain, snapshot: row.snapshot, receivedTs: row.received_ts, online: now - row.received_ts <= OFFLINE_AFTER_MS, address: row.address ?? null };
 }
 
 /** Shape a stored snapshot into the dashboard page's JSON: the paper section
@@ -318,14 +372,125 @@ export function remoteJson(db, code, now = Date.now()) {
   } catch {
     return null;
   }
+  // The public page may show at most the wallet fingerprint — the raw address
+  // is in the DB column only and never enters this JSON.
+  const fp = walletFingerprint(row.address);
   return {
     dbOk: false,
     chain: row.chain,
-    error: row.online ? '🔗 Remote bot — live তথ্য নিচে' : '🔗 Remote bot — ২ মিনিট ধরে snapshot আসেনি (offline)',
+    error: (row.online ? '🔗 Remote bot — live তথ্য নিচে' : '🔗 Remote bot — ২ মিনিট ধরে snapshot আসেনি (offline)') + (fp ? ' · ' + fp : ''),
+    walletFingerprint: fp,
     updatedDhaka: dhakaTime(row.receivedTs),
     online: row.online,
     live: { ...snap, dbOk: true, pm2: { state: row.online ? 'online' : 'stopped' }, updatedTs: row.receivedTs },
   };
+}
+
+/** Owner summary: every reporting bot grouped by hot wallet address, with
+ * totals. Totals are sums over the LATEST snapshot per bot — but the hero
+ * fields are cumulative from each bot's own DB (all finished live trades
+ * since that bot started), so the totals ARE all-time, not a 25 s window.
+ * The only windowed concepts are "online" (snapshot within ACTIVE_AFTER_MS)
+ * and "last trade" (the newest finished trade). Users sort by profit desc,
+ * so one glance shows who is profiting how much. */
+export function readOwnerSummary(db, now = Date.now()) {
+  ensureRemoteTables(db);
+  const rows = db.prepare(
+    `SELECT address, chain, snapshot, received_ts, first_seen FROM remote_bots WHERE address IS NOT NULL`,
+  ).all();
+  // Dedup by (address, chain): a re-paired bot (new code, fresh DB) leaves
+  // an old row for the same chain — only the latest push counts, or the
+  // stale hero would keep inflating the totals until the 30-day prune.
+  // firstSeen is the earliest across ALL rows of that address.
+  const latest = new Map();
+  const firstSeenByAddr = new Map();
+  for (const row of rows) {
+    firstSeenByAddr.set(row.address, Math.min(firstSeenByAddr.get(row.address) ?? Infinity, row.first_seen));
+    const k = row.address + '|' + row.chain;
+    if (!latest.has(k) || row.received_ts > latest.get(k).received_ts) latest.set(k, row);
+  }
+  const byAddr = new Map();
+  for (const row of latest.values()) {
+    let snap;
+    try { snap = JSON.parse(row.snapshot); } catch { continue; }
+    const hero = (snap && snap.hero) || {};
+    const e = byAddr.get(row.address) || {
+      address: row.address, chains: [], trades: 0, volumeUsd: 0, pnl: 0,
+      lastTrade: null, lastSeen: 0, firstSeen: firstSeenByAddr.get(row.address),
+    };
+    // Coerce stored hero values to numbers: a wrong-typed blob (old
+    // snapshot, direct DB edit) would otherwise corrupt the totals via
+    // string concatenation ('00xx') — audit 2026-11-23, S1.
+    e.trades += cleanCount(hero.trades);
+    e.volumeUsd += cleanNum(hero.volumeUsd);
+    e.pnl += cleanNum(hero.pnl);
+    const lt = snap.recent && snap.recent[0];
+    if (lt && typeof lt.ts === 'number' && (!e.lastTrade || lt.ts > e.lastTrade.ts)) {
+      e.lastTrade = { ts: lt.ts, day: lt.day || '', time: lt.time || '', symbol: lt.symbol || '', pnl: cleanNum(lt.pnl), size: cleanNum(lt.size), chain: row.chain };
+    }
+    e.lastSeen = Math.max(e.lastSeen, row.received_ts);
+    e.firstSeen = Math.min(e.firstSeen, row.first_seen);
+    e.chains.push({
+      chain: row.chain, online: now - row.received_ts <= ACTIVE_AFTER_MS,
+      receivedTs: row.received_ts, firstSeen: row.first_seen,
+      trades: cleanCount(hero.trades), volumeUsd: cleanNum(hero.volumeUsd), pnl: cleanNum(hero.pnl),
+    });
+    byAddr.set(row.address, e);
+  }
+  const users = [...byAddr.values()]
+    .map((u) => ({ ...u, online: u.lastSeen > 0 && now - u.lastSeen <= ACTIVE_AFTER_MS, chains: u.chains.sort((a, b) => a.chain.localeCompare(b.chain)) }))
+    .sort((a, b) => b.pnl - a.pnl);
+  return {
+    users,
+    totals: {
+      users: users.length,
+      activeUsers: users.filter((u) => u.online).length,
+      totalTrades: users.reduce((s, u) => s + u.trades, 0),
+      totalVolumeUsd: users.reduce((s, u) => s + u.volumeUsd, 0),
+      totalPnlUsd: users.reduce((s, u) => s + u.pnl, 0),
+    },
+    activeAfterMs: ACTIVE_AFTER_MS,
+  };
+}
+
+/** All chains of one address (full snapshots), or null when unknown. */
+export function readOwnerAddress(db, address, now = Date.now()) {
+  if (typeof address !== 'string' || !WALLET_ADDRESS_RE.test(address.toLowerCase())) return null;
+  ensureRemoteTables(db);
+  const rows = db.prepare(
+    `SELECT chain, snapshot, received_ts, first_seen FROM remote_bots WHERE address = ?`,
+  ).all(address.toLowerCase());
+  if (!rows.length) return null;
+  // Dedup by chain (same reason as readOwnerSummary): a re-paired bot's
+  // old row for the same chain must not list twice — keep the latest push.
+  const latest = new Map();
+  for (const row of rows) {
+    if (!latest.has(row.chain) || row.received_ts > latest.get(row.chain).received_ts) latest.set(row.chain, row);
+  }
+  const chains = [];
+  for (const row of latest.values()) {
+    let snap;
+    try { snap = JSON.parse(row.snapshot); } catch { continue; }
+    chains.push({
+      chain: row.chain, snapshot: snap, receivedTs: row.received_ts,
+      firstSeen: row.first_seen, online: now - row.received_ts <= ACTIVE_AFTER_MS,
+    });
+  }
+  if (!chains.length) return null;
+  chains.sort((a, b) => a.chain.localeCompare(b.chain));
+  return { address: address.toLowerCase(), chains };
+}
+
+/** Owner API shape. Wrong/missing key and unknown address both answer
+ * { ok: false } (the route turns that into a 404) — no enumeration. */
+export function ownerJson(db, key, address, now = Date.now()) {
+  if (!isOwnerKey(key)) return { ok: false, error: 'not found' };
+  if (address) {
+    const detail = readOwnerAddress(db, address, now);
+    if (!detail) return { ok: false, error: 'not found' };
+    return { ok: true, ...detail };
+  }
+  return { ok: true, ...readOwnerSummary(db, now) };
 }
 
 // --- tiny in-memory rate limiter (single process, pm2 fork 1) ---
@@ -347,6 +512,8 @@ export class RateLimiter {
 export const ingestLimiter = new RateLimiter();
 export const remoteLimiter = new RateLimiter();
 export const remoteMissLimiter = new RateLimiter();
+export const ownerLimiter = new RateLimiter();
+export const ownerMissLimiter = new RateLimiter();
 
 /** Real client IP behind the Cloudflare Tunnel (cf-connecting-ip), else the
  * first X-Forwarded-For hop, else the socket address. */
@@ -1121,6 +1288,127 @@ const REMOTE_CODE = new URLSearchParams(location.search).get('code') || '';
 async function load(){`);
 }
 
+// ---------------- Owner board (/bots) ----------------
+// Key-gated summary of every bot reporting to this receiver, grouped by hot
+// wallet address. Private: only Yahia + his friend (Yahia shares the key
+// himself). The page holds no data — the JS fetches /api/owner with the key
+// from the URL, and the API 404s on a wrong key. The same shell serves the
+// list (/bots) and one address (/bots/<address>); the JS reads the path.
+function ownerPage() {
+  return `<!DOCTYPE html><html lang="bn"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MEV Bot — Owner Board</title>
+<style>
+*{box-sizing:border-box}
+body{background:radial-gradient(1200px 600px at 50% -10%,#1c1607 0%,#000 55%);color:#eee;font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px 14px 28px}
+h1{font-size:22px;margin:4px 0 2px;background:linear-gradient(90deg,#f7dc7d,#d4af37 60%,#9a7b1e);-webkit-background-clip:text;background-clip:text;color:transparent}
+h2{font-size:15px;letter-spacing:.4px;margin:20px 0 8px;color:#f0cd6a;display:flex;align-items:center;gap:8px}
+h2::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,#d4af37,transparent)}
+.sub{color:#9a9a9a;font-size:13px;margin-bottom:14px}
+.card{background:linear-gradient(180deg,#171717,#101010);border:1px solid #2c2c2c;border-radius:16px;padding:14px;margin-bottom:10px;box-shadow:0 6px 18px rgba(0,0,0,.45)}
+.hero{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:6px}
+.stat{background:linear-gradient(180deg,#1a1a1a,#101010);border:1px solid #2c2c2c;border-radius:16px;padding:14px;box-shadow:0 6px 18px rgba(0,0,0,.5)}
+.stat .lab{font-size:12px;color:#9a9a9a;margin-bottom:4px}
+.stat .val{font-size:26px;font-weight:800}
+.green{color:#3ddc84}.red{color:#ff6b6b}.gold{color:#d4af37}
+.row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #232323;font-size:14px}
+.row:last-child{border-bottom:0}.muted{color:#9a9a9a;font-size:12px}.mut{color:#9a9a9a;font-size:11px}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:12px;background:#1d2b1d;color:#3ddc84}
+.badge.off{background:#2b1d1d;color:#ff6b6b}
+.mono{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+.wrap{overflow-x:auto;margin:0 -4px;padding:0 4px}
+table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:8px 6px;border-bottom:1px solid #232323;text-align:left;white-space:nowrap}
+th{color:#8a8a8a;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+.foot{color:#777;font-size:12px;text-align:center;margin-top:18px}
+button{background:#d4af37;color:#000;border:0;border-radius:8px;padding:8px 14px;font-weight:700}
+input{flex:1;background:#111;border:1px solid #4a3d16;border-radius:8px;color:#eee;padding:9px 12px;font-size:14px}
+a{color:#d4af37}
+</style></head><body>
+<h1>🤖 Owner Board — সব Bot</h1>
+<div class="sub">Hot wallet address দিয়ে group করা · শুধু key জানা মানুষ দেখতে পারে</div>
+<div id="keybox"></div>
+<div id="summary"></div>
+<div id="users"></div>
+<div id="detail"></div>
+<div class="foot" id="foot"></div>
+<p><button onclick="load()">↻ এখনই দেখো</button></p>
+<script>
+var KEY = new URLSearchParams(location.search).get('key') || '';
+var ADDR = (location.pathname.split('/')[2] || '').toLowerCase();
+function money(n){ var v = Number(n||0); return (v>=0?'+':'')+'$'+v.toFixed(2); }
+function cls(n){ return Number(n||0) >= 0 ? 'green' : 'red'; }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function dhaka(ts){ var d = new Date(Number(ts) + 6*3600*1000); var M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return d.getUTCDate()+' '+M[d.getUTCMonth()]+' '+String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0'); }
+function keyBox(){
+  if(KEY) return '';
+  return '<div class="card"><b>🔑 Owner key দাও</b><div class="muted" style="margin:6px 0 10px">এই page শুধু owner-দের জন্য — key ছাড়া কিছু দেখাবে না।</div><div style="display:flex;gap:8px"><input id="key-input" placeholder="২৪ অক্ষরের owner key" maxlength="24"><button onclick="saveKey()">দেখো</button></div></div>';
+}
+function saveKey(){
+  var v = document.getElementById('key-input').value.trim();
+  if(!/^[A-Za-z0-9_-]{24}$/.test(v)){ document.getElementById('keybox').innerHTML = '<div class="card"><b>⚠️ Key-টা ২৪ অক্ষরের হতে হবে।</b></div>'; return; }
+  location.search = '?key=' + encodeURIComponent(v);
+}
+function summaryHtml(d){
+  var t = d.totals;
+  var h = '<div class="hero">'
+    + '<div class="stat"><div class="lab">মোট user</div><div class="val">'+t.users+'</div><div class="mut">Active '+t.activeUsers+' জন</div></div>'
+    + '<div class="stat"><div class="lab">মোট profit (সব সময়)</div><div class="val '+cls(t.totalPnlUsd)+'">'+money(t.totalPnlUsd)+'</div><div class="mut">'+t.totalTrades+' ট্রেড · মোট volume $'+Number(t.totalVolumeUsd||0).toFixed(2)+'</div></div>'
+    + '</div>'
+    + '<div class="muted">Active = গত ৫ মিনিটে snapshot এসেছে (প্রতি ২৫ সেকেন্ডে একবার আসে)। মোট volume/profit = প্রতিটা bot-এর নিজের DB-র সব সময়ের হিসাব (latest snapshot-এর hero) — ২৫ সেকেন্ডের window নয়।</div>';
+  return h;
+}
+function usersHtml(d){
+  if(!d.users.length) return '<div class="card"><div class="muted">এখনো কোনো bot connect করেনি — bot চালু হলে এখানে আসবে।</div></div>';
+  var h = '<h2>👥 User অনুযায়ী</h2><div class="card"><div class="wrap"><table><tr><th>User (wallet)</th><th>Chain</th><th>ট্রেড</th><th>Volume</th><th>মোট profit</th><th>শেষ trade</th><th></th></tr>';
+  d.users.forEach(function(u){
+    var lt = u.lastTrade ? '<b>'+esc(u.lastTrade.symbol)+'</b> · '+esc(u.lastTrade.day)+' '+esc(u.lastTrade.time)+' · <span class="'+cls(u.lastTrade.pnl)+'">'+money(u.lastTrade.pnl)+'</span>' : '—';
+    h += '<tr><td><span class="mono">'+esc(u.address)+'</span><br><span class="mut">'+(u.online?'● active':'● inactive')+'</span></td>'
+      + '<td>'+u.chains.map(function(c){ return esc(c.chain); }).join(', ')+'</td>'
+      + '<td>'+u.trades+'</td>'
+      + '<td>$'+Number(u.volumeUsd||0).toFixed(2)+'</td>'
+      + '<td><span class="'+cls(u.pnl)+'"><b>'+money(u.pnl)+'</b></span></td>'
+      + '<td>'+lt+'</td>'
+      + '<td><a href="/bots/'+esc(u.address)+'?key='+encodeURIComponent(KEY)+'">দেখো →</a></td></tr>';
+  });
+  return h + '</table></div></div>';
+}
+function chainCard(c){
+  var s = c.snapshot, h = s.hero || {}, t = s.today || {};
+  var rows = (s.recent || []).map(function(r){
+    return '<tr><td>'+esc(r.day)+' '+esc(r.time)+'</td><td><b>'+esc(r.symbol)+'</b></td><td>$'+Number(r.size||0)+'</td><td><span class="'+cls(r.pnl)+'">'+money(r.pnl)+'</span></td></tr>';
+  }).join('');
+  return '<div class="card"><h2 style="margin-top:0">'+esc(c.chain.toUpperCase())+' '+(c.online?'<span class="badge">● চলছে</span>':'<span class="badge off">● offline</span>')+'</h2>'
+    + '<div class="row"><span>মোট profit (সব সময়)</span><b class="'+cls(h.pnl)+'">'+money(h.pnl)+'</b></div>'
+    + '<div class="row"><span>ট্রেড · Volume</span><b>'+(h.trades||0)+' টা · $'+Number(h.volumeUsd||0).toFixed(2)+'</b></div>'
+    + '<div class="row"><span>আজ</span><b>'+(t.trades||0)+' ট্রেড · <span class="'+cls(t.pnl)+'">'+money(t.pnl)+'</span></b></div>'
+    + '<div class="row"><span>শেষ snapshot</span><b>'+dhaka(c.receivedTs)+'</b></div>'
+    + (rows ? '<div class="wrap" style="margin-top:8px"><table><tr><th>সময়</th><th>টোকেন</th><th>সাইজ</th><th>লাভ/লস</th></tr>'+rows+'</table></div>' : '<div class="muted" style="margin-top:8px">এখনো কোনো trade হয়নি</div>')
+    + '</div>';
+}
+async function load(){
+  document.getElementById('keybox').innerHTML = keyBox();
+  if(!KEY){ document.getElementById('summary').innerHTML=''; document.getElementById('users').innerHTML=''; document.getElementById('detail').innerHTML=''; return; }
+  try{
+    var url = '/api/owner?key=' + encodeURIComponent(KEY) + (ADDR ? '&address=' + encodeURIComponent(ADDR) : '');
+    var r = await fetch(url);
+    if(!r.ok){ document.getElementById('summary').innerHTML = '<div class="card"><b>⚠️ ভুল key, বা এই address-এর কোনো bot নেই।</b></div>'; document.getElementById('users').innerHTML=''; document.getElementById('detail').innerHTML=''; return; }
+    var d = await r.json();
+    if(ADDR){
+      document.getElementById('summary').innerHTML = '<div class="card"><b class="mono">'+esc(d.address)+'</b><div class="muted" style="margin-top:6px"><a href="/bots?key='+encodeURIComponent(KEY)+'">← সব user</a></div></div>';
+      document.getElementById('users').innerHTML = '';
+      document.getElementById('detail').innerHTML = (d.chains||[]).map(chainCard).join('') || '<div class="card"><div class="muted">কোনো chain-এর তথ্য নেই</div></div>';
+    } else {
+      document.getElementById('summary').innerHTML = summaryHtml(d);
+      document.getElementById('users').innerHTML = usersHtml(d);
+      document.getElementById('detail').innerHTML = '';
+    }
+    document.getElementById('foot').textContent = 'আপডেট: ' + new Date(Date.now() + 6*3600*1000).toISOString().slice(11,16) + ' ঢাকা · ৩০ সেকেন্ডে নিজে আপডেট হয়';
+  }catch(e){ document.getElementById('summary').innerHTML = '<div class="card"><b>⚠️ লোড হয়নি — আবার চেষ্টা করো</b></div>'; }
+}
+load(); setInterval(load, 30000);
+</script></body></html>`;
+}
+
 // Chain index / landing page: one card per chain with a one-line summary.
 const INDEX_PAGE = `<!DOCTYPE html><html lang="bn"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1395,6 +1683,34 @@ const server = http.createServer(async (req, res) => {
       json(200, out);
       return;
     }
+    if (path === '/api/owner') {
+      const json = (code, obj) => {
+        res.writeHead(code, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(obj));
+      };
+      const ip = clientIp(req);
+      if (!ownerLimiter.allow(`ip:${ip}`, 120, 60_000)) {
+        json(429, { error: 'rate limited' });
+        return;
+      }
+      const out = ownerJson(openRemoteDb(), u.searchParams.get('key') || '', u.searchParams.get('address') || '');
+      if (!out.ok) {
+        // Wrong key and unknown address look identical — no enumeration.
+        if (!ownerMissLimiter.allow(`miss:${ip}`, 20, 60_000)) {
+          json(429, { error: 'rate limited' });
+          return;
+        }
+        json(404, { error: 'not found' });
+        return;
+      }
+      json(200, out);
+      return;
+    }
+    if (path === '/bots' || path.startsWith('/bots/')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(ownerPage());
+      return;
+    }
     if (path === '/remote') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(remotePage());
@@ -1419,8 +1735,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404);
     res.end('not found');
   } catch (e) {
+    // Log the real error server-side; never leak internals (e.g. SQLite
+    // messages) to unauthenticated callers.
+    console.error(e);
     res.writeHead(500);
-    res.end(`error: ${String(e.message || e).slice(0, 200)}`);
+    res.end('error: internal error');
   }
 });
 
